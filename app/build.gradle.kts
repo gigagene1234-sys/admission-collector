@@ -1,23 +1,49 @@
-plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-}
+name: Build Admission Collector
 
-android {
-    namespace = "com.admissionhub.collector"
-    compileSdk = 35
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
 
-    defaultConfig {
-        applicationId = "com.admissionhub.collector"
-        minSdk = 26
-        targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
-    }
+permissions:
+  contents: read
 
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-        }
-    }
-}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
