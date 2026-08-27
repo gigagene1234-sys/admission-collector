@@ -1,0 +1,77 @@
+name: Bootstrap and Build Admission Collector
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'admission-collector-v0.1-1.zip'
+      - '.github/workflows/bootstrap-admission-collector.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract project source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f admission-collector-v0.1-1.zip
+          rm -rf .bootstrap-src
+          mkdir .bootstrap-src
+          unzip -q admission-collector-v0.1-1.zip -d .bootstrap-src
+          test -f .bootstrap-src/admission-collector/settings.gradle.kts
+          test -f .bootstrap-src/admission-collector/app/build.gradle.kts
+          rsync -a .bootstrap-src/admission-collector/ ./
+          rm -rf .bootstrap-src
+
+      - name: Commit extracted source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No source changes to commit"
+          else
+            git commit -m "Bootstrap Admission Collector v0.1 source"
+            git push
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Ensure Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Build debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
