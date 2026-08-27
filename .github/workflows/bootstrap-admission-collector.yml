@@ -1,4 +1,4 @@
- name: Build Admission Collector
+name: Build Admission Collector
 
 on:
   workflow_dispatch:
