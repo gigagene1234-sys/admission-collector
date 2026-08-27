@@ -24,22 +24,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           test -f admission-collector-v0.1-1.zip
+
           rm -rf .bootstrap-src
           mkdir .bootstrap-src
+
           unzip -q admission-collector-v0.1-1.zip -d .bootstrap-src
+
           test -f .bootstrap-src/admission-collector/settings.gradle.kts
           test -f .bootstrap-src/admission-collector/app/build.gradle.kts
+
           rsync -a .bootstrap-src/admission-collector/ ./
+
           rm -rf .bootstrap-src
+
+          # GitHub Actions의 GITHUB_TOKEN은 별도 workflows 권한 없이
+          # 다른 workflow 파일을 생성/수정할 수 없으므로 제외한다.
+          rm -f .github/workflows/android.yml
 
       - name: Commit extracted source
         shell: bash
         run: |
           set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add -A
+
           if git diff --cached --quiet; then
             echo "No source changes to commit"
           else
@@ -74,4 +87,3 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
-
