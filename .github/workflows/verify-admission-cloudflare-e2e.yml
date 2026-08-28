@@ -1,0 +1,119 @@
+name: Verify Admission Collector Cloudflare E2E
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/v0.3.2-cloud-offload
+    paths:
+      - ".github/workflows/verify-admission-cloudflare-e2e.yml"
+      - "cloudflare/src/**"
+      - "cloudflare/migrations/**"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      WORKER_URL: https://admission-collector-offload.gigagene1234.workers.dev
+      ADMISSION_INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+
+    steps:
+      - name: Validate secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ADMISSION_INGEST_TOKEN:-}"
+
+      - name: Health check
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --retry 5 --retry-delay 2 --retry-all-errors --fail --silent --show-error \
+            "$WORKER_URL/health" | tee /tmp/health.json
+          node -e "const x=require('/tmp/health.json'); if(!x.ok||x.service!=='admission-collector-offload'||x.version!=='0.3.2') process.exit(1)"
+
+      - name: Verify run, Queue consumer, D1 checkpoint and resume plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_JSON="$(curl --fail --silent --show-error \
+            -X POST "$WORKER_URL/v1/runs" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"provider":"e2e-smoke","collectorVersion":"0.3.2","metadata":{"source":"github-actions-e2e"}}')"
+          RUN_ID="$(printf '%s' "$RUN_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(!j.runId)process.exit(1);process.stdout.write(j.runId)})")"
+          CHUNK_ID="e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          FINGERPRINT="e2e-record-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          node -e '
+            const fs=require("fs");
+            const body={
+              chunkId:process.env.CHUNK_ID,
+              provider:"e2e-smoke",
+              records:[{
+                sourceRowFingerprint:process.env.FINGERPRINT,
+                provider:"e2e-smoke",
+                recordType:"verification",
+                year:2027,
+                university:"E2E",
+                department:"Queue-D1",
+                sourcePage:"deployment-smoke",
+                sourcePageNumber:2,
+                sourceRowOrdinal:1,
+                confidence:"verified"
+              }],
+              page:{familyKey:"deployment-smoke",requestedYear:2027,page:2,state:"completed",retryCount:0}
+            };
+            fs.writeFileSync("/tmp/chunk.json",JSON.stringify(body));
+          ' CHUNK_ID="$CHUNK_ID" FINGERPRINT="$FINGERPRINT"
+
+          curl --fail --silent --show-error \
+            -X POST "$WORKER_URL/v1/runs/$RUN_ID/chunks" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/chunk.json >/tmp/chunk-response.json
+
+          PROCESSED=0
+          for attempt in $(seq 1 20); do
+            STATUS_JSON="$(curl --fail --silent --show-error \
+              "$WORKER_URL/v1/runs/$RUN_ID/status" \
+              -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN")"
+            if printf '%s' "$STATUS_JSON" | node -e '
+              let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+                const j=JSON.parse(s); const r=j.run||{};
+                process.exit(Number(r.processed_chunks||0)>=1 && Number(r.unique_records||0)>=1 ? 0 : 1);
+              })'; then
+              PROCESSED=1
+              break
+            fi
+            sleep 1
+          done
+          test "$PROCESSED" = "1"
+
+          PLAN_JSON="$(curl --fail --silent --show-error \
+            "$WORKER_URL/v1/runs/$RUN_ID/resume-plan?familyKey=deployment-smoke&requestedYear=2027&totalPages=3&limit=500" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN")"
+
+          printf '%s' "$PLAN_JSON" | node -e '
+            let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+              const j=JSON.parse(s);
+              const missing=new Set(j.missing||[]);
+              const retry=new Set((j.retry||[]).map(x=>x.page));
+              if(j.totalPages!==3) process.exit(1);
+              if(missing.has(2)||retry.has(2)) process.exit(2);
+              if(!missing.has(1)||!missing.has(3)) process.exit(3);
+              if(Number(j.knownPages||0)<1) process.exit(4);
+            })'
+
+          curl --fail --silent --show-error \
+            -X POST "$WORKER_URL/v1/runs/$RUN_ID/finish" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"status":"completed","completionReason":"e2e-verified","summary":{"queue":true,"d1":true,"resumePlan":true}}' >/dev/null
+
+          echo "Queue -> D1 -> resume-plan verified."
+        env:
+          CHUNK_ID: placeholder
+          FINGERPRINT: placeholder
