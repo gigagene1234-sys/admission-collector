@@ -1,0 +1,87 @@
+name: Deploy Cloudflare v0.3.6
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/deploy-cloudflare-v036.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      ADMISSION_INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Cloudflare dependencies
+        working-directory: cloudflare
+        run: npm install --no-audit --no-fund
+      - name: Resolve account
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const r=await fetch('https://api.cloudflare.com/client/v4/accounts?per_page=50',{headers:{Authorization:`Bearer ${process.env.CLOUDFLARE_API_TOKEN}`}});
+          const b=await r.json();
+          if(!r.ok||!b.success||!Array.isArray(b.result)||b.result.length!==1) throw new Error('Unable to resolve exactly one Cloudflare account');
+          fs.appendFileSync(process.env.GITHUB_ENV,`CLOUDFLARE_ACCOUNT_ID=${b.result[0].id}\n`);
+          NODE
+      - name: Validate and deploy Worker
+        working-directory: cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check src/index.js
+          npx wrangler deploy 2>&1 | tee /tmp/deploy.log
+          printf '%s' "$ADMISSION_INGEST_TOKEN" | npx wrangler secret put INGEST_TOKEN
+      - name: Resolve Worker URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$(grep -Eo 'https://[A-Za-z0-9._-]+\.workers\.dev' /tmp/deploy.log | tail -n1 || true)"
+          if [ -z "$URL" ]; then
+            URL="$(node --input-type=module <<'NODE'
+          const r=await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/workers/subdomain`,{headers:{Authorization:`Bearer ${process.env.CLOUDFLARE_API_TOKEN}`}});
+          const b=await r.json(); if(!r.ok||!b.success||!b.result?.subdomain) process.exit(1);
+          process.stdout.write(`https://admission-collector-offload.${b.result.subdomain}.workers.dev`);
+          NODE
+          )"
+          fi
+          echo "WORKER_URL=$URL" >> "$GITHUB_ENV"
+      - name: Verify production health and real cooldown
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --retry 5 --retry-delay 2 --fail --silent --show-error "$WORKER_URL/health" > /tmp/health.json
+          node - <<'NODE'
+          const h=require('/tmp/health.json');
+          if(!h.ok||h.version!=='0.3.6') throw new Error(`Unexpected health: ${JSON.stringify(h)}`);
+          console.log('health 0.3.6 confirmed');
+          NODE
+          LATEST="$(curl --fail --silent --show-error "$WORKER_URL/v1/runs/latest?provider=adiga" -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN")"
+          RUN_ID="$(printf '%s' "$LATEST" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let j=JSON.parse(s);if(!j.runId)process.exit(1);process.stdout.write(j.runId)})")"
+          PLAN="$(curl --fail --silent --show-error --get "$WORKER_URL/v1/runs/$RUN_ID/resume-plan" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN" \
+            --data-urlencode 'familyKey=/ucp/cls/uni/classUnivView.do?menuId=PCCLSINF2000' \
+            --data-urlencode 'requestedYear=2027' \
+            --data-urlencode 'totalPages=500')"
+          printf '%s' "$PLAN" > /tmp/plan.json
+          node - <<'NODE'
+          const p=require('/tmp/plan.json');
+          if(!Array.isArray(p.deferred)) throw new Error('deferred missing from production resume-plan');
+          const pages=p.deferred.map(x=>x.page).sort((a,b)=>a-b);
+          console.log(`deferred pages: ${pages.join(',') || '(none)'}`);
+          console.log(`retry pages: ${(p.retry||[]).map(x=>x.page).join(',') || '(none)'}`);
+          if(!pages.includes(496)||!pages.includes(498)||!pages.includes(499)||!pages.includes(500)) {
+            throw new Error(`Expected current persistent server-error pages to be deferred, got ${JSON.stringify(p)}`);
+          }
+          NODE
