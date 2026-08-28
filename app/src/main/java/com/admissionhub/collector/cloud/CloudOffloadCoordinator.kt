@@ -10,11 +10,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Optional Cloudflare offload coordinator for Admission Collector v0.3.2.
+ * Cloudflare checkpoint coordinator for Admission Collector v0.3.2.
  *
- * The collector remains fully usable when this is not configured. When configured,
- * normalized page records and checkpoint/error metadata are streamed to the Worker.
- * The user's Adiga/Jinhak credentials, cookies, CSRF tokens and CAPTCHA data are not sent.
+ * The deployed Worker URL is built in, while the ingestion token is never hard-coded.
+ * Adiga/Jinhak credentials, cookies, CSRF tokens and CAPTCHA data are not sent.
  */
 class CloudOffloadCoordinator(context: Context) {
     private val appContext = context.applicationContext
@@ -50,7 +49,9 @@ class CloudOffloadCoordinator(context: Context) {
 
     fun isConfigured(): Boolean = workerUrl().isNotBlank() && token().isNotBlank()
 
-    fun workerUrl(): String = prefs.getString(KEY_URL, "")?.trim()?.trimEnd('/') ?: ""
+    fun workerUrl(): String =
+        prefs.getString(KEY_URL, null)?.trim()?.trimEnd('/')?.takeIf { it.isNotBlank() }
+            ?: DEFAULT_WORKER_URL
 
     private fun token(): String = prefs.getString(KEY_TOKEN, "") ?: ""
 
@@ -181,7 +182,7 @@ class CloudOffloadCoordinator(context: Context) {
 
     fun snapshotStatus(): JSONObject = JSONObject()
         .put("configured", isConfigured())
-        .put("workerUrl", workerUrl().ifBlank { JSONObject.NULL })
+        .put("workerUrl", workerUrl())
         .put("activeRunId", synchronized(lock) { activeRunId } ?: JSONObject.NULL)
         .put("reusedRun", reusedRun)
         .put("uploadedChunks", uploadedChunks)
@@ -195,12 +196,12 @@ class CloudOffloadCoordinator(context: Context) {
             setPadding(p, p / 2, p, 0)
         }
         val urlInput = EditText(activity).apply {
-            hint = "https://...workers.dev"
+            hint = DEFAULT_WORKER_URL
             setText(workerUrl())
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         }
         val tokenInput = EditText(activity).apply {
-            hint = if (token().isBlank()) "INGEST_TOKEN" else "토큰 유지: 비워두기"
+            hint = if (token().isBlank()) "ADMISSION_INGEST_TOKEN 입력" else "토큰 유지: 비워두기"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         layout.addView(urlInput)
@@ -208,15 +209,15 @@ class CloudOffloadCoordinator(context: Context) {
 
         AlertDialog.Builder(activity)
             .setTitle("Cloudflare Offload 설정")
-            .setMessage("어디가/진학사 로그인 정보와 쿠키는 전송하지 않습니다. Worker URL과 수집용 토큰만 저장합니다.")
+            .setMessage("Worker 주소는 배포된 기본값이 들어 있습니다. 수집용 토큰만 한 번 입력하면 됩니다. 어디가/진학사 로그인 정보와 쿠키는 전송하지 않습니다.")
             .setView(layout)
-            .setNeutralButton("설정 삭제") { _, _ ->
+            .setNeutralButton("토큰/설정 삭제") { _, _ ->
                 clearConfiguration()
                 onChanged?.invoke()
             }
             .setNegativeButton("취소", null)
             .setPositiveButton("저장") { _, _ ->
-                val url = urlInput.text.toString().trim().trimEnd('/')
+                val url = urlInput.text.toString().trim().trimEnd('/').ifBlank { DEFAULT_WORKER_URL }
                 val newToken = tokenInput.text.toString()
                 val editor = prefs.edit().putString(KEY_URL, url)
                 if (newToken.isNotBlank()) editor.putString(KEY_TOKEN, newToken)
@@ -325,6 +326,7 @@ class CloudOffloadCoordinator(context: Context) {
     }
 
     companion object {
+        const val DEFAULT_WORKER_URL = "https://admission-collector-offload.gigagene1234.workers.dev"
         private const val PREFS = "admission_cloud_offload"
         private const val KEY_URL = "worker_url"
         private const val KEY_TOKEN = "ingest_token"
