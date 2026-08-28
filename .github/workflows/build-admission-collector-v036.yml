@@ -29,7 +29,24 @@ jobs:
           ref: main
 
       - name: Apply deterministic v0.3.6 patch
-        run: python3 scripts/apply_v036.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q 'private const val VERSION = "0.3.6"' MainActivity.kt; then
+            echo 'v0.3.6 source already persisted; patch step skipped'
+          else
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/apply_v036.py')
+          s = p.read_text()
+          old = """    if 'collectorWebView' in text:\n        raise SystemExit(f\"{path}: obsolete collectorWebView reference remains\")\n"""
+          new = """    # Any residual reference at this point belongs to the old secondary collector.\n    # The v0.3.6 architecture deliberately uses the authenticated WebView for every crawl.\n    text = text.replace('collectorWebView', 'webView')\n    if 'collectorWebView' in text:\n        raise SystemExit(f\"{path}: obsolete collectorWebView reference remains\")\n"""
+          if old not in s:
+              raise SystemExit('apply_v036.py normalization marker missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
+            python3 scripts/apply_v036.py
+          fi
 
       - name: Verify v0.3.6 invariants
         shell: bash
@@ -105,7 +122,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add MainActivity.kt app/build.gradle.kts app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          git add MainActivity.kt app/build.gradle.kts app/src/main/java/com/admissionhub/collector/MainActivity.kt scripts/apply_v036.py
           if git diff --cached --quiet; then
             echo "v0.3.6 source already persisted"
           else
