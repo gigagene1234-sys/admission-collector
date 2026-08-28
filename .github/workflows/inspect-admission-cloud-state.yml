@@ -1,0 +1,34 @@
+name: Inspect Admission Cloud State
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/inspect-admission-cloud-state.yml"
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Cloudflare dependencies
+        working-directory: cloudflare
+        run: npm install --no-audit --no-fund
+      - name: Show latest real collector runs
+        working-directory: cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== LATEST REAL RUNS ==='
+          npx wrangler d1 execute admission-collector-db --remote --command "SELECT run_id, provider, collector_version, status, created_at, updated_at, uploaded_chunks, processed_chunks, received_records, unique_records, duplicate_records, error_count FROM runs WHERE provider NOT IN ('e2e-smoke','deployment-smoke') ORDER BY updated_at DESC LIMIT 10;" --json | tee /tmp/runs.json
+          echo '=== LATEST RUN PAGE COUNTS ==='
+          npx wrangler d1 execute admission-collector-db --remote --command "SELECT r.run_id, r.provider, r.status, COUNT(p.page_number) AS known_pages, SUM(CASE WHEN p.state='completed' THEN 1 ELSE 0 END) AS completed_pages, SUM(CASE WHEN p.state!='completed' THEN 1 ELSE 0 END) AS non_completed_pages, MAX(p.page_number) AS max_page FROM runs r LEFT JOIN run_pages p ON p.run_id=r.run_id WHERE r.provider NOT IN ('e2e-smoke','deployment-smoke') GROUP BY r.run_id ORDER BY r.updated_at DESC LIMIT 10;" --json | tee /tmp/pages.json
+          echo '=== MOST RECENT REAL RUN PAGE DETAILS ==='
+          npx wrangler d1 execute admission-collector-db --remote --command "SELECT family_key, requested_year, page_number, state, retry_count, error_type, updated_at FROM run_pages WHERE run_id=(SELECT run_id FROM runs WHERE provider NOT IN ('e2e-smoke','deployment-smoke') ORDER BY updated_at DESC LIMIT 1) ORDER BY updated_at DESC, page_number DESC LIMIT 30;" --json | tee /tmp/recent-pages.json
