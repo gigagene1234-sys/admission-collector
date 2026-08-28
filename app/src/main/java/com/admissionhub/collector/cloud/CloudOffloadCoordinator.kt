@@ -10,7 +10,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Cloudflare checkpoint coordinator for Admission Collector v0.3.2.
+ * Cloudflare checkpoint coordinator for Admission Collector v0.3.3.
  *
  * The deployed Worker URL is built in, while the ingestion token is never hard-coded.
  * Adiga/Jinhak credentials, cookies, CSRF tokens and CAPTCHA data are not sent.
@@ -82,29 +82,71 @@ class CloudOffloadCoordinator(context: Context) {
             ensureClientLocked()
         }
 
-        client?.createRun(
-            provider = provider,
-            collectorVersion = collectorVersion,
-            metadata = JSONObject()
-                .put("client", "android")
-                .put("checkpointMode", "incremental")
-        ) { result ->
-            val runId = result.getOrNull()
-            val error = result.exceptionOrNull()
-            synchronized(lock) {
-                creatingRun = false
-                if (runId != null) {
-                    activeRunId = runId
+        recoverOrCreateRun(provider, collectorVersion, onReady)
+    }
+
+    /**
+     * Recovers the newest unfinished server-side run when local SharedPreferences were
+     * lost (for example after the one-time migration from an ephemeral debug signature).
+     * This preserves D1 checkpoints without exporting browser credentials or cookies.
+     */
+    private fun recoverOrCreateRun(
+        provider: String,
+        collectorVersion: String,
+        onReady: ((String?) -> Unit)?
+    ) {
+        val currentClient = synchronized(lock) { ensureClientLocked(); client }
+        if (currentClient == null) {
+            synchronized(lock) { creatingRun = false }
+            onReady?.invoke(null)
+            return
+        }
+
+        currentClient.getLatestActiveRun(provider) { lookup ->
+            val recovered = lookup.getOrNull()
+            if (!recovered.isNullOrBlank()) {
+                synchronized(lock) {
+                    creatingRun = false
+                    activeRunId = recovered
+                    activeProvider = provider
+                    reusedRun = true
                     prefs.edit()
-                        .putString(KEY_ACTIVE_RUN, runId)
+                        .putString(KEY_ACTIVE_RUN, recovered)
                         .putString(KEY_ACTIVE_PROVIDER, provider)
                         .apply()
-                } else {
-                    lastError = error?.message ?: "run creation failed"
                 }
+                flushPending()
+                onReady?.invoke(recovered)
+                return@getLatestActiveRun
             }
-            if (runId != null) flushPending()
-            onReady?.invoke(runId)
+
+            currentClient.createRun(
+                provider = provider,
+                collectorVersion = collectorVersion,
+                metadata = JSONObject()
+                    .put("client", "android")
+                    .put("checkpointMode", "incremental")
+                    .put("recoveryLookup", if (lookup.isSuccess) "none-found" else "failed")
+            ) { result ->
+                val runId = result.getOrNull()
+                val error = result.exceptionOrNull()
+                synchronized(lock) {
+                    creatingRun = false
+                    if (runId != null) {
+                        activeRunId = runId
+                        activeProvider = provider
+                        reusedRun = false
+                        prefs.edit()
+                            .putString(KEY_ACTIVE_RUN, runId)
+                            .putString(KEY_ACTIVE_PROVIDER, provider)
+                            .apply()
+                    } else {
+                        lastError = error?.message ?: lookup.exceptionOrNull()?.message ?: "run creation failed"
+                    }
+                }
+                if (runId != null) flushPending()
+                onReady?.invoke(runId)
+            }
         }
     }
 

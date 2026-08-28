@@ -10,7 +10,7 @@ import java.util.UUID
 import java.util.concurrent.Executors
 
 /**
- * v0.3.2 Cloudflare offload client.
+ * v0.3.3 Cloudflare offload client.
  *
  * No credentials are hard-coded here.
  * Supply workerUrl/token from runtime configuration and store the token
@@ -103,6 +103,17 @@ class CloudOffloadClient(
         callback: (Result<JSONObject>) -> Unit
     ) = io.execute {
         callback(runCatching { get("/v1/runs/${encode(runId)}/status") })
+    }
+
+    fun getLatestActiveRun(
+        provider: String,
+        callback: (Result<String?>) -> Unit
+    ) = io.execute {
+        callback(runCatching {
+            get("/v1/runs/latest?provider=${encode(provider)}")
+                .optString("runId")
+                .takeIf { it.isNotBlank() && it != "null" }
+        })
     }
 
     fun getResumePlan(

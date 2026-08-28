@@ -12,13 +12,19 @@ export default {
         return json({
           ok: true,
           service: "admission-collector-offload",
-          version: "0.3.2",
+          version: "0.3.3",
           time: new Date().toISOString(),
         });
       }
 
       if (!(await isAuthorized(request, env))) {
         return json({ error: "unauthorized" }, 401);
+      }
+
+      if (request.method === "GET" && url.pathname === "/v1/runs/latest") {
+        const provider = String(url.searchParams.get("provider") || "").slice(0, 40);
+        if (!provider) return json({ error: "provider is required" }, 400);
+        return getLatestActiveRun(env, provider);
       }
 
       if (request.method === "POST" && url.pathname === "/v1/runs") {
@@ -161,6 +167,24 @@ async function readJson(request, maxBytes) {
   }
   if (!text) return {};
   return JSON.parse(text);
+}
+
+async function getLatestActiveRun(env, provider) {
+  const row = await env.DB.prepare(`
+    SELECT run_id, provider, collector_version, status, created_at, updated_at
+    FROM runs
+    WHERE provider = ? AND status = 'collecting'
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `).bind(provider).first();
+
+  return json({
+    runId: row?.run_id || null,
+    provider: row?.provider || provider,
+    collectorVersion: row?.collector_version || null,
+    status: row?.status || null,
+    updatedAt: row?.updated_at || null,
+  });
 }
 
 async function createRun(env, body) {
