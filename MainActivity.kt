@@ -92,6 +92,10 @@ class MainActivity : Activity() {
     private var activeBatchPageAction: BatchPageAction? = null
     private var batchPageCount = 0
     private var batchPaginationRetries = 0
+    private var batchCloudPlansPending = 0
+    private var batchCloudResumePlans = 0
+    private var batchCloudPagesScheduled = 0
+    private var batchCloudPagesSkipped = 0
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
@@ -480,23 +484,33 @@ class MainActivity : Activity() {
         batchCollecting = false
         batchPageCount = 0
         batchPaginationRetries = 0
+        batchCloudPlansPending = 0
+        batchCloudResumePlans = 0
+        batchCloudPagesScheduled = 0
+        batchCloudPagesSkipped = 0
         currentBatchTarget = url
         batchButton.text = "일괄 수집 중지"
-        cloudOffload.beginOrResume(provider.wireName, VERSION) { runId ->
-            if (runId != null) {
-                runOnUiThread {
-                    status.text = "Cloud 체크포인트 연결: ${runId.take(8)}… / 수집 시작"
-                }
-            }
+        status.text = if (cloudOffload.isConfigured()) {
+            "Cloud 체크포인트 연결 준비 중…"
+        } else {
+            "Cloud 토큰 미설정: 로컬 안전모드로 수집 시작"
         }
-        enqueueProviderSeeds()
-        status.text = "일괄 수집 시작: 기본 정보영역 ${batchQueue.size}개를 포함해 탐색합니다."
-
-        checkSessionState { needsLogin, _ ->
-            if (needsLogin) {
-                pauseBatchForLogin()
-            } else {
-                scheduleBatchSnapshot()
+        cloudOffload.beginOrResume(provider.wireName, VERSION) { runId ->
+            runOnUiThread {
+                if (!batchRunning) return@runOnUiThread
+                enqueueProviderSeeds()
+                status.text = if (runId != null) {
+                    "Cloud 체크포인트 연결: ${runId.take(8)}… / 기본 정보영역 ${batchQueue.size}개 탐색"
+                } else {
+                    "로컬 안전모드: 기본 정보영역 ${batchQueue.size}개 탐색"
+                }
+                checkSessionState { needsLogin, _ ->
+                    if (needsLogin) {
+                        pauseBatchForLogin()
+                    } else {
+                        scheduleBatchSnapshot()
+                    }
+                }
             }
         }
     }
@@ -860,6 +874,11 @@ class MainActivity : Activity() {
 
     private fun loadNextBatchPage() {
         if (!batchRunning || batchPausedForLogin) return
+        if (batchCloudPlansPending > 0) {
+            status.text = "Cloud resume 계획 확인 중: ${batchCloudPlansPending}개 목록"
+            handler.postDelayed({ loadNextBatchPage() }, 180)
+            return
+        }
 
         while (batchPageActions.isNotEmpty()) {
             val action = batchPageActions.removeFirst()
@@ -1022,6 +1041,9 @@ class MainActivity : Activity() {
                 .put("errorPages", batchErrors.length())
                 .put("records", batchRecords.length())
                 .put("paginationRetries", batchPaginationRetries)
+                .put("cloudResumePlans", batchCloudResumePlans)
+                .put("cloudPagesScheduled", batchCloudPagesScheduled)
+                .put("cloudPagesSkipped", batchCloudPagesSkipped)
         )
         status.text = "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 최종오류 ${batchErrors.length()} / 재시도 $batchPaginationRetries / 레코드 ${batchRecords.length()}"
     }
@@ -1043,6 +1065,9 @@ class MainActivity : Activity() {
                 .put("paginationActionsFailed", batchPageActionFailed.size)
                 .put("paginationRetries", batchPaginationRetries)
                 .put("paginationPlans", batchPaginationPlanned.size)
+                .put("cloudResumePlans", batchCloudResumePlans)
+                .put("cloudPagesScheduled", batchCloudPagesScheduled)
+                .put("cloudPagesSkipped", batchCloudPagesSkipped)
                 .put("duplicateYearViewsSkipped", batchDuplicateYearViews.length())
                 .put("dynamicSearchBootstraps", batchBootstrapSearchAttempted.size))
             .put("errors", batchErrors)
@@ -1115,7 +1140,50 @@ class MainActivity : Activity() {
         val planKey = "$baseUrl|${plan.totalItems}|${plan.pageSize}|${plan.totalPages}"
         if (!batchPaginationPlanned.add(planKey)) return
 
-        for (page in 2..plan.totalPages) {
+        if (!cloudOffload.isConfigured()) {
+            enqueuePageActions(baseUrl, plan, (2..plan.totalPages).toList())
+            return
+        }
+
+        batchCloudPlansPending += 1
+        cloudOffload.resumePlan(plan.familyKey, plan.requestedYear, plan.totalPages) { result ->
+            runOnUiThread {
+                batchCloudPlansPending = (batchCloudPlansPending - 1).coerceAtLeast(0)
+                if (!batchRunning) return@runOnUiThread
+
+                val response = result.getOrNull()
+                val pages = linkedSetOf<Int>()
+                if (response != null && !(response.optBoolean("truncated", false) && plan.totalPages > 500)) {
+                    val missing = response.optJSONArray("missing") ?: JSONArray()
+                    for (i in 0 until missing.length()) {
+                        val page = missing.optInt(i, -1)
+                        if (page in 2..plan.totalPages) pages.add(page)
+                    }
+                    val retry = response.optJSONArray("retry") ?: JSONArray()
+                    for (i in 0 until retry.length()) {
+                        val page = retry.optJSONObject(i)?.optInt("page", -1) ?: -1
+                        if (page in 2..plan.totalPages) pages.add(page)
+                    }
+                    batchCloudResumePlans += 1
+                    batchCloudPagesScheduled += pages.size
+                    val skipped = (plan.totalPages - 1 - pages.size).coerceAtLeast(0)
+                    batchCloudPagesSkipped += skipped
+                    status.text = "Cloud resume: ${pages.size}쪽 재수집 / ${skipped}쪽 완료로 건너뜀"
+                    enqueuePageActions(baseUrl, plan, pages.sorted())
+                } else {
+                    val fallback = (2..plan.totalPages).toList()
+                    enqueuePageActions(baseUrl, plan, fallback)
+                    status.text = "Cloud resume 확인 실패: 전체 페이지 안전 수집으로 전환"
+                }
+
+                handler.postDelayed({ loadNextBatchPage() }, 120)
+            }
+        }
+    }
+
+    private fun enqueuePageActions(baseUrl: String, plan: PaginationPlan, pages: Collection<Int>) {
+        for (page in pages) {
+            if (page !in 2..plan.totalPages) continue
             val action = BatchPageAction(
                 baseUrl = baseUrl,
                 page = page,
