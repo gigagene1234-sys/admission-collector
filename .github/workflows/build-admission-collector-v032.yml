@@ -3,7 +3,7 @@ name: Build Admission Collector v0.3.2
 on:
   push:
     branches:
-      - feature/v0.3.2-cloud-offload
+      - main
   pull_request:
     branches:
       - main
@@ -92,8 +92,8 @@ jobs:
       - name: Build debug APK
         run: gradle --no-daemon :app:assembleDebug
 
-      - name: Persist generated v0.3.2 source on feature branch
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/feature/v0.3.2-cloud-offload' }}
+      - name: Persist generated v0.3.2 source on main
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -104,7 +104,7 @@ jobs:
             echo "Generated source already persisted"
           else
             git commit -m "Apply v0.3.2 cloud offload integration [skip ci]"
-            git push origin HEAD:feature/v0.3.2-cloud-offload
+            git push origin HEAD:main
           fi
 
       - name: Upload debug APK
