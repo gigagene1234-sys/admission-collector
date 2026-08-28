@@ -9,11 +9,13 @@ GRADLE = ROOT / "app/build.gradle.kts"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
-    if new in text:
-        return text
     count = text.count(old)
+    if count == 0:
+        if new in text:
+            return text
+        raise SystemExit(f"{label}: old and new forms are both missing")
     if count != 1:
-        raise SystemExit(f"{label}: expected exactly one match, found {count}")
+        raise SystemExit(f"{label}: expected exactly one old-form match, found {count}")
     return text.replace(old, new, 1)
 
 
