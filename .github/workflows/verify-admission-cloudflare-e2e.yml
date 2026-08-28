@@ -46,6 +46,7 @@ jobs:
           RUN_ID="$(printf '%s' "$RUN_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(!j.runId)process.exit(1);process.stdout.write(j.runId)})")"
           CHUNK_ID="e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           FINGERPRINT="e2e-record-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export CHUNK_ID FINGERPRINT
 
           node -e '
             const fs=require("fs");
@@ -67,7 +68,7 @@ jobs:
               page:{familyKey:"deployment-smoke",requestedYear:2027,page:2,state:"completed",retryCount:0}
             };
             fs.writeFileSync("/tmp/chunk.json",JSON.stringify(body));
-          ' CHUNK_ID="$CHUNK_ID" FINGERPRINT="$FINGERPRINT"
+          '
 
           curl --fail --silent --show-error \
             -X POST "$WORKER_URL/v1/runs/$RUN_ID/chunks" \
@@ -114,6 +115,3 @@ jobs:
             --data '{"status":"completed","completionReason":"e2e-verified","summary":{"queue":true,"d1":true,"resumePlan":true}}' >/dev/null
 
           echo "Queue -> D1 -> resume-plan verified."
-        env:
-          CHUNK_ID: placeholder
-          FINGERPRINT: placeholder
