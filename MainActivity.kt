@@ -45,6 +45,7 @@ class MainActivity : Activity() {
     private var batchSnapshots = JSONArray()
     private var batchRecords = JSONArray()
     private var batchResources = JSONArray()
+    private var batchErrors = JSONArray()
     private var batchRunning = false
     private var batchPausedForLogin = false
     private var batchCollecting = false
@@ -60,7 +61,7 @@ class MainActivity : Activity() {
         private const val JINHAK_URL = "https://www.jinhak.com/"
         private const val MAX_BATCH_PAGES = 240
         private const val PREVIEW_LIMIT = 16000
-        private const val VERSION = "0.2.1"
+        private const val VERSION = "0.2.2"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -345,17 +346,18 @@ class MainActivity : Activity() {
               var pw=document.querySelectorAll('input[type=password]');
               for(var i=0;i<pw.length;i++){ if(visible(pw[i])) { pass=true; break; } }
               var text=(document.body && document.body.innerText ? document.body.innerText : '').slice(0,12000);
-              var authenticated=/(로그아웃|마이페이지|내\s*정보|회원정보|MY\s*PAGE|LOG\s*OUT|SIGN\s*OUT)/i.test(text);
-              var loginUrl=/(login|signin|sign-in|member\/login|loginForm)/i.test(location.href);
-              var loginControl=false;
+              var logoutControl=false;
               var controls=document.querySelectorAll('a,button,[role=button]');
               for(var j=0;j<controls.length;j++){
                 var node=controls[j];
                 if(!visible(node)) continue;
                 var label=(node.innerText||node.textContent||node.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim();
-                if(/^(로그인|log\s*in|sign\s*in)$/i.test(label)){ loginControl=true; break; }
+                if(/^(로그아웃|log\s*out|sign\s*out)$/i.test(label)){ logoutControl=true; break; }
               }
-              return JSON.stringify({needsLogin:(pass||loginUrl||loginControl)&&!authenticated,authenticated:authenticated});
+              var loginUrl=/(\/mbs\/log\/|login|signin|sign-in|member\/login|loginForm)/i.test(location.href);
+              var loginRequired=/(로그인이\s*필요|로그인\s*후\s*(?:이용|사용)|로그인해\s*주세요|로그인해주세요|회원만\s*이용|서비스\s*이용을\s*위해\s*로그인)/i.test(text);
+              var authenticated=logoutControl;
+              return JSON.stringify({needsLogin:(pass||loginUrl||loginRequired)&&!authenticated,authenticated:authenticated});
             })();
         """.trimIndent()
 
@@ -390,6 +392,7 @@ class MainActivity : Activity() {
         batchSnapshots = JSONArray()
         batchRecords = JSONArray()
         batchResources = JSONArray()
+        batchErrors = JSONArray()
         batchRunning = true
         batchPausedForLogin = false
         batchCollecting = false
@@ -482,22 +485,33 @@ class MainActivity : Activity() {
             batchCollecting = false
             if (!batchRunning || snapshot == null) return@collectSnapshot
 
+            val navigationKey = snapshot.optString("navigationKey")
+            if (navigationKey.isNotBlank()) batchVisited.add(navigationKey)
+            batchPageCount += 1
+
+            val pageState = snapshot.optJSONObject("pageState") ?: JSONObject()
+            if (pageState.optBoolean("isError", false)) {
+                batchErrors.put(JSONObject()
+                    .put("url", snapshot.optString("url"))
+                    .put("type", pageState.optString("errorType", "page-error"))
+                    .put("title", snapshot.optString("title")))
+                status.text = "오류 페이지 건너뜀: ${pageState.optString("errorType", "error")} / 계속 탐색 중"
+                handler.postDelayed({ loadNextBatchPage() }, 250)
+                return@collectSnapshot
+            }
+
             val session = snapshot.optJSONObject("session") ?: JSONObject()
             if (session.optBoolean("needsLogin", false)) {
                 pauseBatchForLogin()
                 return@collectSnapshot
             }
 
-            val navigationKey = snapshot.optString("navigationKey")
-            if (navigationKey.isNotBlank()) batchVisited.add(navigationKey)
-            batchPageCount += 1
-
             batchSnapshots.put(stripNavigationLinksForExport(snapshot))
             appendUniqueRecords(batchRecords, normalizeSnapshot(snapshot))
             appendUniqueResources(batchResources, snapshot.optJSONArray("resourceLinks") ?: JSONArray())
             enqueueDiscoveredLinks(snapshot.optJSONArray("navigationLinks") ?: JSONArray())
 
-            status.text = "일괄 수집: 페이지 $batchPageCount / 대기 ${batchQueue.size} / 레코드 ${batchRecords.length()}"
+            status.text = "일괄 수집: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / 대기 ${batchQueue.size} / 레코드 ${batchRecords.length()}"
 
             if (batchPageCount >= MAX_BATCH_PAGES) {
                 finishBatch("page-limit")
@@ -527,7 +541,7 @@ class MainActivity : Activity() {
         batchCollecting = false
         batchButton.text = "접근 가능 정보 일괄 수집"
         finalizeBatchJson(reason)
-        status.text = "일괄 수집 완료: 페이지 $batchPageCount / 레코드 ${batchRecords.length()} / 자료링크 ${batchResources.length()}"
+        status.text = "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / 레코드 ${batchRecords.length()}"
     }
 
     private fun finalizeBatchJson(reason: String) {
@@ -538,9 +552,12 @@ class MainActivity : Activity() {
             .put("mode", "batch")
             .put("completion", reason)
             .put("summary", JSONObject()
-                .put("pages", batchSnapshots.length())
+                .put("attemptedPages", batchPageCount)
+                .put("successfulPages", batchSnapshots.length())
+                .put("errorPages", batchErrors.length())
                 .put("records", batchRecords.length())
                 .put("resourceLinks", batchResources.length()))
+            .put("errors", batchErrors)
             .put("records", batchRecords)
             .put("snapshots", batchSnapshots)
             .put("resourceLinks", batchResources)
@@ -645,17 +662,23 @@ class MainActivity : Activity() {
           var pass=false;
           var pw=document.querySelectorAll('input[type=password]');
           for(var p=0;p<pw.length;p++){ if(visible(pw[p])) { pass=true; break; } }
-          var bodyText=(document.body&&document.body.innerText?document.body.innerText:'').slice(0,12000);
-          var authenticated=/(로그아웃|마이페이지|내\s*정보|회원정보|MY\s*PAGE|LOG\s*OUT|SIGN\s*OUT)/i.test(bodyText);
-          var loginUrl=/(login|signin|sign-in|member\/login|loginForm)/i.test(location.href);
-          var loginControl=false;
+          var bodyText=(document.body&&document.body.innerText?document.body.innerText:'').slice(0,16000);
+          var logoutControl=false;
           var sessionControls=document.querySelectorAll('a,button,[role=button]');
           for(var sc=0;sc<sessionControls.length;sc++){
             var sn=sessionControls[sc];
             if(!visible(sn)) continue;
             var sl=cleanText(sn.innerText||sn.textContent||sn.getAttribute('aria-label')||'');
-            if(/^(로그인|log\s*in|sign\s*in)$/i.test(sl)){ loginControl=true; break; }
+            if(/^(로그아웃|log\s*out|sign\s*out)$/i.test(sl)){ logoutControl=true; break; }
           }
+          var loginUrl=/(\/mbs\/log\/|login|signin|sign-in|member\/login|loginForm)/i.test(location.href);
+          var loginRequired=/(로그인이\s*필요|로그인\s*후\s*(?:이용|사용)|로그인해\s*주세요|로그인해주세요|회원만\s*이용|서비스\s*이용을\s*위해\s*로그인)/i.test(bodyText);
+          var authenticated=logoutControl;
+          var titleText=cleanText(document.title||'');
+          var error404=/(404\s*Not\s*Found|요청하신\s*페이지를\s*찾을\s*수\s*없|페이지를\s*찾을\s*수\s*없)/i.test(titleText+' '+bodyText);
+          var serverError=/(500\s*(?:Internal\s*Server\s*Error)?|서비스\s*처리\s*중\s*오류|일시적인\s*오류가\s*발생)/i.test(titleText+' '+bodyText);
+          var pageError=error404||serverError;
+          var errorType=error404?'404':(serverError?'server-error':'');
 
           var context=[];
           var contextNodes=document.querySelectorAll('h1,h2,h3,h4,h5,h6,.title,.tit,.sub-title,.breadcrumb,.location,[class*=title],[class*=breadcrumb]');
@@ -755,7 +778,8 @@ class MainActivity : Activity() {
             url:safeExportUrl(location.href),
             navigationKey:fullNavigationUrl(location.href),
             collectedAt:new Date().toISOString(),
-            session:{needsLogin:(pass||loginUrl||loginControl)&&!authenticated,authenticated:authenticated},
+            session:{needsLogin:(pass||loginUrl||loginRequired)&&!authenticated,authenticated:authenticated},
+            pageState:{isError:pageError,errorType:errorType},
             discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates},
             context:context,
             tables:tables,
