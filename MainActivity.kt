@@ -24,6 +24,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
 import com.admissionhub.collector.capture.SnapshotScript
+import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.parser.RecordUtils
 import com.admissionhub.collector.provider.PaginationPlan
 import com.admissionhub.collector.provider.ProviderAdapter
@@ -38,6 +39,7 @@ class MainActivity : Activity() {
     private lateinit var sessionState: TextView
     private lateinit var preview: TextView
     private lateinit var batchButton: Button
+    private lateinit var cloudOffload: CloudOffloadCoordinator
 
     private val handler = Handler(Looper.getMainLooper())
     private val sessionKeepAlive = object : Runnable {
@@ -90,6 +92,10 @@ class MainActivity : Activity() {
     private var activeBatchPageAction: BatchPageAction? = null
     private var batchPageCount = 0
     private var batchPaginationRetries = 0
+    private var batchCloudPlansPending = 0
+    private var batchCloudResumePlans = 0
+    private var batchCloudPagesScheduled = 0
+    private var batchCloudPagesSkipped = 0
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
@@ -99,11 +105,12 @@ class MainActivity : Activity() {
         private const val MAX_BATCH_PAGES = 2000
         private const val MAX_PAGE_RETRIES = 2
         private const val PREVIEW_LIMIT = 16000
-        private const val VERSION = "0.3.1"
+        private const val VERSION = "0.3.2"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        cloudOffload = CloudOffloadCoordinator(this)
         buildUi()
         configureWebView()
         openProvider(ProviderId.ADIGA)
@@ -177,8 +184,21 @@ class MainActivity : Activity() {
             text = "JSON 저장"
             setOnClickListener { saveJson() }
         }
+        val cloudSettings = Button(this).apply {
+            text = "Cloud 설정"
+            setOnClickListener {
+                cloudOffload.showSettingsDialog(this@MainActivity) {
+                    status.text = if (cloudOffload.isConfigured()) {
+                        "Cloudflare Offload 설정됨"
+                    } else {
+                        "Cloudflare Offload 미설정: 로컬 수집 모드"
+                    }
+                }
+            }
+        }
         actions2.addView(resume, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         actions2.addView(save, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        actions2.addView(cloudSettings, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
         status = TextView(this).apply {
             text = "Admission Collector v$VERSION 준비 중"
@@ -464,16 +484,33 @@ class MainActivity : Activity() {
         batchCollecting = false
         batchPageCount = 0
         batchPaginationRetries = 0
+        batchCloudPlansPending = 0
+        batchCloudResumePlans = 0
+        batchCloudPagesScheduled = 0
+        batchCloudPagesSkipped = 0
         currentBatchTarget = url
         batchButton.text = "일괄 수집 중지"
-        enqueueProviderSeeds()
-        status.text = "일괄 수집 시작: 기본 정보영역 ${batchQueue.size}개를 포함해 탐색합니다."
-
-        checkSessionState { needsLogin, _ ->
-            if (needsLogin) {
-                pauseBatchForLogin()
-            } else {
-                scheduleBatchSnapshot()
+        status.text = if (cloudOffload.isConfigured()) {
+            "Cloud 체크포인트 연결 준비 중…"
+        } else {
+            "Cloud 토큰 미설정: 로컬 안전모드로 수집 시작"
+        }
+        cloudOffload.beginOrResume(provider.wireName, VERSION) { runId ->
+            runOnUiThread {
+                if (!batchRunning) return@runOnUiThread
+                enqueueProviderSeeds()
+                status.text = if (runId != null) {
+                    "Cloud 체크포인트 연결: ${runId.take(8)}… / 기본 정보영역 ${batchQueue.size}개 탐색"
+                } else {
+                    "로컬 안전모드: 기본 정보영역 ${batchQueue.size}개 탐색"
+                }
+                checkSessionState { needsLogin, _ ->
+                    if (needsLogin) {
+                        pauseBatchForLogin()
+                    } else {
+                        scheduleBatchSnapshot()
+                    }
+                }
             }
         }
     }
@@ -750,6 +787,14 @@ class MainActivity : Activity() {
                         .put("retryCount", activeAction.retry)
                 }
                 batchErrors.put(error)
+                cloudOffload.uploadError(
+                    provider = provider.wireName,
+                    familyKey = activeAction?.familyKey,
+                    requestedYear = activeAction?.requestedYear,
+                    page = activeAction?.page,
+                    retryCount = activeAction?.retry ?: 0,
+                    error = error
+                )
                 status.text = if (activeAction != null) {
                     "목록 ${activeAction.page}/${activeAction.totalPages}쪽 최종 실패 / 다음 페이지 계속"
                 } else {
@@ -793,7 +838,16 @@ class MainActivity : Activity() {
 
             batchSnapshots.put(stripNavigationLinksForExport(snapshot))
             tableFingerprint(snapshot)?.let { batchLastTableSignatures[canonicalizeBatchUrl(snapshot.optString("url"))] = it }
-            RecordUtils.appendUniqueRecords(batchRecords, normalizeSnapshot(snapshot))
+            val pageRecords = normalizeSnapshot(snapshot)
+            RecordUtils.appendUniqueRecords(batchRecords, pageRecords)
+            cloudOffload.uploadPage(
+                provider = provider.wireName,
+                records = pageRecords,
+                familyKey = activeAction?.familyKey ?: plan?.familyKey,
+                requestedYear = activeAction?.requestedYear ?: plan?.requestedYear,
+                page = activeAction?.page ?: if (plan != null) 1 else null,
+                retryCount = activeAction?.retry ?: 0
+            )
             RecordUtils.appendUniqueResources(batchResources, snapshot.optJSONArray("resourceLinks") ?: JSONArray())
 
             if (activeAction == null) {
@@ -820,6 +874,11 @@ class MainActivity : Activity() {
 
     private fun loadNextBatchPage() {
         if (!batchRunning || batchPausedForLogin) return
+        if (batchCloudPlansPending > 0) {
+            status.text = "Cloud resume 계획 확인 중: ${batchCloudPlansPending}개 목록"
+            handler.postDelayed({ loadNextBatchPage() }, 180)
+            return
+        }
 
         while (batchPageActions.isNotEmpty()) {
             val action = batchPageActions.removeFirst()
@@ -913,14 +972,23 @@ class MainActivity : Activity() {
 
     private fun recordPaginationFailure(action: BatchPageAction, type: String) {
         batchPageActionFailed.add(pageActionKey(action))
-        batchErrors.put(JSONObject()
+        val error = JSONObject()
             .put("url", action.baseUrl)
             .put("type", type)
             .put("page", action.page)
             .put("totalPages", action.totalPages)
             .put("familyKey", action.familyKey)
             .put("requestedYear", action.requestedYear ?: JSONObject.NULL)
-            .put("retryCount", action.retry))
+            .put("retryCount", action.retry)
+        batchErrors.put(error)
+        cloudOffload.uploadError(
+            provider = provider.wireName,
+            familyKey = action.familyKey,
+            requestedYear = action.requestedYear,
+            page = action.page,
+            retryCount = action.retry,
+            error = error
+        )
     }
 
     private fun pageActionStatus(action: BatchPageAction, suffix: String): String {
@@ -965,6 +1033,18 @@ class MainActivity : Activity() {
         batchCollecting = false
         batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
         finalizeBatchJson(reason)
+        cloudOffload.finish(
+            reason = reason,
+            summary = JSONObject()
+                .put("attemptedPages", batchPageCount)
+                .put("successfulPages", batchSnapshots.length())
+                .put("errorPages", batchErrors.length())
+                .put("records", batchRecords.length())
+                .put("paginationRetries", batchPaginationRetries)
+                .put("cloudResumePlans", batchCloudResumePlans)
+                .put("cloudPagesScheduled", batchCloudPagesScheduled)
+                .put("cloudPagesSkipped", batchCloudPagesSkipped)
+        )
         status.text = "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 최종오류 ${batchErrors.length()} / 재시도 $batchPaginationRetries / 레코드 ${batchRecords.length()}"
     }
 
@@ -985,11 +1065,15 @@ class MainActivity : Activity() {
                 .put("paginationActionsFailed", batchPageActionFailed.size)
                 .put("paginationRetries", batchPaginationRetries)
                 .put("paginationPlans", batchPaginationPlanned.size)
+                .put("cloudResumePlans", batchCloudResumePlans)
+                .put("cloudPagesScheduled", batchCloudPagesScheduled)
+                .put("cloudPagesSkipped", batchCloudPagesSkipped)
                 .put("duplicateYearViewsSkipped", batchDuplicateYearViews.length())
                 .put("dynamicSearchBootstraps", batchBootstrapSearchAttempted.size))
             .put("errors", batchErrors)
             .put("retryEvents", batchRetryEvents)
             .put("duplicateYearViews", batchDuplicateYearViews)
+            .put("cloudOffload", cloudOffload.snapshotStatus())
             .put("records", batchRecords)
             .put("snapshots", batchSnapshots)
             .put("resourceLinks", batchResources)
@@ -1056,7 +1140,50 @@ class MainActivity : Activity() {
         val planKey = "$baseUrl|${plan.totalItems}|${plan.pageSize}|${plan.totalPages}"
         if (!batchPaginationPlanned.add(planKey)) return
 
-        for (page in 2..plan.totalPages) {
+        if (!cloudOffload.isConfigured()) {
+            enqueuePageActions(baseUrl, plan, (2..plan.totalPages).toList())
+            return
+        }
+
+        batchCloudPlansPending += 1
+        cloudOffload.resumePlan(plan.familyKey, plan.requestedYear, plan.totalPages) { result ->
+            runOnUiThread {
+                batchCloudPlansPending = (batchCloudPlansPending - 1).coerceAtLeast(0)
+                if (!batchRunning) return@runOnUiThread
+
+                val response = result.getOrNull()
+                val pages = linkedSetOf<Int>()
+                if (response != null && !(response.optBoolean("truncated", false) && plan.totalPages > 500)) {
+                    val missing = response.optJSONArray("missing") ?: JSONArray()
+                    for (i in 0 until missing.length()) {
+                        val page = missing.optInt(i, -1)
+                        if (page in 2..plan.totalPages) pages.add(page)
+                    }
+                    val retry = response.optJSONArray("retry") ?: JSONArray()
+                    for (i in 0 until retry.length()) {
+                        val page = retry.optJSONObject(i)?.optInt("page", -1) ?: -1
+                        if (page in 2..plan.totalPages) pages.add(page)
+                    }
+                    batchCloudResumePlans += 1
+                    batchCloudPagesScheduled += pages.size
+                    val skipped = (plan.totalPages - 1 - pages.size).coerceAtLeast(0)
+                    batchCloudPagesSkipped += skipped
+                    status.text = "Cloud resume: ${pages.size}쪽 재수집 / ${skipped}쪽 완료로 건너뜀"
+                    enqueuePageActions(baseUrl, plan, pages.sorted())
+                } else {
+                    val fallback = (2..plan.totalPages).toList()
+                    enqueuePageActions(baseUrl, plan, fallback)
+                    status.text = "Cloud resume 확인 실패: 전체 페이지 안전 수집으로 전환"
+                }
+
+                handler.postDelayed({ loadNextBatchPage() }, 120)
+            }
+        }
+    }
+
+    private fun enqueuePageActions(baseUrl: String, plan: PaginationPlan, pages: Collection<Int>) {
+        for (page in pages) {
+            if (page !in 2..plan.totalPages) continue
             val action = BatchPageAction(
                 baseUrl = baseUrl,
                 page = page,
@@ -1187,6 +1314,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         CookieManager.getInstance().flush()
+        cloudOffload.shutdown()
         webView.stopLoading()
         webView.destroy()
         super.onDestroy()
