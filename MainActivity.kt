@@ -47,6 +47,8 @@ class MainActivity : Activity() {
     private val batchPageActions = ArrayDeque<BatchPageAction>()
     private val batchPageActionQueued = linkedSetOf<String>()
     private val batchPageActionVisited = linkedSetOf<String>()
+    private val batchBootstrapSearchAttempted = linkedSetOf<String>()
+    private var batchReadinessPolling = false
     private var batchSnapshots = JSONArray()
     private var batchRecords = JSONArray()
     private var batchResources = JSONArray()
@@ -67,7 +69,7 @@ class MainActivity : Activity() {
         private const val JINHAK_URL = "https://www.jinhak.com/"
         private const val MAX_BATCH_PAGES = 900
         private const val PREVIEW_LIMIT = 16000
-        private const val VERSION = "0.2.3"
+        private const val VERSION = "0.2.4"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -405,6 +407,8 @@ class MainActivity : Activity() {
         batchPageActions.clear()
         batchPageActionQueued.clear()
         batchPageActionVisited.clear()
+        batchBootstrapSearchAttempted.clear()
+        batchReadinessPolling = false
         pendingBatchPageAction = null
         batchSnapshots = JSONArray()
         batchRecords = JSONArray()
@@ -436,6 +440,7 @@ class MainActivity : Activity() {
         batchQueued.clear()
         batchPageActions.clear()
         batchPageActionQueued.clear()
+        batchReadinessPolling = false
         pendingBatchPageAction = null
         batchButton.text = "접근 가능 정보 일괄 수집"
         status.text = "일괄 수집 중지: $reason"
@@ -475,7 +480,107 @@ class MainActivity : Activity() {
 
     private fun scheduleBatchSnapshot() {
         if (!batchRunning || batchPausedForLogin || batchCollecting) return
-        handler.postDelayed({ collectSnapshotForBatch() }, 500)
+        val url = canonicalizeBatchUrl(webView.url ?: "")
+        if (provider == "adiga" && isAdigaDynamicListPage(url)) {
+            if (batchReadinessPolling) return
+            batchReadinessPolling = true
+            pollAdigaDynamicListReadiness(url, attempt = 0, afterBootstrap = false)
+        } else {
+            handler.postDelayed({ collectSnapshotForBatch() }, 650)
+        }
+    }
+
+    private fun isAdigaDynamicListPage(url: String): Boolean {
+        return url.contains("/ucp/uvt/uni/univView.do") ||
+            url.contains("/ucp/cls/uni/classUnivView.do") ||
+            url.contains("/ucp/prc/uni/admssUnivView.do")
+    }
+
+    private fun pollAdigaDynamicListReadiness(baseUrl: String, attempt: Int, afterBootstrap: Boolean) {
+        if (!batchRunning || batchPausedForLogin || batchCollecting) {
+            batchReadinessPolling = false
+            return
+        }
+        val current = canonicalizeBatchUrl(webView.url ?: "")
+        if (current != baseUrl) {
+            batchReadinessPolling = false
+            scheduleBatchSnapshot()
+            return
+        }
+
+        val js = """
+            (function(){
+              try{
+                var text=(document.body&&document.body.innerText?document.body.innerText:'').replace(/\s+/g,' ');
+                var m=text.match(/총\s*([0-9,]+)\s*건/);
+                var total=m?parseInt(m[1].replace(/,/g,''),10):-1;
+                var table=document.querySelector('table,[role=table]');
+                var rows=table?table.querySelectorAll('tr,[role=row]').length:0;
+                var noResult=/검색결과가\s*없습니다/.test(text);
+                return JSON.stringify({
+                  total:isNaN(total)?-1:total,
+                  rows:rows,
+                  noResult:noResult,
+                  canFnSearch:(typeof window.fnSearch==='function')
+                });
+              }catch(e){
+                return JSON.stringify({total:-1,rows:0,noResult:false,canFnSearch:false});
+              }
+            })();
+        """.trimIndent()
+
+        webView.evaluateJavascript(js) { encoded ->
+            if (!batchRunning || batchPausedForLogin) {
+                batchReadinessPolling = false
+                return@evaluateJavascript
+            }
+            try {
+                val obj = JSONObject(decodeJsString(encoded))
+                val total = obj.optInt("total", -1)
+                val rows = obj.optInt("rows", 0)
+                val ready = total > 0 && (
+                    !baseUrl.contains("/ucp/uvt/uni/univView.do") &&
+                    !baseUrl.contains("/ucp/cls/uni/classUnivView.do") ||
+                    rows > 1
+                )
+
+                if (ready) {
+                    batchReadinessPolling = false
+                    status.text = "동적 목록 준비 완료: 총 ${total}건"
+                    handler.postDelayed({ collectSnapshotForBatch() }, 250)
+                    return@evaluateJavascript
+                }
+
+                val maxAttempts = if (afterBootstrap) 18 else 12
+                if (attempt < maxAttempts) {
+                    status.text = "동적 목록 로딩 대기: ${attempt + 1}/$maxAttempts"
+                    handler.postDelayed({
+                        pollAdigaDynamicListReadiness(baseUrl, attempt + 1, afterBootstrap)
+                    }, 450)
+                    return@evaluateJavascript
+                }
+
+                val canFnSearch = obj.optBoolean("canFnSearch", false)
+                if (!afterBootstrap && canFnSearch && batchBootstrapSearchAttempted.add(baseUrl)) {
+                    status.text = "초기 검색 실행 후 목록 재대기"
+                    webView.evaluateJavascript(
+                        "(function(){try{window.fnSearch(1);return true;}catch(e){return false;}})();"
+                    ) {
+                        handler.postDelayed({
+                            pollAdigaDynamicListReadiness(baseUrl, attempt = 0, afterBootstrap = true)
+                        }, 900)
+                    }
+                    return@evaluateJavascript
+                }
+
+                batchReadinessPolling = false
+                status.text = "동적 목록 준비 시간 초과: 현재 상태 그대로 안전 수집"
+                collectSnapshotForBatch()
+            } catch (_: Exception) {
+                batchReadinessPolling = false
+                handler.postDelayed({ collectSnapshotForBatch() }, 250)
+            }
+        }
     }
 
     private fun collectCurrentPage() {
@@ -666,7 +771,8 @@ class MainActivity : Activity() {
                 .put("errorPages", batchErrors.length())
                 .put("records", batchRecords.length())
                 .put("resourceLinks", batchResources.length())
-                .put("paginationActionsCompleted", batchPageActionVisited.size))
+                .put("paginationActionsCompleted", batchPageActionVisited.size)
+                .put("dynamicSearchBootstraps", batchBootstrapSearchAttempted.size))
             .put("errors", batchErrors)
             .put("records", batchRecords)
             .put("snapshots", batchSnapshots)
@@ -805,8 +911,9 @@ class MainActivity : Activity() {
           var titleText=cleanText(document.title||'');
           var error404=/(404\s*Not\s*Found|요청하신\s*페이지를\s*찾을\s*수\s*없|페이지를\s*찾을\s*수\s*없)/i.test(titleText+' '+bodyText);
           var serverError=/(500\s*(?:Internal\s*Server\s*Error)?|서비스\s*처리\s*중\s*오류|일시적인\s*오류가\s*발생)/i.test(titleText+' '+bodyText);
-          var pageError=error404||serverError;
-          var errorType=error404?'404':(serverError?'server-error':'');
+          var browserError=/(웹페이지를\s*사용할\s*수\s*없|net::ERR_|ERR_CONNECTION_|ERR_NAME_NOT_RESOLVED)/i.test(titleText+' '+bodyText);
+          var pageError=error404||serverError||browserError;
+          var errorType=error404?'404':(serverError?'server-error':(browserError?'browser-error':''));
 
           var context=[];
           var contextNodes=document.querySelectorAll('h1,h2,h3,h4,h5,h6,.title,.tit,.sub-title,.breadcrumb,.location,[class*=title],[class*=breadcrumb]');
@@ -1365,7 +1472,7 @@ class MainActivity : Activity() {
         for (i in 0 until links.length()) {
             val obj = links.optJSONObject(i) ?: continue
             val url = canonicalizeBatchUrl(obj.optString("url"))
-            if (url.isBlank() || !isProviderUrl(url)) continue
+            if (url.isBlank() || !isBatchNavigableProviderUrl(url)) continue
             if (batchVisited.contains(url)) continue
             if (batchQueued.add(url)) batchQueue.addLast(url)
             if (batchQueue.size + batchVisited.size >= MAX_BATCH_PAGES * 2) break
@@ -1393,6 +1500,26 @@ class MainActivity : Activity() {
         copy.remove("pageActions")
         copy.remove("navigationKey")
         return copy
+    }
+
+    private fun isBatchNavigableProviderUrl(url: String): Boolean {
+        if (!isProviderUrl(url)) return false
+        if (provider != "adiga") return true
+        return try {
+            val uri = Uri.parse(url)
+            val host = uri.host?.lowercase() ?: return false
+            if (host == "m.adiga.kr") return false
+            val path = uri.path ?: return false
+
+            // 계정/상담/뉴스/일정 등은 입시 DB 수집 대상에서 제외하고
+            // 대학·학과·전형·성적·공식 입시자료 영역만 순회한다.
+            path.startsWith("/ucp/") ||
+                path.startsWith("/sco/") ||
+                path.startsWith("/uct/acd/") ||
+                path.startsWith("/uct/ces/")
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun isProviderUrl(url: String): Boolean {
@@ -1438,7 +1565,7 @@ class MainActivity : Activity() {
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/json"
-            putExtra(Intent.EXTRA_TITLE, "admission-${provider}-v021-${System.currentTimeMillis()}.json")
+            putExtra(Intent.EXTRA_TITLE, "admission-${provider}-v${VERSION}-${System.currentTimeMillis()}.json")
         }
         startActivityForResult(intent, SAVE_JSON_REQUEST)
     }
