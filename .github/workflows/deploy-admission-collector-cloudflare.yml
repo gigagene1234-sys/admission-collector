@@ -1,0 +1,246 @@
+name: Deploy Admission Collector Cloudflare
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/v0.3.2-cloud-offload
+    paths:
+      - "cloudflare/**"
+      - ".github/workflows/deploy-admission-collector-cloudflare.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-collector-cloudflare
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      ADMISSION_INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: feature/v0.3.2-cloud-offload
+          fetch-depth: 0
+
+      - name: Validate required GitHub secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "Missing GitHub Actions secret: CLOUDFLARE_API_TOKEN" >&2
+            exit 1
+          fi
+          if [ -z "${ADMISSION_INGEST_TOKEN:-}" ]; then
+            echo "Missing GitHub Actions secret: ADMISSION_INGEST_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Cloudflare dependencies
+        working-directory: cloudflare
+        run: npm install --no-audit --no-fund
+
+      - name: Resolve Cloudflare account automatically
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const response = await fetch('https://api.cloudflare.com/client/v4/accounts?per_page=50', {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          const body = await response.json();
+          if (!response.ok || !body.success) {
+            throw new Error(`Unable to list Cloudflare accounts: ${JSON.stringify(body.errors || body)}`);
+          }
+          const accounts = Array.isArray(body.result) ? body.result : [];
+          if (accounts.length !== 1) {
+            const names = accounts.map(a => `${a.name} (${a.id})`).join(', ');
+            throw new Error(`Expected exactly one accessible Cloudflare account, found ${accounts.length}: ${names}`);
+          }
+          const account = accounts[0];
+          fs.appendFileSync(process.env.GITHUB_ENV, `CLOUDFLARE_ACCOUNT_ID=${account.id}\n`);
+          console.log(`Using Cloudflare account: ${account.name}`);
+          NODE
+
+      - name: Create or reuse D1 database
+        working-directory: cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler d1 list --json > /tmp/d1-list.json
+          if ! node - <<'NODE'
+          const fs = require('fs');
+          const raw = JSON.parse(fs.readFileSync('/tmp/d1-list.json', 'utf8'));
+          const rows = Array.isArray(raw) ? raw : (raw.result || []);
+          process.exit(rows.some(x => x.name === 'admission-collector-db') ? 0 : 1);
+          NODE
+          then
+            npx wrangler d1 create admission-collector-db
+            npx wrangler d1 list --json > /tmp/d1-list.json
+          fi
+
+          D1_ID="$(node - <<'NODE'
+          const fs = require('fs');
+          const raw = JSON.parse(fs.readFileSync('/tmp/d1-list.json', 'utf8'));
+          const rows = Array.isArray(raw) ? raw : (raw.result || []);
+          const db = rows.find(x => x.name === 'admission-collector-db');
+          if (!db) throw new Error('D1 database not found after create/reuse step');
+          const id = db.uuid || db.id || db.database_id;
+          if (!id) throw new Error(`D1 database ID missing: ${JSON.stringify(db)}`);
+          process.stdout.write(String(id));
+          NODE
+          )"
+          echo "Resolved D1 database ID."
+          echo "D1_DATABASE_ID=${D1_ID}" >> "$GITHUB_ENV"
+
+      - name: Patch Wrangler D1 binding with real database ID
+        working-directory: cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const path = 'wrangler.jsonc';
+          let text = fs.readFileSync(path, 'utf8');
+          const id = process.env.D1_DATABASE_ID;
+          if (!id) throw new Error('D1_DATABASE_ID is missing');
+          const next = text.replace(/("database_name"\s*:\s*"admission-collector-db"[\s\S]*?"database_id"\s*:\s*)"[^"]+"/, `$1"${id}"`);
+          if (next === text && !text.includes(`"database_id": "${id}"`)) {
+            throw new Error('Could not patch D1 database_id in wrangler.jsonc');
+          }
+          fs.writeFileSync(path, next);
+          NODE
+
+      - name: Create or reuse Queues
+        working-directory: cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! npx wrangler queues info admission-collector-ingest >/dev/null 2>&1; then
+            npx wrangler queues create admission-collector-ingest
+          fi
+          if ! npx wrangler queues info admission-collector-ingest-dlq >/dev/null 2>&1; then
+            npx wrangler queues create admission-collector-ingest-dlq
+          fi
+
+      - name: Apply D1 migrations
+        working-directory: cloudflare
+        run: npx wrangler d1 migrations apply admission-collector-db --remote
+
+      - name: Validate Worker source
+        working-directory: cloudflare
+        run: node --check src/index.js
+
+      - name: Deploy Worker
+        working-directory: cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler deploy 2>&1 | tee /tmp/wrangler-deploy.log
+
+      - name: Configure Worker ingest secret
+        working-directory: cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$ADMISSION_INGEST_TOKEN" | npx wrangler secret put INGEST_TOKEN
+
+      - name: Resolve deployed Worker URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKER_URL="$(grep -Eo 'https://[A-Za-z0-9._-]+\.workers\.dev' /tmp/wrangler-deploy.log | tail -n 1 || true)"
+          if [ -z "$WORKER_URL" ]; then
+            WORKER_URL="$(node <<'NODE'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          const body = await response.json();
+          if (!response.ok || !body.success || !body.result?.subdomain) {
+            process.exit(0);
+          }
+          process.stdout.write(`https://admission-collector-offload.${body.result.subdomain}.workers.dev`);
+          NODE
+            )"
+          fi
+          if [ -z "$WORKER_URL" ]; then
+            echo "Could not resolve deployed Worker URL." >&2
+            exit 1
+          fi
+          echo "WORKER_URL=$WORKER_URL" >> "$GITHUB_ENV"
+          echo "Worker URL resolved: $WORKER_URL"
+
+      - name: Health check
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --retry 6 --retry-delay 3 --retry-all-errors --fail --silent --show-error "$WORKER_URL/health" | tee /tmp/health.json
+          node -e "const x=require('/tmp/health.json'); if(!x.ok || x.service!=='admission-collector-offload') process.exit(1)"
+
+      - name: Authenticated API and resume-plan smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_JSON="$(curl --retry 4 --retry-delay 2 --fail --silent --show-error \
+            -X POST "$WORKER_URL/v1/runs" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"provider":"deployment-smoke","collectorVersion":"0.3.2","metadata":{"source":"github-actions"}}')"
+          RUN_ID="$(printf '%s' "$RUN_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(!j.runId)process.exit(1);process.stdout.write(j.runId)})")"
+
+          PLAN_JSON="$(curl --retry 4 --retry-delay 2 --fail --silent --show-error \
+            "$WORKER_URL/v1/runs/$RUN_ID/resume-plan?familyKey=deployment-smoke&requestedYear=2027&totalPages=3" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN")"
+          printf '%s' "$PLAN_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(j.totalPages!==3||!Array.isArray(j.missing))process.exit(1)})"
+
+          curl --fail --silent --show-error \
+            -X POST "$WORKER_URL/v1/runs/$RUN_ID/finish" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"status":"completed","completionReason":"deployment-smoke","summary":{"ok":true}}' >/dev/null
+
+          echo "Cloudflare API smoke test passed."
+
+      - name: Persist resolved D1 binding in feature branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- cloudflare/wrangler.jsonc; then
+            echo "wrangler.jsonc already contains the resolved D1 ID."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cloudflare/wrangler.jsonc
+          git commit -m "Persist Cloudflare D1 binding [skip ci]"
+          git push origin HEAD:feature/v0.3.2-cloud-offload
+
+      - name: Deployment summary
+        shell: bash
+        run: |
+          {
+            echo "## Admission Collector Cloudflare deployment"
+            echo "- Worker: $WORKER_URL"
+            echo "- D1: admission-collector-db"
+            echo "- Queue: admission-collector-ingest"
+            echo "- DLQ: admission-collector-ingest-dlq"
+            echo "- Migration: applied"
+            echo "- Health: passed"
+            echo "- Authenticated API/resume-plan smoke test: passed"
+          } >> "$GITHUB_STEP_SUMMARY"
