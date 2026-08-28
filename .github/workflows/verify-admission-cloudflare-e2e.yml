@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - feature/v0.3.2-cloud-offload
+      - main
     paths:
       - ".github/workflows/verify-admission-cloudflare-e2e.yml"
       - "cloudflare/src/**"
