@@ -40,6 +40,11 @@ class CollectionKeepAliveService : Service() {
         return START_NOT_STICKY
     }
 
+    /** Android 15 caps dataSync foreground-service time. Stop cleanly if that cap is reached. */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        stopSelf()
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
