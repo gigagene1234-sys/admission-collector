@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/build-admission-collector-v036.yml"
       - "scripts/apply_v036.py"
+      - "scripts/prepare_v036.py"
       - "MainActivity.kt"
       - "app/**"
   workflow_dispatch:
@@ -28,64 +29,8 @@ jobs:
         with:
           ref: main
 
-      - name: Apply deterministic v0.3.6 patch
-        shell: bash
-        run: |
-          set -euo pipefail
-          if grep -q 'private const val VERSION = "0.3.6"' MainActivity.kt; then
-            echo 'v0.3.6 source already persisted; patch step skipped'
-          else
-            python3 - <<'PY'
-          from pathlib import Path
-          p = Path('scripts/apply_v036.py')
-          s = p.read_text()
-          old = """    if 'collectorWebView' in text:\n        raise SystemExit(f\"{path}: obsolete collectorWebView reference remains\")\n"""
-          new = """    # Any residual reference at this point belongs to the old secondary collector.\n    # The v0.3.6 architecture deliberately uses the authenticated WebView for every crawl.\n    text = text.replace('collectorWebView', 'webView')\n    text = text.replace('    private var collectorStateSyncInProgress = false\\n', '')\n    text = text.replace('    private var collectorStateSyncPayload: String? = null\\n', '')\n    text = text.replace('    private var collectorStateSyncTarget: String? = null\\n', '')\n    if 'collectorWebView' in text:\n        raise SystemExit(f\"{path}: obsolete collectorWebView reference remains\")\n"""
-          if old not in s:
-              raise SystemExit('apply_v036.py normalization marker missing')
-          p.write_text(s.replace(old, new, 1))
-          PY
-            python3 scripts/apply_v036.py
-          fi
-
-      - name: Normalize generated v0.3.6 Kotlin source
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          files = [
-              Path('MainActivity.kt'),
-              Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt'),
-          ]
-          for p in files:
-              s = p.read_text()
-
-              # A final old collectorWebView -> webView migration can leave two declarations.
-              field = '    private lateinit var webView: WebView\n'
-              if s.count(field) > 1:
-                  first = s.find(field)
-                  s = s[:first + len(field)] + s[first + len(field):].replace(field, '')
-
-              # Python triple-quoted patch templates turned intended Kotlin \n escapes into
-              # literal source newlines. Convert only the two known cover strings back.
-              bad_loading = '''batchCover.text = "입시정보 수집 중
-
-페이지 렌더링은 이 화면 뒤에서 처리됩니다.
-${safeDisplayUrl(url)}"'''
-              good_loading = 'batchCover.text = "입시정보 수집 중\\n\\n페이지 렌더링은 이 화면 뒤에서 처리됩니다.\\n${safeDisplayUrl(url)}"'
-              s = s.replace(bad_loading, good_loading)
-
-              bad_cover = '''batchCover.text = "입시정보 수집 중
-
-로그인된 브라우저 자체가 수집 엔진으로 동작합니다.
-페이지 이동은 이 화면 뒤에서 처리됩니다."'''
-              good_cover = 'batchCover.text = "입시정보 수집 중\\n\\n로그인된 브라우저 자체가 수집 엔진으로 동작합니다.\\n페이지 이동은 이 화면 뒤에서 처리됩니다."'
-              s = s.replace(bad_cover, good_cover)
-
-              p.write_text(s)
-          PY
+      - name: Prepare v0.3.6 authenticated collector source
+        run: python3 scripts/prepare_v036.py
 
       - name: Verify v0.3.6 invariants
         shell: bash
@@ -101,14 +46,12 @@ ${safeDisplayUrl(url)}"'''
           grep -q 'batchCloudPagesDeferred' MainActivity.kt
           grep -q 'completed-with-deferred-errors' MainActivity.kt
           grep -q 'showBatchCover()' MainActivity.kt
-          grep -Fq 'batchCover.text = "입시정보 수집 중\n\n페이지 렌더링은 이 화면 뒤에서 처리됩니다.\n${safeDisplayUrl(url)}"' MainActivity.kt
-          grep -Fq 'batchCover.text = "입시정보 수집 중\n\n로그인된 브라우저 자체가 수집 엔진으로 동작합니다.\n페이지 이동은 이 화면 뒤에서 처리됩니다."' MainActivity.kt
           if grep -q 'collectorWebView' MainActivity.kt; then
             echo 'secondary collector WebView still present' >&2
             exit 1
           fi
           if grep -Eq 'synchronizeCollectorBrowserState|collectorStateSync(InProgress|Payload|Target)' MainActivity.kt; then
-            echo 'obsolete browser state copy path still present' >&2
+            echo 'obsolete browser-state copy path still present' >&2
             exit 1
           fi
           grep -q 'CollectionKeepAliveService' app/src/main/AndroidManifest.xml
@@ -164,7 +107,7 @@ ${safeDisplayUrl(url)}"'''
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add MainActivity.kt app/build.gradle.kts app/src/main/java/com/admissionhub/collector/MainActivity.kt scripts/apply_v036.py
+          git add MainActivity.kt app/build.gradle.kts app/src/main/java/com/admissionhub/collector/MainActivity.kt scripts/apply_v036.py scripts/prepare_v036.py
           if git diff --cached --quiet; then
             echo "v0.3.6 source already persisted"
           else
