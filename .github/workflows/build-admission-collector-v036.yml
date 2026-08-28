@@ -48,6 +48,45 @@ jobs:
             python3 scripts/apply_v036.py
           fi
 
+      - name: Normalize generated v0.3.6 Kotlin source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = [
+              Path('MainActivity.kt'),
+              Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt'),
+          ]
+          for p in files:
+              s = p.read_text()
+
+              # A final old collectorWebView -> webView migration can leave two declarations.
+              field = '    private lateinit var webView: WebView\n'
+              if s.count(field) > 1:
+                  first = s.find(field)
+                  s = s[:first + len(field)] + s[first + len(field):].replace(field, '')
+
+              # Python triple-quoted patch templates turned intended Kotlin \n escapes into
+              # literal source newlines. Convert only the two known cover strings back.
+              bad_loading = '''batchCover.text = "입시정보 수집 중
+
+페이지 렌더링은 이 화면 뒤에서 처리됩니다.
+${safeDisplayUrl(url)}"'''
+              good_loading = 'batchCover.text = "입시정보 수집 중\\n\\n페이지 렌더링은 이 화면 뒤에서 처리됩니다.\\n${safeDisplayUrl(url)}"'
+              s = s.replace(bad_loading, good_loading)
+
+              bad_cover = '''batchCover.text = "입시정보 수집 중
+
+로그인된 브라우저 자체가 수집 엔진으로 동작합니다.
+페이지 이동은 이 화면 뒤에서 처리됩니다."'''
+              good_cover = 'batchCover.text = "입시정보 수집 중\\n\\n로그인된 브라우저 자체가 수집 엔진으로 동작합니다.\\n페이지 이동은 이 화면 뒤에서 처리됩니다."'
+              s = s.replace(bad_cover, good_cover)
+
+              p.write_text(s)
+          PY
+
       - name: Verify v0.3.6 invariants
         shell: bash
         run: |
@@ -57,10 +96,13 @@ jobs:
           grep -q 'versionName = "0.3.6"' app/build.gradle.kts
           grep -q 'versionCode = 13' app/build.gradle.kts
           grep -q 'private lateinit var batchCover: TextView' MainActivity.kt
+          test "$(grep -c 'private lateinit var webView: WebView' MainActivity.kt)" -eq 1
           grep -q 'authenticated-webview-covered' MainActivity.kt
           grep -q 'batchCloudPagesDeferred' MainActivity.kt
           grep -q 'completed-with-deferred-errors' MainActivity.kt
           grep -q 'showBatchCover()' MainActivity.kt
+          grep -Fq 'batchCover.text = "입시정보 수집 중\n\n페이지 렌더링은 이 화면 뒤에서 처리됩니다.\n${safeDisplayUrl(url)}"' MainActivity.kt
+          grep -Fq 'batchCover.text = "입시정보 수집 중\n\n로그인된 브라우저 자체가 수집 엔진으로 동작합니다.\n페이지 이동은 이 화면 뒤에서 처리됩니다."' MainActivity.kt
           if grep -q 'collectorWebView' MainActivity.kt; then
             echo 'secondary collector WebView still present' >&2
             exit 1
