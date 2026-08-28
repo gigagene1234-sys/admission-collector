@@ -83,12 +83,24 @@ def patch_main(path: Path) -> None:
 '''
     text = replace_once(text, old_start_load, new_start_load, f"{path}: initial browser state sync")
 
-    text = replace_once(
-        text,
-        'batchCollecting = false\n        collectorWebView.stopLoading()\n        stopCollectionKeepAlive()',
-        'batchCollecting = false\n        collectorStateSyncInProgress = false\n        collectorStateSyncPayload = null\n        collectorStateSyncTarget = null\n        collectorWebView.stopLoading()\n        stopCollectionKeepAlive()',
-        f"{path}: stop browser state sync",
-    )
+    old_stop = '''    private fun stopBatch(reason: String) {
+        batchRunning = false
+        batchPausedForLogin = false
+        batchCollecting = false
+        collectorWebView.stopLoading()
+        stopCollectionKeepAlive()
+'''
+    new_stop = '''    private fun stopBatch(reason: String) {
+        batchRunning = false
+        batchPausedForLogin = false
+        batchCollecting = false
+        collectorStateSyncInProgress = false
+        collectorStateSyncPayload = null
+        collectorStateSyncTarget = null
+        collectorWebView.stopLoading()
+        stopCollectionKeepAlive()
+'''
+    text = replace_once(text, old_stop, new_stop, f"{path}: stop browser state sync")
 
     old_recover = '''                val retry = currentBatchTarget
                 status.text = "백그라운드 수집 세션 재동기화 ${batchSessionSyncRetries}/$MAX_SESSION_SYNC_RETRIES"
