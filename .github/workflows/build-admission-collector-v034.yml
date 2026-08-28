@@ -1,0 +1,120 @@
+name: Build Admission Collector v0.3.4
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-admission-collector-v034.yml"
+      - "scripts/apply_v034.py"
+      - "MainActivity.kt"
+      - "app/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip ci]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Apply deterministic v0.3.4 patch
+        run: python3 scripts/apply_v034.py
+
+      - name: Verify v0.3.4 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp -s MainActivity.kt app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          grep -q 'private const val VERSION = "0.3.4"' MainActivity.kt
+          grep -q 'versionName = "0.3.4"' app/build.gradle.kts
+          grep -q 'versionCode = 11' app/build.gradle.kts
+          grep -q 'MAX_SESSION_SYNC_RETRIES = 3' MainActivity.kt
+          grep -q 'recoverCollectorSessionOrPause' MainActivity.kt
+          grep -q '메인 로그인 유지 / 수집 세션 동기화' MainActivity.kt
+          grep -q 'collectorWebView.evaluateJavascript' MainActivity.kt
+          if grep -q 'AdmissionCollectorCrawler' MainActivity.kt; then
+            echo 'collector WebView still uses a different user agent' >&2
+            exit 1
+          fi
+          grep -q 'userAgentString = userAgentString + " AdmissionCollector/$VERSION"' MainActivity.kt
+          test "$(grep -c 'userAgentString = userAgentString + " AdmissionCollector/$VERSION"' MainActivity.kt)" -eq 2
+          grep -q 'CollectionKeepAliveService' app/src/main/AndroidManifest.xml
+          grep -q 'ADMISSION_SIGNING_STORE_FILE' app/build.gradle.kts
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          test -f signing/admission-upload.keystore.enc
+          STORE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -pass env:ANDROID_SIGNING_SECRET \
+            -in signing/admission-upload.keystore.enc \
+            -out "$STORE"
+          keytool -list -keystore "$STORE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+          echo "Stable signing key restored"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build v0.3.4 APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Persist v0.3.4 generated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add MainActivity.kt app/build.gradle.kts app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          if git diff --cached --quiet; then
+            echo "v0.3.4 source already persisted"
+          else
+            git commit -m "Apply v0.3.4 session synchronization [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      - name: Upload v0.3.4 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-v0.3.4-session-synced-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
