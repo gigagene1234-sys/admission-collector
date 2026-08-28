@@ -53,6 +53,11 @@ object AdigaAdapter : ProviderAdapter {
     override fun paginationPlan(snapshot: JSONObject): PaginationPlan? {
         val url = snapshot.optString("url")
         if (!isDynamicListPage(url)) return null
+        // Dynamic admission lists are year-scoped. A missing year after a login
+        // redirect must never create a second Cloudflare checkpoint namespace (-1).
+        // MainActivity restores the expected year before asking for a plan; if that
+        // recovery fails, skip pagination rather than mislabel data.
+        val requestedYear = queryYear(url) ?: return null
         val meta = snapshot.optJSONObject("listMeta") ?: return null
         val totalItems = meta.optInt("totalItems", -1)
         val pageSize = meta.optInt("visibleDataRows", 0)
@@ -65,7 +70,7 @@ object AdigaAdapter : ProviderAdapter {
             totalItems = totalItems,
             pageSize = pageSize,
             totalPages = totalPages,
-            requestedYear = queryYear(url),
+            requestedYear = requestedYear,
             firstPageFingerprint = fingerprint
         )
     }

@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.View
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -16,6 +17,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -35,6 +37,7 @@ import java.util.ArrayDeque
 
 class MainActivity : Activity() {
     private lateinit var webView: WebView
+    private lateinit var collectorWebView: WebView
     private lateinit var status: TextView
     private lateinit var sessionState: TextView
     private lateinit var preview: TextView
@@ -96,6 +99,7 @@ class MainActivity : Activity() {
     private var batchCloudResumePlans = 0
     private var batchCloudPagesScheduled = 0
     private var batchCloudPagesSkipped = 0
+    private var batchContextRecoveries = 0
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
@@ -105,7 +109,7 @@ class MainActivity : Activity() {
         private const val MAX_BATCH_PAGES = 2000
         private const val MAX_PAGE_RETRIES = 2
         private const val PREVIEW_LIMIT = 16000
-        private const val VERSION = "0.3.2"
+        private const val VERSION = "0.3.3"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -205,7 +209,22 @@ class MainActivity : Activity() {
             setPadding(8, 8, 8, 8)
         }
 
+        collectorWebView = WebView(this).apply {
+            isFocusable = false
+            isClickable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
         webView = WebView(this)
+        val browserStack = FrameLayout(this).apply {
+            addView(collectorWebView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ))
+            addView(webView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ))
+        }
         preview = TextView(this).apply {
             text = "수집 결과가 여기에 표시됩니다."
             setTextIsSelectable(true)
@@ -218,7 +237,7 @@ class MainActivity : Activity() {
         root.addView(actions1)
         root.addView(actions2)
         root.addView(status)
-        root.addView(webView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f))
+        root.addView(browserStack, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f))
         root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 2f))
         setContentView(root)
     }
@@ -229,6 +248,7 @@ class MainActivity : Activity() {
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
             setAcceptThirdPartyCookies(webView, true)
+            setAcceptThirdPartyCookies(collectorWebView, true)
         }
 
         webView.settings.apply {
@@ -242,33 +262,55 @@ class MainActivity : Activity() {
             userAgentString = userAgentString + " AdmissionCollector/$VERSION"
         }
 
-        webView.webViewClient = object : WebViewClient() {
+        collectorWebView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            cacheMode = WebSettings.LOAD_DEFAULT
+            javaScriptCanOpenWindowsAutomatically = true
+            setSupportMultipleWindows(false)
+            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            userAgentString = userAgentString + " AdmissionCollectorCrawler/$VERSION"
+        }
+
+        collectorWebView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-                status.text = "불러오는 중: ${safeDisplayUrl(url)}"
+                if (batchRunning) status.text = "백그라운드 로딩: ${safeDisplayUrl(url)}"
             }
 
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
-                status.text = "현재 페이지: ${safeDisplayUrl(url)}"
+                if (!batchRunning || batchPausedForLogin) return
+                val pending = pendingBatchPageAction
+                if (pending != null && sameBatchDocument(url, pending.baseUrl)) {
+                    executePendingBatchPageAction()
+                } else {
+                    scheduleBatchSnapshot()
+                }
+            }
+        }
 
-                when {
-                    batchPausedForLogin -> checkSessionState { needsLogin, _ ->
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
+
+            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                if (!batchRunning) status.text = "불러오는 중: ${safeDisplayUrl(url)}"
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                CookieManager.getInstance().flush()
+                if (batchPausedForLogin) {
+                    checkSessionState { needsLogin, _ ->
                         if (!needsLogin) {
                             sessionState.text = "● 로그인 상태 복구 감지"
                             resumeAfterLogin()
                         }
                     }
-                    batchRunning -> {
-                        val pending = pendingBatchPageAction
-                        if (pending != null && canonicalizeBatchUrl(url) == pending.baseUrl) {
-                            executePendingBatchPageAction()
-                        } else {
-                            scheduleBatchSnapshot()
-                        }
-                    }
-                    else -> checkSessionState()
+                } else if (!batchRunning) {
+                    status.text = "현재 페이지: ${safeDisplayUrl(url)}"
+                    checkSessionState()
                 }
             }
         }
@@ -328,10 +370,14 @@ class MainActivity : Activity() {
               return false;
             })();
         """.trimIndent()
-        webView.evaluateJavascript(js) { result ->
-            if (result == "true") {
-                CookieManager.getInstance().flush()
-                sessionState.text = "● 로그인 세션 자동 연장"
+        val targets = mutableListOf(webView)
+        if (::collectorWebView.isInitialized && batchRunning) targets.add(collectorWebView)
+        targets.forEach { target ->
+            target.evaluateJavascript(js) { result ->
+                if (result == "true") {
+                    CookieManager.getInstance().flush()
+                    sessionState.text = "● 로그인 세션 자동 연장"
+                }
             }
         }
     }
@@ -480,6 +526,7 @@ class MainActivity : Activity() {
         batchRetryEvents = JSONArray()
         batchDuplicateYearViews = JSONArray()
         batchRunning = true
+        startCollectionKeepAlive()
         batchPausedForLogin = false
         batchCollecting = false
         batchPageCount = 0
@@ -488,7 +535,8 @@ class MainActivity : Activity() {
         batchCloudResumePlans = 0
         batchCloudPagesScheduled = 0
         batchCloudPagesSkipped = 0
-        currentBatchTarget = url
+        batchContextRecoveries = 0
+        currentBatchTarget = canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
         status.text = if (cloudOffload.isConfigured()) {
             "Cloud 체크포인트 연결 준비 중…"
@@ -508,7 +556,9 @@ class MainActivity : Activity() {
                     if (needsLogin) {
                         pauseBatchForLogin()
                     } else {
-                        scheduleBatchSnapshot()
+                        val startUrl = currentBatchTarget
+                        if (!startUrl.isNullOrBlank()) collectorWebView.loadUrl(startUrl)
+                        else loadNextBatchPage()
                     }
                 }
             }
@@ -528,6 +578,8 @@ class MainActivity : Activity() {
         batchRunning = false
         batchPausedForLogin = false
         batchCollecting = false
+        collectorWebView.stopLoading()
+        stopCollectionKeepAlive()
         batchQueue.clear()
         batchQueued.clear()
         batchPageActions.clear()
@@ -544,8 +596,9 @@ class MainActivity : Activity() {
         batchPausedForLogin = true
         batchCollecting = false
         sessionState.text = "○ 로그인 갱신 필요"
-        status.text = "수집 일시정지: 로그인 갱신 후 자동/수동으로 계속할 수 있습니다."
+        status.text = "백그라운드 수집 일시정지: 메인 화면에서 로그인 갱신 후 자동으로 계속합니다."
         batchButton.text = "일괄 수집 중지"
+        handler.postDelayed({ refreshSessionOrOpenLogin() }, 150)
     }
 
     private fun resumeAfterLogin() {
@@ -564,7 +617,7 @@ class MainActivity : Activity() {
             val retry = currentBatchTarget
             if (!retry.isNullOrBlank() && isProviderUrl(retry)) {
                 status.text = "로그인 갱신 완료: 중단 지점 재시도"
-                webView.loadUrl(retry)
+                collectorWebView.loadUrl(retry)
             } else {
                 loadNextBatchPage()
             }
@@ -583,7 +636,7 @@ class MainActivity : Activity() {
             return
         }
 
-        val url = canonicalizeBatchUrl(webView.url ?: "")
+        val url = canonicalizeBatchUrl(collectorWebView.url ?: "")
         if (currentAdapter().isDynamicListPage(url)) {
             if (batchReadinessPolling) return
             batchReadinessPolling = true
@@ -610,7 +663,7 @@ class MainActivity : Activity() {
             })();
         """.trimIndent()
 
-        webView.evaluateJavascript(js) { encoded ->
+        collectorWebView.evaluateJavascript(js) { encoded ->
             if (!batchRunning || batchPausedForLogin || activeBatchPageAction == null) return@evaluateJavascript
             try {
                 val obj = JSONObject(decodeJsString(encoded))
@@ -637,8 +690,8 @@ class MainActivity : Activity() {
             batchReadinessPolling = false
             return
         }
-        val current = canonicalizeBatchUrl(webView.url ?: "")
-        if (current != baseUrl) {
+        val current = canonicalizeBatchUrl(collectorWebView.url ?: "")
+        if (current != baseUrl && !sameBatchDocument(current, baseUrl)) {
             batchReadinessPolling = false
             scheduleBatchSnapshot()
             return
@@ -665,7 +718,7 @@ class MainActivity : Activity() {
             })();
         """.trimIndent()
 
-        webView.evaluateJavascript(js) { encoded ->
+        collectorWebView.evaluateJavascript(js) { encoded ->
             if (!batchRunning || batchPausedForLogin) {
                 batchReadinessPolling = false
                 return@evaluateJavascript
@@ -740,9 +793,10 @@ class MainActivity : Activity() {
     private fun collectSnapshotForBatch() {
         if (!batchRunning || batchPausedForLogin || batchCollecting) return
         batchCollecting = true
-        collectSnapshot { snapshot ->
+        collectSnapshot(collectorWebView) { snapshot ->
             batchCollecting = false
             if (!batchRunning || snapshot == null) return@collectSnapshot
+            stabilizeBatchSnapshotContext(snapshot)
 
             val activeAction = activeBatchPageAction
             val collectionPage = activeAction?.page ?: 1
@@ -886,7 +940,7 @@ class MainActivity : Activity() {
             batchPageActionQueued.remove(key)
             if (batchPageActionVisited.contains(key) || batchPageActionFailed.contains(key)) continue
 
-            val current = canonicalizeBatchUrl(webView.url ?: "")
+            val current = canonicalizeBatchUrl(collectorWebView.url ?: "")
             pendingBatchPageAction = action
             currentBatchTarget = action.baseUrl
             status.text = pageActionStatus(action, "탐색 준비")
@@ -894,7 +948,7 @@ class MainActivity : Activity() {
             if (current == action.baseUrl) {
                 executePendingBatchPageAction()
             } else {
-                webView.loadUrl(action.baseUrl)
+                collectorWebView.loadUrl(action.baseUrl)
             }
             return
         }
@@ -906,7 +960,7 @@ class MainActivity : Activity() {
             if (next.isBlank() || batchVisited.contains(next) || !isProviderUrl(next)) continue
             currentBatchTarget = next
             status.text = "다음 입시정보 페이지 탐색: ${safeDisplayUrl(next)}"
-            webView.loadUrl(next)
+            collectorWebView.loadUrl(next)
             return
         }
         finishBatch("completed")
@@ -931,8 +985,11 @@ class MainActivity : Activity() {
         }
 
         activeBatchPageAction = action
-        status.text = pageActionStatus(action, if (action.retry > 0) "재시도 ${action.retry}/$MAX_PAGE_RETRIES" else "이동 중")
-        webView.evaluateJavascript(js) { result ->
+        status.text = pageActionStatus(action, if (action.retry > 0) "재시도 ${action.retry}/$MAX_PAGE_RETRIES" else "백그라운드 이동 중")
+        val yearPrelude = action.requestedYear?.let { expectedYear ->
+            """(function(){var n=document.querySelectorAll('[name=searchSyr],#searchSyr');for(var i=0;i<n.length;i++){try{n[i].value='$expectedYear';}catch(e){}}})();"""
+        } ?: ""
+        collectorWebView.evaluateJavascript(yearPrelude + js) { result ->
             if (result != "true") {
                 activeBatchPageAction = null
                 if (action.retry < MAX_PAGE_RETRIES) {
@@ -966,7 +1023,7 @@ class MainActivity : Activity() {
         status.text = pageActionStatus(retry, "서버 오류 후 재시도 대기")
         val delay = 900L + (retry.retry * 900L)
         handler.postDelayed({
-            if (batchRunning && !batchPausedForLogin) webView.loadUrl(retry.baseUrl)
+            if (batchRunning && !batchPausedForLogin) collectorWebView.loadUrl(retry.baseUrl)
         }, delay)
     }
 
@@ -1003,7 +1060,63 @@ class MainActivity : Activity() {
     }
 
     private fun pageActionKey(action: BatchPageAction): String =
-        "${action.baseUrl}|page|${action.page}"
+        "${action.familyKey}|year=${action.requestedYear ?: "unknown"}|page=${action.page}"
+
+    private fun sameBatchDocument(a: String, b: String): Boolean {
+        return try {
+            val ua = Uri.parse(a)
+            val ub = Uri.parse(b)
+            ua.host.equals(ub.host, ignoreCase = true) && ua.path == ub.path
+        } catch (_: Exception) { false }
+    }
+
+    private fun queryYearFromUrl(url: String?): Int? {
+        if (url.isNullOrBlank()) return null
+        return try { Uri.parse(url).getQueryParameter("searchSyr")?.toIntOrNull() } catch (_: Exception) { null }
+    }
+
+    private fun withQueryParameter(url: String, key: String, value: String): String {
+        return try {
+            val uri = Uri.parse(url)
+            val builder = uri.buildUpon().clearQuery()
+            for (name in uri.queryParameterNames) {
+                if (name == key) continue
+                for (v in uri.getQueryParameters(name)) builder.appendQueryParameter(name, v)
+            }
+            builder.appendQueryParameter(key, value).build().toString()
+        } catch (_: Exception) { url }
+    }
+
+    private fun stabilizeBatchSnapshotContext(snapshot: JSONObject) {
+        if (provider != ProviderId.ADIGA) return
+        val rawUrl = snapshot.optString("url")
+        if (!currentAdapter().isDynamicListPage(rawUrl)) return
+        if (queryYearFromUrl(rawUrl) != null) return
+
+        val expectedYear = activeBatchPageAction?.requestedYear
+            ?: pendingBatchPageAction?.requestedYear
+            ?: queryYearFromUrl(currentBatchTarget)
+        if (expectedYear == null) {
+            snapshot.put("collectionContextError", "missing-searchSyr")
+            return
+        }
+
+        val restoredUrl = withQueryParameter(rawUrl, "searchSyr", expectedYear.toString())
+        snapshot.put("url", restoredUrl)
+        snapshot.put("navigationKey", restoredUrl)
+        snapshot.put("collectionContextRecovered", true)
+        snapshot.put("collectionExpectedYear", expectedYear)
+        currentBatchTarget = restoredUrl
+        batchContextRecoveries += 1
+    }
+
+    private fun startCollectionKeepAlive() {
+        runCatching { startForegroundService(Intent(this, CollectionKeepAliveService::class.java)) }
+    }
+
+    private fun stopCollectionKeepAlive() {
+        runCatching { stopService(Intent(this, CollectionKeepAliveService::class.java)) }
+    }
 
     private fun canonicalizeBatchUrl(url: String): String {
         if (url.isBlank()) return ""
@@ -1031,6 +1144,8 @@ class MainActivity : Activity() {
         batchRunning = false
         batchPausedForLogin = false
         batchCollecting = false
+        collectorWebView.stopLoading()
+        stopCollectionKeepAlive()
         batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
         finalizeBatchJson(reason)
         cloudOffload.finish(
@@ -1068,6 +1183,8 @@ class MainActivity : Activity() {
                 .put("cloudResumePlans", batchCloudResumePlans)
                 .put("cloudPagesScheduled", batchCloudPagesScheduled)
                 .put("cloudPagesSkipped", batchCloudPagesSkipped)
+                .put("contextRecoveries", batchContextRecoveries)
+                .put("collectionTransport", "background-webview")
                 .put("duplicateYearViewsSkipped", batchDuplicateYearViews.length())
                 .put("dynamicSearchBootstraps", batchBootstrapSearchAttempted.size))
             .put("errors", batchErrors)
@@ -1081,9 +1198,11 @@ class MainActivity : Activity() {
         showPreview(lastJson)
     }
 
-    private fun collectSnapshot(callback: (JSONObject?) -> Unit) {
+    private fun collectSnapshot(callback: (JSONObject?) -> Unit) = collectSnapshot(webView, callback)
+
+    private fun collectSnapshot(target: WebView, callback: (JSONObject?) -> Unit) {
         val js = SnapshotScript.build()
-        webView.evaluateJavascript(js) { encoded ->
+        target.evaluateJavascript(js) { encoded ->
             try {
                 val raw = decodeJsString(encoded)
                 val obj = JSONObject(raw)
@@ -1137,7 +1256,7 @@ class MainActivity : Activity() {
     private fun enqueueCalculatedPageActions(snapshot: JSONObject, plan: PaginationPlan) {
         val baseUrl = canonicalizeBatchUrl(snapshot.optString("url"))
         if (baseUrl.isBlank() || !isProviderUrl(baseUrl) || plan.totalPages <= 1) return
-        val planKey = "$baseUrl|${plan.totalItems}|${plan.pageSize}|${plan.totalPages}"
+        val planKey = "${plan.familyKey}|year=${plan.requestedYear ?: "unknown"}|${plan.totalItems}|${plan.pageSize}|${plan.totalPages}"
         if (!batchPaginationPlanned.add(planKey)) return
 
         if (!cloudOffload.isConfigured()) {
@@ -1314,7 +1433,12 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         CookieManager.getInstance().flush()
+        stopCollectionKeepAlive()
         cloudOffload.shutdown()
+        if (::collectorWebView.isInitialized) {
+            collectorWebView.stopLoading()
+            collectorWebView.destroy()
+        }
         webView.stopLoading()
         webView.destroy()
         super.onDestroy()
