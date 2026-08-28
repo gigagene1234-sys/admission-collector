@@ -102,6 +102,8 @@ class MainActivity : Activity() {
     private var batchCloudPagesDeferred = 0
     private var batchContextRecoveries = 0
     private var batchSessionSyncRetries = 0
+    private var batchNavigationWatchdogGeneration = 0
+    private var batchNavigationWatchdogRecovery = false
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
@@ -112,7 +114,8 @@ class MainActivity : Activity() {
         private const val MAX_PAGE_RETRIES = 2
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
-        private const val VERSION = "0.3.6"
+        private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
+        private const val VERSION = "0.3.7"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -275,6 +278,7 @@ class MainActivity : Activity() {
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 if (batchRunning && !batchPausedForLogin) {
+                    armBatchNavigationWatchdog(url)
                     status.text = "수집 엔진 로딩: ${safeDisplayUrl(url)}"
                     if (::batchCover.isInitialized) {
                         batchCover.text = "입시정보 수집 중\n\n페이지 렌더링은 이 화면 뒤에서 처리됩니다.\n${safeDisplayUrl(url)}"
@@ -287,6 +291,11 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
                 if (batchRunning && !batchPausedForLogin) {
+                    disarmBatchNavigationWatchdog()
+                    if (batchNavigationWatchdogRecovery) {
+                        batchNavigationWatchdogRecovery = false
+                        return
+                    }
                     val pending = pendingBatchPageAction
                     if (pending != null && sameBatchDocument(url, pending.baseUrl)) {
                         executePendingBatchPageAction()
@@ -535,6 +544,8 @@ class MainActivity : Activity() {
         batchCloudPagesDeferred = 0
         batchContextRecoveries = 0
         batchSessionSyncRetries = 0
+        batchNavigationWatchdogRecovery = false
+        disarmBatchNavigationWatchdog()
         currentBatchTarget = canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
         status.text = if (cloudOffload.isConfigured()) {
@@ -564,6 +575,31 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun armBatchNavigationWatchdog(expectedUrl: String) {
+        val generation = ++batchNavigationWatchdogGeneration
+        handler.postDelayed({
+            if (!batchRunning || batchPausedForLogin || generation != batchNavigationWatchdogGeneration) return@postDelayed
+            val current = webView.url ?: expectedUrl
+            val sameDocument = canonicalizeBatchUrl(current) == canonicalizeBatchUrl(expectedUrl) || sameBatchDocument(current, expectedUrl)
+            if (!sameDocument) return@postDelayed
+            batchNavigationWatchdogRecovery = true
+            batchNavigationWatchdogGeneration += 1
+            status.text = "페이지 로딩 지연 감지: 현재 DOM으로 안전하게 계속합니다."
+            if (::batchCover.isInitialized) {
+                batchCover.text = "입시정보 수집 계속 중\n\n페이지 로딩이 오래 걸려 현재 상태를 평가한 뒤 다음 항목으로 진행합니다.\n${safeDisplayUrl(current)}"
+            }
+            runCatching { webView.stopLoading() }
+            handler.postDelayed({
+                if (!batchRunning || batchPausedForLogin || batchCollecting) return@postDelayed
+                scheduleBatchSnapshot()
+            }, 250L)
+        }, BATCH_NAVIGATION_TIMEOUT_MS)
+    }
+
+    private fun disarmBatchNavigationWatchdog() {
+        batchNavigationWatchdogGeneration += 1
+    }
+
     private fun showBatchCover() {
         if (!::batchCover.isInitialized) return
         batchCover.text = "입시정보 수집 중\n\n로그인된 브라우저 자체가 수집 엔진으로 동작합니다.\n페이지 이동은 이 화면 뒤에서 처리됩니다."
@@ -588,6 +624,8 @@ class MainActivity : Activity() {
         batchRunning = false
         batchPausedForLogin = false
         batchCollecting = false
+        batchNavigationWatchdogRecovery = false
+        disarmBatchNavigationWatchdog()
         webView.stopLoading()
         hideBatchCover()
         stopCollectionKeepAlive()
@@ -606,6 +644,8 @@ class MainActivity : Activity() {
     private fun pauseBatchForLogin(autoOpenLogin: Boolean = true) {
         batchPausedForLogin = true
         batchCollecting = false
+        batchNavigationWatchdogRecovery = false
+        disarmBatchNavigationWatchdog()
         hideBatchCover()
         if (autoOpenLogin) {
             sessionState.text = "○ 로그인 갱신 필요"
@@ -1184,6 +1224,8 @@ class MainActivity : Activity() {
         batchRunning = false
         batchPausedForLogin = false
         batchCollecting = false
+        batchNavigationWatchdogRecovery = false
+        disarmBatchNavigationWatchdog()
         webView.stopLoading()
         hideBatchCover()
         stopCollectionKeepAlive()
