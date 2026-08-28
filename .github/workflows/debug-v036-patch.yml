@@ -1,0 +1,38 @@
+name: Debug v0.3.6 Patch
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ ".github/workflows/debug-v036-patch.yml" ]
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Apply diagnostic variant and print residual references
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/apply_v036.py')
+          s=p.read_text()
+          s=s.replace(
+              "    if 'collectorWebView' in text:\n        raise SystemExit(f\"{path}: obsolete collectorWebView reference remains\")\n",
+              "    text = text.replace('collectorWebView', 'webView')\n"
+          )
+          s=s.replace(
+              "    if 'synchronizeCollectorBrowserState' in text or 'collectorStateSyncInProgress' in text:\n        raise SystemExit(f\"{path}: obsolete browser-state copy code remains\")\n",
+              ""
+          )
+          p.write_text(s)
+          PY
+          python3 scripts/apply_v036.py
+          echo '=== RESIDUAL BROWSER STATE REFERENCES ==='
+          grep -nE 'synchronizeCollectorBrowserState|collectorStateSync(InProgress|Payload|Target)' MainActivity.kt || true
+          echo '=== RESIDUAL SECONDARY WEBVIEW REFERENCES ==='
+          grep -n 'collectorWebView' MainActivity.kt || true
