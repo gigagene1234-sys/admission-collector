@@ -1,6 +1,7 @@
 package com.admissionhub.collector
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
@@ -24,6 +25,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import com.admissionhub.collector.capture.SnapshotScript
 import com.admissionhub.collector.parser.RecordUtils
+import com.admissionhub.collector.provider.PaginationPlan
 import com.admissionhub.collector.provider.ProviderAdapter
 import com.admissionhub.collector.provider.ProviderId
 import com.admissionhub.collector.provider.ProviderRegistry
@@ -44,7 +46,23 @@ class MainActivity : Activity() {
             handler.postDelayed(this, 45_000L)
         }
     }
-    private data class BatchPageAction(val baseUrl: String, val page: Int)
+    private data class BatchPageAction(
+        val baseUrl: String,
+        val page: Int,
+        val familyKey: String,
+        val requestedYear: Int?,
+        val totalPages: Int,
+        val pageSize: Int,
+        val totalItems: Int,
+        val retry: Int = 0
+    )
+
+    private data class ListFingerprint(
+        val requestedYear: Int?,
+        val totalItems: Int,
+        val pageSize: Int,
+        val fingerprint: String
+    )
 
     private val batchQueue = ArrayDeque<String>()
     private val batchVisited = linkedSetOf<String>()
@@ -52,27 +70,36 @@ class MainActivity : Activity() {
     private val batchPageActions = ArrayDeque<BatchPageAction>()
     private val batchPageActionQueued = linkedSetOf<String>()
     private val batchPageActionVisited = linkedSetOf<String>()
+    private val batchPageActionFailed = linkedSetOf<String>()
+    private val batchPaginationPlanned = linkedSetOf<String>()
+    private val batchListFingerprints = linkedMapOf<String, ListFingerprint>()
+    private val batchLastTableSignatures = linkedMapOf<String, String>()
     private val batchBootstrapSearchAttempted = linkedSetOf<String>()
     private var batchReadinessPolling = false
     private var batchSnapshots = JSONArray()
     private var batchRecords = JSONArray()
     private var batchResources = JSONArray()
     private var batchErrors = JSONArray()
+    private var batchRetryEvents = JSONArray()
+    private var batchDuplicateYearViews = JSONArray()
     private var batchRunning = false
     private var batchPausedForLogin = false
     private var batchCollecting = false
     private var currentBatchTarget: String? = null
     private var pendingBatchPageAction: BatchPageAction? = null
+    private var activeBatchPageAction: BatchPageAction? = null
     private var batchPageCount = 0
+    private var batchPaginationRetries = 0
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
-        private const val MAX_BATCH_PAGES = 900
+        private const val MAX_BATCH_PAGES = 2000
+        private const val MAX_PAGE_RETRIES = 2
         private const val PREVIEW_LIMIT = 16000
-        private const val VERSION = "0.3.0"
+        private const val VERSION = "0.3.1"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -131,7 +158,7 @@ class MainActivity : Activity() {
         batchButton = Button(this).apply {
             text = "접근 가능 정보 일괄 수집"
             setOnClickListener {
-                if (batchRunning) stopBatch("사용자 중지") else startBatch()
+                if (batchRunning) confirmStopBatch() else startBatch()
             }
         }
         actions1.addView(back)
@@ -418,17 +445,25 @@ class MainActivity : Activity() {
         batchPageActions.clear()
         batchPageActionQueued.clear()
         batchPageActionVisited.clear()
+        batchPageActionFailed.clear()
+        batchPaginationPlanned.clear()
+        batchListFingerprints.clear()
+        batchLastTableSignatures.clear()
         batchBootstrapSearchAttempted.clear()
         batchReadinessPolling = false
         pendingBatchPageAction = null
+        activeBatchPageAction = null
         batchSnapshots = JSONArray()
         batchRecords = JSONArray()
         batchResources = JSONArray()
         batchErrors = JSONArray()
+        batchRetryEvents = JSONArray()
+        batchDuplicateYearViews = JSONArray()
         batchRunning = true
         batchPausedForLogin = false
         batchCollecting = false
         batchPageCount = 0
+        batchPaginationRetries = 0
         currentBatchTarget = url
         batchButton.text = "일괄 수집 중지"
         enqueueProviderSeeds()
@@ -443,6 +478,15 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun confirmStopBatch() {
+        AlertDialog.Builder(this)
+            .setTitle("일괄 수집을 중지할까요?")
+            .setMessage("현재까지 수집한 결과는 보존됩니다. 실수로 누른 경우 '계속 수집'을 선택하세요.")
+            .setNegativeButton("계속 수집", null)
+            .setPositiveButton("중지") { _, _ -> stopBatch("사용자 중지") }
+            .show()
+    }
+
     private fun stopBatch(reason: String) {
         batchRunning = false
         batchPausedForLogin = false
@@ -453,6 +497,7 @@ class MainActivity : Activity() {
         batchPageActionQueued.clear()
         batchReadinessPolling = false
         pendingBatchPageAction = null
+        activeBatchPageAction = null
         batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
         status.text = "일괄 수집 중지: $reason"
         if (batchSnapshots.length() > 0) finalizeBatchJson("stopped")
@@ -491,6 +536,16 @@ class MainActivity : Activity() {
 
     private fun scheduleBatchSnapshot() {
         if (!batchRunning || batchPausedForLogin || batchCollecting) return
+
+        // Pagination actions already wait for AJAX after fnSearch(N). Do not run the
+        // first-page bootstrap logic here, because the legitimate last page may
+        // contain only one row.
+        val activeAction = activeBatchPageAction
+        if (activeAction != null) {
+            pollPaginationActionReadiness(activeAction, attempt = 0)
+            return
+        }
+
         val url = canonicalizeBatchUrl(webView.url ?: "")
         if (currentAdapter().isDynamicListPage(url)) {
             if (batchReadinessPolling) return
@@ -501,6 +556,44 @@ class MainActivity : Activity() {
         }
     }
 
+
+    private fun pollPaginationActionReadiness(action: BatchPageAction, attempt: Int) {
+        if (!batchRunning || batchPausedForLogin || batchCollecting || activeBatchPageAction == null) return
+        val js = """
+            (function(){
+              try{
+                var body=(document.body&&document.body.innerText?document.body.innerText:'').slice(0,20000);
+                var title=String(document.title||'');
+                var error=/(404\s*Not\s*Found|500\s*(?:Internal\s*Server\s*Error)?|서비스\s*처리\s*중\s*오류|일시적인\s*오류가\s*발생|웹페이지를\s*사용할\s*수\s*없|net::ERR_)/i.test(title+' '+body);
+                var table=document.querySelector('table,[role=table]');
+                var rows=table?table.querySelectorAll('tr,[role=row]').length:0;
+                var tableText=table?(table.innerText||table.textContent||'').replace(/\s+/g,' ').trim().slice(0,30000):'';
+                return JSON.stringify({error:error,rows:rows,tableText:tableText});
+              }catch(e){return JSON.stringify({error:false,rows:0,tableText:''});}
+            })();
+        """.trimIndent()
+
+        webView.evaluateJavascript(js) { encoded ->
+            if (!batchRunning || batchPausedForLogin || activeBatchPageAction == null) return@evaluateJavascript
+            try {
+                val obj = JSONObject(decodeJsString(encoded))
+                val isError = obj.optBoolean("error", false)
+                val rows = obj.optInt("rows", 0)
+                val tableText = obj.optString("tableText")
+                val signature = if (tableText.isNotBlank()) RecordUtils.sha256(tableText) else ""
+                val previous = batchLastTableSignatures[action.baseUrl]
+                val changed = signature.isNotBlank() && (previous == null || previous != signature)
+                if (isError || (rows > 1 && changed) || attempt >= 12) {
+                    collectSnapshotForBatch()
+                } else {
+                    handler.postDelayed({ pollPaginationActionReadiness(action, attempt + 1) }, 250)
+                }
+            } catch (_: Exception) {
+                if (attempt >= 12) collectSnapshotForBatch()
+                else handler.postDelayed({ pollPaginationActionReadiness(action, attempt + 1) }, 250)
+            }
+        }
+    }
 
     private fun pollAdigaDynamicListReadiness(baseUrl: String, attempt: Int, afterBootstrap: Boolean) {
         if (!batchRunning || batchPausedForLogin || batchCollecting) {
@@ -544,11 +637,9 @@ class MainActivity : Activity() {
                 val obj = JSONObject(decodeJsString(encoded))
                 val total = obj.optInt("total", -1)
                 val rows = obj.optInt("rows", 0)
-                val ready = total > 0 && (
-                    !baseUrl.contains("/ucp/uvt/uni/univView.do") &&
-                    !baseUrl.contains("/ucp/cls/uni/classUnivView.do") ||
-                    rows > 1
-                )
+                val visibleDataRows = (rows - 1).coerceAtLeast(0)
+                val ready = total > 0 && visibleDataRows > 0 &&
+                    (total <= visibleDataRows || visibleDataRows >= 5)
 
                 if (ready) {
                     batchReadinessPolling = false
@@ -616,34 +707,108 @@ class MainActivity : Activity() {
             batchCollecting = false
             if (!batchRunning || snapshot == null) return@collectSnapshot
 
+            val activeAction = activeBatchPageAction
+            val collectionPage = activeAction?.page ?: 1
+            snapshot.put("collectionPage", collectionPage)
+            if (activeAction != null) {
+                snapshot.put("collectionPagination", JSONObject()
+                    .put("page", activeAction.page)
+                    .put("totalPages", activeAction.totalPages)
+                    .put("pageSize", activeAction.pageSize)
+                    .put("totalItems", activeAction.totalItems)
+                    .put("familyKey", activeAction.familyKey)
+                    .put("requestedYear", activeAction.requestedYear ?: JSONObject.NULL)
+                    .put("retry", activeAction.retry))
+            }
+
             val navigationKey = snapshot.optString("navigationKey")
             if (navigationKey.isNotBlank()) batchVisited.add(navigationKey)
             batchPageCount += 1
 
             val pageState = snapshot.optJSONObject("pageState") ?: JSONObject()
             if (pageState.optBoolean("isError", false)) {
-                batchErrors.put(JSONObject()
+                val errorType = pageState.optString("errorType", "page-error")
+                if (activeAction != null && activeAction.retry < MAX_PAGE_RETRIES) {
+                    activeBatchPageAction = null
+                    schedulePageActionRetry(activeAction, errorType)
+                    return@collectSnapshot
+                }
+
+                if (activeAction != null) {
+                    batchPageActionFailed.add(pageActionKey(activeAction))
+                    activeBatchPageAction = null
+                }
+                val error = JSONObject()
                     .put("url", snapshot.optString("url"))
-                    .put("type", pageState.optString("errorType", "page-error"))
-                    .put("title", snapshot.optString("title")))
-                status.text = "오류 페이지 건너뜀: ${pageState.optString("errorType", "error")} / 계속 탐색 중"
-                handler.postDelayed({ loadNextBatchPage() }, 250)
+                    .put("type", errorType)
+                    .put("title", snapshot.optString("title"))
+                if (activeAction != null) {
+                    error.put("page", activeAction.page)
+                        .put("totalPages", activeAction.totalPages)
+                        .put("familyKey", activeAction.familyKey)
+                        .put("requestedYear", activeAction.requestedYear ?: JSONObject.NULL)
+                        .put("retryCount", activeAction.retry)
+                }
+                batchErrors.put(error)
+                status.text = if (activeAction != null) {
+                    "목록 ${activeAction.page}/${activeAction.totalPages}쪽 최종 실패 / 다음 페이지 계속"
+                } else {
+                    "오류 페이지 건너뜀: $errorType / 계속 탐색 중"
+                }
+                handler.postDelayed({ loadNextBatchPage() }, 300)
                 return@collectSnapshot
             }
 
             val session = snapshot.optJSONObject("session") ?: JSONObject()
             if (session.optBoolean("needsLogin", false)) {
+                if (activeAction != null) {
+                    pendingBatchPageAction = activeAction
+                    activeBatchPageAction = null
+                }
                 pauseBatchForLogin()
                 return@collectSnapshot
             }
 
+            val plan = if (activeAction == null) currentAdapter().paginationPlan(snapshot) else null
+            val duplicateOfYear = plan?.let { duplicateYearViewOf(it) }
+            if (duplicateOfYear != null && plan != null) {
+                val copy = stripNavigationLinksForExport(snapshot)
+                copy.put("duplicateYearView", JSONObject()
+                    .put("skippedYear", plan.requestedYear ?: JSONObject.NULL)
+                    .put("duplicateOfYear", duplicateOfYear)
+                    .put("familyKey", plan.familyKey)
+                    .put("totalItems", plan.totalItems))
+                batchSnapshots.put(copy)
+                batchDuplicateYearViews.put(JSONObject()
+                    .put("familyKey", plan.familyKey)
+                    .put("skippedYear", plan.requestedYear ?: JSONObject.NULL)
+                    .put("duplicateOfYear", duplicateOfYear)
+                    .put("totalItems", plan.totalItems))
+                status.text = "중복 연도 목록 생략: ${plan.requestedYear} → $duplicateOfYear (${plan.totalItems}건 동일)"
+                handler.postDelayed({ loadNextBatchPage() }, 250)
+                return@collectSnapshot
+            }
+
+            if (plan != null) registerListFingerprint(plan)
+
             batchSnapshots.put(stripNavigationLinksForExport(snapshot))
+            tableFingerprint(snapshot)?.let { batchLastTableSignatures[canonicalizeBatchUrl(snapshot.optString("url"))] = it }
             RecordUtils.appendUniqueRecords(batchRecords, normalizeSnapshot(snapshot))
             RecordUtils.appendUniqueResources(batchResources, snapshot.optJSONArray("resourceLinks") ?: JSONArray())
-            enqueueDiscoveredLinks(snapshot.optJSONArray("navigationLinks") ?: JSONArray())
-            enqueuePageActions(snapshot.optJSONArray("pageActions") ?: JSONArray())
 
-            status.text = "일괄 수집: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / URL대기 ${batchQueue.size} / 페이지대기 ${batchPageActions.size} / 레코드 ${batchRecords.length()}"
+            if (activeAction == null) {
+                enqueueDiscoveredLinks(snapshot.optJSONArray("navigationLinks") ?: JSONArray())
+                if (plan != null) enqueueCalculatedPageActions(snapshot, plan)
+            } else {
+                batchPageActionVisited.add(pageActionKey(activeAction))
+                activeBatchPageAction = null
+            }
+
+            status.text = if (activeAction != null) {
+                "목록 ${activeAction.page}/${activeAction.totalPages}쪽 완료 / 시도 $batchPageCount / 오류 ${batchErrors.length()} / 레코드 ${batchRecords.length()}"
+            } else {
+                "일괄 수집: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / URL대기 ${batchQueue.size} / 페이지대기 ${batchPageActions.size} / 레코드 ${batchRecords.length()}"
+            }
 
             if (batchPageCount >= MAX_BATCH_PAGES) {
                 finishBatch("page-limit")
@@ -660,12 +825,12 @@ class MainActivity : Activity() {
             val action = batchPageActions.removeFirst()
             val key = pageActionKey(action)
             batchPageActionQueued.remove(key)
-            if (batchPageActionVisited.contains(key)) continue
+            if (batchPageActionVisited.contains(key) || batchPageActionFailed.contains(key)) continue
 
             val current = canonicalizeBatchUrl(webView.url ?: "")
             pendingBatchPageAction = action
             currentBatchTarget = action.baseUrl
-            status.text = "목록 페이지 ${action.page}쪽 탐색 준비"
+            status.text = pageActionStatus(action, "탐색 준비")
 
             if (current == action.baseUrl) {
                 executePendingBatchPageAction()
@@ -694,33 +859,30 @@ class MainActivity : Activity() {
         pendingBatchPageAction = null
 
         val key = pageActionKey(action)
-        if (!batchPageActionVisited.add(key)) {
+        if (batchPageActionVisited.contains(key) || batchPageActionFailed.contains(key)) {
             handler.postDelayed({ loadNextBatchPage() }, 100)
             return
         }
 
-        val js = """
-            (function(){
-              try{
-                if(typeof window.fnSearch !== 'function') return false;
-                window.fnSearch(${action.page});
-                return true;
-              }catch(e){
-                return false;
-              }
-            })();
-        """.trimIndent()
+        val js = currentAdapter().paginationScript(action.page)
+        if (js.isNullOrBlank()) {
+            recordPaginationFailure(action, "pagination-action-unavailable")
+            handler.postDelayed({ loadNextBatchPage() }, 150)
+            return
+        }
 
-        status.text = "목록 페이지 ${action.page}쪽 이동 중"
+        activeBatchPageAction = action
+        status.text = pageActionStatus(action, if (action.retry > 0) "재시도 ${action.retry}/$MAX_PAGE_RETRIES" else "이동 중")
         webView.evaluateJavascript(js) { result ->
             if (result != "true") {
-                batchErrors.put(JSONObject()
-                    .put("url", action.baseUrl)
-                    .put("type", "pagination-action-unavailable")
-                    .put("page", action.page))
-                handler.postDelayed({ loadNextBatchPage() }, 150)
+                activeBatchPageAction = null
+                if (action.retry < MAX_PAGE_RETRIES) {
+                    schedulePageActionRetry(action, "pagination-action-unavailable")
+                } else {
+                    recordPaginationFailure(action, "pagination-action-unavailable")
+                    handler.postDelayed({ loadNextBatchPage() }, 150)
+                }
             } else {
-                // fnSearch가 전체 페이지 이동이 아닌 DOM/AJAX 갱신을 사용하는 경우를 위한 보조 수집.
                 handler.postDelayed({
                     if (batchRunning && !batchPausedForLogin && !batchCollecting && pendingBatchPageAction == null) {
                         scheduleBatchSnapshot()
@@ -730,8 +892,50 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun schedulePageActionRetry(action: BatchPageAction, reason: String) {
+        val retry = action.copy(retry = action.retry + 1)
+        batchPaginationRetries += 1
+        batchRetryEvents.put(JSONObject()
+            .put("familyKey", action.familyKey)
+            .put("requestedYear", action.requestedYear ?: JSONObject.NULL)
+            .put("page", action.page)
+            .put("attempt", retry.retry)
+            .put("reason", reason))
+        pendingBatchPageAction = retry
+        activeBatchPageAction = null
+        currentBatchTarget = retry.baseUrl
+        status.text = pageActionStatus(retry, "서버 오류 후 재시도 대기")
+        val delay = 900L + (retry.retry * 900L)
+        handler.postDelayed({
+            if (batchRunning && !batchPausedForLogin) webView.loadUrl(retry.baseUrl)
+        }, delay)
+    }
+
+    private fun recordPaginationFailure(action: BatchPageAction, type: String) {
+        batchPageActionFailed.add(pageActionKey(action))
+        batchErrors.put(JSONObject()
+            .put("url", action.baseUrl)
+            .put("type", type)
+            .put("page", action.page)
+            .put("totalPages", action.totalPages)
+            .put("familyKey", action.familyKey)
+            .put("requestedYear", action.requestedYear ?: JSONObject.NULL)
+            .put("retryCount", action.retry))
+    }
+
+    private fun pageActionStatus(action: BatchPageAction, suffix: String): String {
+        val year = action.requestedYear?.let { " $it" } ?: ""
+        val label = when {
+            action.familyKey.contains("classUnivView") -> "학과정보"
+            action.familyKey.contains("univView") -> "대학정보"
+            action.familyKey.contains("admssUnivView") -> "전형정보"
+            else -> "목록"
+        }
+        return "$label$year ${action.page}/${action.totalPages}쪽 $suffix"
+    }
+
     private fun pageActionKey(action: BatchPageAction): String =
-        "${action.baseUrl}|fnSearch|${action.page}"
+        "${action.baseUrl}|page|${action.page}"
 
     private fun canonicalizeBatchUrl(url: String): String {
         if (url.isBlank()) return ""
@@ -761,7 +965,7 @@ class MainActivity : Activity() {
         batchCollecting = false
         batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
         finalizeBatchJson(reason)
-        status.text = "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / 레코드 ${batchRecords.length()}"
+        status.text = "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 최종오류 ${batchErrors.length()} / 재시도 $batchPaginationRetries / 레코드 ${batchRecords.length()}"
     }
 
     private fun finalizeBatchJson(reason: String) {
@@ -778,8 +982,14 @@ class MainActivity : Activity() {
                 .put("records", batchRecords.length())
                 .put("resourceLinks", batchResources.length())
                 .put("paginationActionsCompleted", batchPageActionVisited.size)
+                .put("paginationActionsFailed", batchPageActionFailed.size)
+                .put("paginationRetries", batchPaginationRetries)
+                .put("paginationPlans", batchPaginationPlanned.size)
+                .put("duplicateYearViewsSkipped", batchDuplicateYearViews.length())
                 .put("dynamicSearchBootstraps", batchBootstrapSearchAttempted.size))
             .put("errors", batchErrors)
+            .put("retryEvents", batchRetryEvents)
+            .put("duplicateYearViews", batchDuplicateYearViews)
             .put("records", batchRecords)
             .put("snapshots", batchSnapshots)
             .put("resourceLinks", batchResources)
@@ -832,18 +1042,63 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun enqueuePageActions(actions: JSONArray) {
-        for (i in 0 until actions.length()) {
-            val obj = actions.optJSONObject(i) ?: continue
-            if (obj.optString("type") != "fnSearch") continue
-            val page = obj.optInt("page", -1)
-            val baseUrl = canonicalizeBatchUrl(obj.optString("baseUrl"))
-            if (page <= 1 || page > 500 || baseUrl.isBlank() || !isProviderUrl(baseUrl)) continue
-            val action = BatchPageAction(baseUrl, page)
+    private fun tableFingerprint(snapshot: JSONObject): String? {
+        val tables = snapshot.optJSONArray("tables") ?: return null
+        if (tables.length() == 0) return null
+        val rows = tables.optJSONObject(0)?.optJSONArray("rows") ?: return null
+        if (rows.length() == 0) return null
+        return RecordUtils.sha256(rows.toString())
+    }
+
+    private fun enqueueCalculatedPageActions(snapshot: JSONObject, plan: PaginationPlan) {
+        val baseUrl = canonicalizeBatchUrl(snapshot.optString("url"))
+        if (baseUrl.isBlank() || !isProviderUrl(baseUrl) || plan.totalPages <= 1) return
+        val planKey = "$baseUrl|${plan.totalItems}|${plan.pageSize}|${plan.totalPages}"
+        if (!batchPaginationPlanned.add(planKey)) return
+
+        for (page in 2..plan.totalPages) {
+            val action = BatchPageAction(
+                baseUrl = baseUrl,
+                page = page,
+                familyKey = plan.familyKey,
+                requestedYear = plan.requestedYear,
+                totalPages = plan.totalPages,
+                pageSize = plan.pageSize,
+                totalItems = plan.totalItems
+            )
             val key = pageActionKey(action)
-            if (batchPageActionVisited.contains(key)) continue
+            if (batchPageActionVisited.contains(key) || batchPageActionFailed.contains(key)) continue
             if (batchPageActionQueued.add(key)) batchPageActions.addLast(action)
-            if (batchPageActions.size + batchPageActionVisited.size >= MAX_BATCH_PAGES * 2) break
+        }
+    }
+
+    private fun duplicateYearViewOf(plan: PaginationPlan): Int? {
+        val previous = batchListFingerprints[plan.familyKey] ?: return null
+        val year = plan.requestedYear ?: return null
+        val previousYear = previous.requestedYear ?: return null
+        if (year >= previousYear) return null
+        val identical = previous.totalItems == plan.totalItems &&
+            previous.pageSize == plan.pageSize &&
+            previous.fingerprint == plan.firstPageFingerprint
+        return if (identical) previousYear else null
+    }
+
+    private fun registerListFingerprint(plan: PaginationPlan) {
+        val current = batchListFingerprints[plan.familyKey]
+        val incoming = ListFingerprint(
+            requestedYear = plan.requestedYear,
+            totalItems = plan.totalItems,
+            pageSize = plan.pageSize,
+            fingerprint = plan.firstPageFingerprint
+        )
+        if (current == null) {
+            batchListFingerprints[plan.familyKey] = incoming
+            return
+        }
+        val currentYear = current.requestedYear
+        val incomingYear = incoming.requestedYear
+        if (currentYear == null || (incomingYear != null && incomingYear > currentYear)) {
+            batchListFingerprints[plan.familyKey] = incoming
         }
     }
 

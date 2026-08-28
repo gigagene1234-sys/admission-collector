@@ -227,6 +227,10 @@ object SnapshotScript {
     if(nav.length>=240) break;
   }
 
+  var totalMatch=bodyText.match(/총\s*([0-9,]+)\s*건/);
+  var listTotal=totalMatch?parseInt(totalMatch[1].replace(/,/g,''),10):-1;
+  var visibleDataRows=(tables.length>0 && tables[0].rows)?Math.max(0,tables[0].rows.length-1):0;
+
   return JSON.stringify({
     title:document.title||'',
     url:safeExportUrl(location.href),
@@ -234,6 +238,7 @@ object SnapshotScript {
     collectedAt:new Date().toISOString(),
     session:{needsLogin:(pass||loginUrl||loginRequired)&&!authenticated,authenticated:authenticated},
     pageState:{isError:pageError,errorType:errorType},
+    listMeta:{totalItems:isNaN(listTotal)?-1:listTotal,visibleDataRows:visibleDataRows},
     discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length},
     context:context,
     tables:tables,

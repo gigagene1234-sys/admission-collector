@@ -2,6 +2,7 @@ package com.admissionhub.collector.parser
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.MessageDigest
 
 object RecordUtils {
     fun dedupe(input: JSONArray): JSONArray {
@@ -26,15 +27,25 @@ object RecordUtils {
         }
     }
 
-    private fun key(o: JSONObject): String = listOf(
-        o.optString("recordType"),
-        o.opt("year")?.toString() ?: "",
-        o.opt("university")?.toString() ?: "",
-        o.opt("department")?.toString() ?: "",
-        o.opt("admission")?.toString() ?: "",
-        o.optJSONObject("metrics")?.toString() ?: "",
-        o.optString("rawEvidence").take(300)
-    ).joinToString("|")
+    private fun key(o: JSONObject): String {
+        val rowFingerprint = o.optString("sourceRowFingerprint")
+        if (rowFingerprint.isNotBlank()) {
+            return listOf(
+                o.optString("recordType"),
+                o.opt("year")?.toString() ?: "",
+                rowFingerprint
+            ).joinToString("|")
+        }
+        return listOf(
+            o.optString("recordType"),
+            o.opt("year")?.toString() ?: "",
+            o.opt("university")?.toString() ?: "",
+            o.opt("department")?.toString() ?: "",
+            o.opt("admission")?.toString() ?: "",
+            o.optJSONObject("metrics")?.toString() ?: "",
+            o.optString("rawEvidence").take(300)
+        ).joinToString("|")
+    }
 
     fun appendUniqueResources(target: JSONArray, incoming: JSONArray) {
         val seen = linkedSetOf<String>()
@@ -46,5 +57,10 @@ object RecordUtils {
             val url = obj.optString("url")
             if (url.isNotBlank() && seen.add(url)) target.put(obj)
         }
+    }
+
+    fun sha256(value: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
     }
 }

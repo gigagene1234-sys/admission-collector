@@ -50,6 +50,31 @@ object AdigaAdapter : ProviderAdapter {
             url.contains("/ucp/cls/uni/classUnivView.do") ||
             url.contains("/ucp/prc/uni/admssUnivView.do")
 
+    override fun paginationPlan(snapshot: JSONObject): PaginationPlan? {
+        val url = snapshot.optString("url")
+        if (!isDynamicListPage(url)) return null
+        val meta = snapshot.optJSONObject("listMeta") ?: return null
+        val totalItems = meta.optInt("totalItems", -1)
+        val pageSize = meta.optInt("visibleDataRows", 0)
+        if (totalItems <= 0 || pageSize <= 0) return null
+        val totalPages = ((totalItems + pageSize - 1) / pageSize).coerceIn(1, 600)
+        val rows = firstTableRows(snapshot) ?: return null
+        val fingerprint = RecordUtils.sha256("$totalItems|${rows}")
+        return PaginationPlan(
+            familyKey = listFamilyKey(url),
+            totalItems = totalItems,
+            pageSize = pageSize,
+            totalPages = totalPages,
+            requestedYear = queryYear(url),
+            firstPageFingerprint = fingerprint
+        )
+    }
+
+    override fun paginationScript(page: Int): String? {
+        if (page <= 1 || page > 600) return null
+        return "(function(){try{if(typeof window.fnSearch!=='function')return false;window.fnSearch($page);return true;}catch(e){return false;}})();"
+    }
+
     override fun classify(snapshot: JSONObject): String {
         val url = snapshot.optString("url")
         return when {
@@ -110,11 +135,15 @@ object AdigaAdapter : ProviderAdapter {
                 .put("recordType", "university-summary")
                 .put("year", pageYear ?: JSONObject.NULL)
                 .put("university", university)
+                .put("campus", extractCampus(university) ?: JSONObject.NULL)
                 .put("department", JSONObject.NULL)
                 .put("admission", JSONObject.NULL)
                 .put("metrics", metrics)
                 .put("confidence", "high")
                 .put("sourcePage", snapshot.optString("url"))
+                .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
+                .put("sourceRowOrdinal", sourceRowOrdinal(snapshot, ri))
+                .put("sourceRowFingerprint", rowFingerprint("university-summary", row))
                 .put("rawEvidence", rowToEvidence(row)))
         }
         return out
@@ -145,11 +174,15 @@ object AdigaAdapter : ProviderAdapter {
                 .put("recordType", "department-summary")
                 .put("year", pageYear ?: JSONObject.NULL)
                 .put("university", university)
+                .put("campus", extractCampus(university) ?: JSONObject.NULL)
                 .put("department", department)
                 .put("admission", JSONObject.NULL)
                 .put("metrics", metrics)
                 .put("confidence", "high")
                 .put("sourcePage", snapshot.optString("url"))
+                .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
+                .put("sourceRowOrdinal", sourceRowOrdinal(snapshot, ri))
+                .put("sourceRowFingerprint", rowFingerprint("department-summary", row))
                 .put("rawEvidence", rowToEvidence(row)))
         }
         return out
@@ -214,11 +247,14 @@ object AdigaAdapter : ProviderAdapter {
                 .put("recordType", "disabled-admissions-index")
                 .put("year", year ?: JSONObject.NULL)
                 .put("university", university)
+                .put("campus", extractCampus(university) ?: JSONObject.NULL)
                 .put("department", JSONObject.NULL)
                 .put("admission", "대학별 장애인 전형")
                 .put("metrics", metrics)
                 .put("confidence", "high")
                 .put("sourcePage", snapshot.optString("url"))
+                .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
+                .put("sourceRowFingerprint", rowFingerprint("disabled-admissions-index", row))
                 .put("rawEvidence", rowToEvidence(row)))
         }
         return out
@@ -226,8 +262,12 @@ object AdigaAdapter : ProviderAdapter {
 
     private fun indexRecord(type: String, university: String, metrics: JSONObject, snapshot: JSONObject, row: JSONArray): JSONObject = JSONObject()
         .put("recordType", type).put("year", JSONObject.NULL).put("university", university)
+        .put("campus", extractCampus(university) ?: JSONObject.NULL)
         .put("department", JSONObject.NULL).put("admission", JSONObject.NULL).put("metrics", metrics)
-        .put("confidence", "high").put("sourcePage", snapshot.optString("url")).put("rawEvidence", rowToEvidence(row))
+        .put("confidence", "high").put("sourcePage", snapshot.optString("url"))
+        .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
+        .put("sourceRowFingerprint", rowFingerprint(type, row))
+        .put("rawEvidence", rowToEvidence(row))
 
     private fun queryYear(url: String): Int? = queryParam(url, "searchSyr")?.toIntOrNull()
 
@@ -245,10 +285,43 @@ object AdigaAdapter : ProviderAdapter {
         } catch (_: Exception) { null }
     }
 
-    private fun normalizeUniversityCell(value: String): String = value.replace(Regex("\\s+\\["), "[").replace(Regex("\\s+"), " ").trim()
+    private fun normalizeUniversityCell(value: String): String = value
+        .replace(Regex("\\s+(?=[(\\[])") , "")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
     private fun looksLikeUniversity(value: String): Boolean {
         if (value.isBlank() || value.contains("대학명을 클릭") || value == "일반대학" || value == "전문대학") return false
-        return Regex("(대학교|대학)(?:\\[(?:본교|분교|제\\d+캠퍼스)\\])?$").containsMatchIn(value)
+        return Regex("(?:대학교|대학)(?:\\([^()]{1,60}\\))?(?:\\[(?:본교|분교|제\\d+캠퍼스)\\])?$").containsMatchIn(value)
+    }
+
+    private fun extractCampus(university: String): String? =
+        Regex("\\[((?:본교|분교|제\\d+캠퍼스))\\]$").find(university)?.groupValues?.getOrNull(1)
+
+    private fun sourceRowOrdinal(snapshot: JSONObject, rowIndex: Int): Any {
+        val page = snapshot.optInt("collectionPage", 1).coerceAtLeast(1)
+        val pagination = snapshot.optJSONObject("collectionPagination")
+        val plannedPageSize = pagination?.optInt("pageSize", 0) ?: 0
+        val visiblePageSize = snapshot.optJSONObject("listMeta")?.optInt("visibleDataRows", 0) ?: 0
+        val pageSize = if (plannedPageSize > 0) plannedPageSize else visiblePageSize
+        if (pageSize <= 0) return JSONObject.NULL
+        return (page - 1) * pageSize + rowIndex
+    }
+
+    private fun rowFingerprint(type: String, row: JSONArray): String =
+        RecordUtils.sha256("$type|${rowToEvidence(row)}")
+
+    private fun listFamilyKey(url: String): String {
+        return try {
+            val uri = URI(url)
+            val menuId = queryParam(url, "menuId")
+            buildString {
+                append(uri.path ?: "")
+                if (!menuId.isNullOrBlank()) append("?menuId=").append(menuId)
+            }
+        } catch (_: Exception) {
+            url.substringBefore('?')
+        }
     }
     private fun parseCompetition(value: String): Pair<Double?, Double?> {
         val early = Regex("수시\\s*([0-9]+(?:\\.[0-9]+)?)").find(value)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
