@@ -7,7 +7,7 @@ on:
     paths:
       - ".github/workflows/inspect-admission-cloud-state.yml"
 
-# diagnostic-trigger: 2026-08-29-v036-device-check
+# diagnostic-trigger: 2026-08-29-v036-device-check-2
 
 jobs:
   inspect:
