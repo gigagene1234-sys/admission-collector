@@ -100,6 +100,7 @@ class MainActivity : Activity() {
     private var batchCloudPagesScheduled = 0
     private var batchCloudPagesSkipped = 0
     private var batchContextRecoveries = 0
+    private var batchSessionSyncRetries = 0
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
@@ -109,7 +110,8 @@ class MainActivity : Activity() {
         private const val MAX_BATCH_PAGES = 2000
         private const val MAX_PAGE_RETRIES = 2
         private const val PREVIEW_LIMIT = 16000
-        private const val VERSION = "0.3.3"
+        private const val MAX_SESSION_SYNC_RETRIES = 3
+        private const val VERSION = "0.3.4"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -270,7 +272,7 @@ class MainActivity : Activity() {
             javaScriptCanOpenWindowsAutomatically = true
             setSupportMultipleWindows(false)
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            userAgentString = userAgentString + " AdmissionCollectorCrawler/$VERSION"
+            userAgentString = userAgentString + " AdmissionCollector/$VERSION"
         }
 
         collectorWebView.webViewClient = object : WebViewClient() {
@@ -302,8 +304,8 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
                 if (batchPausedForLogin) {
-                    checkSessionState { needsLogin, _ ->
-                        if (!needsLogin) {
+                    checkSessionState { needsLogin, authenticated ->
+                        if (!needsLogin && authenticated) {
                             sessionState.text = "● 로그인 상태 복구 감지"
                             resumeAfterLogin()
                         }
@@ -398,7 +400,11 @@ class MainActivity : Activity() {
         checkSessionState { needsLogin, hasAuthenticatedUi ->
             if (!needsLogin && hasAuthenticatedUi) {
                 sessionState.text = "● 로그인 유지됨"
-                Toast.makeText(this, "로그인 세션이 유지되고 있습니다.", Toast.LENGTH_SHORT).show()
+                if (batchRunning && batchPausedForLogin) {
+                    resumeAfterLogin()
+                } else {
+                    Toast.makeText(this, "로그인 세션이 유지되고 있습니다.", Toast.LENGTH_SHORT).show()
+                }
                 return@checkSessionState
             }
 
@@ -536,6 +542,7 @@ class MainActivity : Activity() {
         batchCloudPagesScheduled = 0
         batchCloudPagesSkipped = 0
         batchContextRecoveries = 0
+        batchSessionSyncRetries = 0
         currentBatchTarget = canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
         status.text = if (cloudOffload.isConfigured()) {
@@ -592,13 +599,52 @@ class MainActivity : Activity() {
         if (batchSnapshots.length() > 0) finalizeBatchJson("stopped")
     }
 
-    private fun pauseBatchForLogin() {
+    private fun pauseBatchForLogin(autoOpenLogin: Boolean = true) {
         batchPausedForLogin = true
         batchCollecting = false
-        sessionState.text = "○ 로그인 갱신 필요"
-        status.text = "백그라운드 수집 일시정지: 메인 화면에서 로그인 갱신 후 자동으로 계속합니다."
+        if (autoOpenLogin) {
+            sessionState.text = "○ 로그인 갱신 필요"
+            status.text = "백그라운드 수집 일시정지: 메인 로그인 갱신 후 자동으로 계속합니다."
+        } else {
+            sessionState.text = "△ 수집 세션 재동기화 필요"
+            status.text = "수집 세션 자동 동기화 실패: 로그인 세션 확인/갱신 후 계속을 눌러주세요."
+        }
         batchButton.text = "일괄 수집 중지"
-        handler.postDelayed({ refreshSessionOrOpenLogin() }, 150)
+        if (autoOpenLogin) handler.postDelayed({ refreshSessionOrOpenLogin() }, 150)
+    }
+
+    private fun recoverCollectorSessionOrPause() {
+        if (!batchRunning) return
+        CookieManager.getInstance().flush()
+        checkSessionState { needsLogin, authenticated ->
+            if (!batchRunning) return@checkSessionState
+
+            if (!needsLogin && authenticated && batchSessionSyncRetries < MAX_SESSION_SYNC_RETRIES) {
+                batchSessionSyncRetries += 1
+                batchPausedForLogin = false
+                batchCollecting = false
+                sessionState.text = "● 메인 로그인 유지 / 수집 세션 동기화"
+                val retry = currentBatchTarget
+                status.text = "백그라운드 수집 세션 재동기화 ${batchSessionSyncRetries}/$MAX_SESSION_SYNC_RETRIES"
+                handler.postDelayed({
+                    if (!batchRunning || batchPausedForLogin) return@postDelayed
+                    if (!retry.isNullOrBlank() && isProviderUrl(retry)) {
+                        collectorWebView.loadUrl(retry)
+                    } else {
+                        loadNextBatchPage()
+                    }
+                }, 300)
+                return@checkSessionState
+            }
+
+            if (!needsLogin && authenticated) {
+                batchSessionSyncRetries = 0
+                pauseBatchForLogin(autoOpenLogin = false)
+            } else {
+                batchSessionSyncRetries = 0
+                pauseBatchForLogin(autoOpenLogin = true)
+            }
+        }
     }
 
     private fun resumeAfterLogin() {
@@ -750,7 +796,7 @@ class MainActivity : Activity() {
                 val canFnSearch = obj.optBoolean("canFnSearch", false)
                 if (!afterBootstrap && canFnSearch && batchBootstrapSearchAttempted.add(baseUrl)) {
                     status.text = "초기 검색 실행 후 목록 재대기"
-                    webView.evaluateJavascript(
+                    collectorWebView.evaluateJavascript(
                         "(function(){try{window.fnSearch(1);return true;}catch(e){return false;}})();"
                     ) {
                         handler.postDelayed({
@@ -864,9 +910,10 @@ class MainActivity : Activity() {
                     pendingBatchPageAction = activeAction
                     activeBatchPageAction = null
                 }
-                pauseBatchForLogin()
+                recoverCollectorSessionOrPause()
                 return@collectSnapshot
             }
+            batchSessionSyncRetries = 0
 
             val plan = if (activeAction == null) currentAdapter().paginationPlan(snapshot) else null
             val duplicateOfYear = plan?.let { duplicateYearViewOf(it) }
