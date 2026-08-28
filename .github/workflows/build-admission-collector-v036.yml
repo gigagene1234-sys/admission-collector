@@ -40,7 +40,7 @@ jobs:
           p = Path('scripts/apply_v036.py')
           s = p.read_text()
           old = """    if 'collectorWebView' in text:\n        raise SystemExit(f\"{path}: obsolete collectorWebView reference remains\")\n"""
-          new = """    # Any residual reference at this point belongs to the old secondary collector.\n    # The v0.3.6 architecture deliberately uses the authenticated WebView for every crawl.\n    text = text.replace('collectorWebView', 'webView')\n    if 'collectorWebView' in text:\n        raise SystemExit(f\"{path}: obsolete collectorWebView reference remains\")\n"""
+          new = """    # Any residual reference at this point belongs to the old secondary collector.\n    # The v0.3.6 architecture deliberately uses the authenticated WebView for every crawl.\n    text = text.replace('collectorWebView', 'webView')\n    text = text.replace('    private var collectorStateSyncInProgress = false\\n', '')\n    text = text.replace('    private var collectorStateSyncPayload: String? = null\\n', '')\n    text = text.replace('    private var collectorStateSyncTarget: String? = null\\n', '')\n    if 'collectorWebView' in text:\n        raise SystemExit(f\"{path}: obsolete collectorWebView reference remains\")\n"""
           if old not in s:
               raise SystemExit('apply_v036.py normalization marker missing')
           p.write_text(s.replace(old, new, 1))
@@ -65,7 +65,7 @@ jobs:
             echo 'secondary collector WebView still present' >&2
             exit 1
           fi
-          if grep -q 'synchronizeCollectorBrowserState' MainActivity.kt; then
+          if grep -Eq 'synchronizeCollectorBrowserState|collectorStateSync(InProgress|Payload|Target)' MainActivity.kt; then
             echo 'obsolete browser state copy path still present' >&2
             exit 1
           fi
