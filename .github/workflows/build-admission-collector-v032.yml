@@ -25,7 +25,9 @@ jobs:
           ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Apply deterministic v0.3.2 patch
-        run: python3 scripts/apply_v032.py
+        run: |
+          python3 scripts/apply_v032.py
+          python3 scripts/fix_v032_resume.py
 
       - name: Verify source invariants
         shell: bash
@@ -47,6 +49,10 @@ jobs:
           grep -q 'CloudOffloadCoordinator' MainActivity.kt
           grep -q 'cloudOffload.uploadPage' MainActivity.kt
           grep -q 'cloudOffload.uploadError' MainActivity.kt
+          grep -q 'cloudOffload.resumePlan' MainActivity.kt
+          grep -q 'batchCloudPagesSkipped' MainActivity.kt
+          grep -q '${batchCloudPlansPending}개 목록' MainActivity.kt
+          grep -q 'DEFAULT_WORKER_URL = "https://admission-collector-offload.gigagene1234.workers.dev"' app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt
 
       - name: Validate Cloudflare Worker source
         shell: bash
