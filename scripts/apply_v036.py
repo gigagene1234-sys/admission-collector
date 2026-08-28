@@ -394,6 +394,11 @@ def patch_main(path: Path) -> None:
 '''
     text = once(text, old_destroy, '        webView.stopLoading()\n', f"{path}: destroy single webview")
 
+    # Any residual secondary-WebView name belongs to the old v0.3.5 collector.
+    text = text.replace('collectorWebView', 'webView')
+    text = text.replace('    private var collectorStateSyncInProgress = false\n', '')
+    text = text.replace('    private var collectorStateSyncPayload: String? = null\n', '')
+    text = text.replace('    private var collectorStateSyncTarget: String? = null\n', '')
     if 'collectorWebView' in text:
         raise SystemExit(f"{path}: obsolete collectorWebView reference remains")
     if 'synchronizeCollectorBrowserState' in text or 'collectorStateSyncInProgress' in text:
