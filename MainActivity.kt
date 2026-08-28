@@ -39,9 +39,14 @@ class MainActivity : Activity() {
             handler.postDelayed(this, 45_000L)
         }
     }
+    private data class BatchPageAction(val baseUrl: String, val page: Int)
+
     private val batchQueue = ArrayDeque<String>()
     private val batchVisited = linkedSetOf<String>()
     private val batchQueued = linkedSetOf<String>()
+    private val batchPageActions = ArrayDeque<BatchPageAction>()
+    private val batchPageActionQueued = linkedSetOf<String>()
+    private val batchPageActionVisited = linkedSetOf<String>()
     private var batchSnapshots = JSONArray()
     private var batchRecords = JSONArray()
     private var batchResources = JSONArray()
@@ -50,6 +55,7 @@ class MainActivity : Activity() {
     private var batchPausedForLogin = false
     private var batchCollecting = false
     private var currentBatchTarget: String? = null
+    private var pendingBatchPageAction: BatchPageAction? = null
     private var batchPageCount = 0
 
     private var lastJson: String = ""
@@ -59,9 +65,9 @@ class MainActivity : Activity() {
         private const val SAVE_JSON_REQUEST = 7001
         private const val ADIGA_URL = "https://www.adiga.kr/"
         private const val JINHAK_URL = "https://www.jinhak.com/"
-        private const val MAX_BATCH_PAGES = 240
+        private const val MAX_BATCH_PAGES = 900
         private const val PREVIEW_LIMIT = 16000
-        private const val VERSION = "0.2.2"
+        private const val VERSION = "0.2.3"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -202,7 +208,14 @@ class MainActivity : Activity() {
                             resumeAfterLogin()
                         }
                     }
-                    batchRunning -> scheduleBatchSnapshot()
+                    batchRunning -> {
+                        val pending = pendingBatchPageAction
+                        if (pending != null && canonicalizeBatchUrl(url) == pending.baseUrl) {
+                            executePendingBatchPageAction()
+                        } else {
+                            scheduleBatchSnapshot()
+                        }
+                    }
                     else -> checkSessionState()
                 }
             }
@@ -389,6 +402,10 @@ class MainActivity : Activity() {
         batchQueue.clear()
         batchVisited.clear()
         batchQueued.clear()
+        batchPageActions.clear()
+        batchPageActionQueued.clear()
+        batchPageActionVisited.clear()
+        pendingBatchPageAction = null
         batchSnapshots = JSONArray()
         batchRecords = JSONArray()
         batchResources = JSONArray()
@@ -417,6 +434,9 @@ class MainActivity : Activity() {
         batchCollecting = false
         batchQueue.clear()
         batchQueued.clear()
+        batchPageActions.clear()
+        batchPageActionQueued.clear()
+        pendingBatchPageAction = null
         batchButton.text = "접근 가능 정보 일괄 수집"
         status.text = "일괄 수집 중지: $reason"
         if (batchSnapshots.length() > 0) finalizeBatchJson("stopped")
@@ -510,8 +530,9 @@ class MainActivity : Activity() {
             appendUniqueRecords(batchRecords, normalizeSnapshot(snapshot))
             appendUniqueResources(batchResources, snapshot.optJSONArray("resourceLinks") ?: JSONArray())
             enqueueDiscoveredLinks(snapshot.optJSONArray("navigationLinks") ?: JSONArray())
+            enqueuePageActions(snapshot.optJSONArray("pageActions") ?: JSONArray())
 
-            status.text = "일괄 수집: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / 대기 ${batchQueue.size} / 레코드 ${batchRecords.length()}"
+            status.text = "일괄 수집: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / URL대기 ${batchQueue.size} / 페이지대기 ${batchPageActions.size} / 레코드 ${batchRecords.length()}"
 
             if (batchPageCount >= MAX_BATCH_PAGES) {
                 finishBatch("page-limit")
@@ -523,16 +544,104 @@ class MainActivity : Activity() {
 
     private fun loadNextBatchPage() {
         if (!batchRunning || batchPausedForLogin) return
+
+        while (batchPageActions.isNotEmpty()) {
+            val action = batchPageActions.removeFirst()
+            val key = pageActionKey(action)
+            batchPageActionQueued.remove(key)
+            if (batchPageActionVisited.contains(key)) continue
+
+            val current = canonicalizeBatchUrl(webView.url ?: "")
+            pendingBatchPageAction = action
+            currentBatchTarget = action.baseUrl
+            status.text = "목록 페이지 ${action.page}쪽 탐색 준비"
+
+            if (current == action.baseUrl) {
+                executePendingBatchPageAction()
+            } else {
+                webView.loadUrl(action.baseUrl)
+            }
+            return
+        }
+
         while (batchQueue.isNotEmpty()) {
-            val next = batchQueue.removeFirst()
+            val nextRaw = batchQueue.removeFirst()
+            val next = canonicalizeBatchUrl(nextRaw)
             batchQueued.remove(next)
-            if (batchVisited.contains(next) || !isProviderUrl(next)) continue
+            if (next.isBlank() || batchVisited.contains(next) || !isProviderUrl(next)) continue
             currentBatchTarget = next
             status.text = "다음 입시정보 페이지 탐색: ${safeDisplayUrl(next)}"
             webView.loadUrl(next)
             return
         }
         finishBatch("completed")
+    }
+
+    private fun executePendingBatchPageAction() {
+        if (!batchRunning || batchPausedForLogin) return
+        val action = pendingBatchPageAction ?: return
+        pendingBatchPageAction = null
+
+        val key = pageActionKey(action)
+        if (!batchPageActionVisited.add(key)) {
+            handler.postDelayed({ loadNextBatchPage() }, 100)
+            return
+        }
+
+        val js = """
+            (function(){
+              try{
+                if(typeof window.fnSearch !== 'function') return false;
+                window.fnSearch(${action.page});
+                return true;
+              }catch(e){
+                return false;
+              }
+            })();
+        """.trimIndent()
+
+        status.text = "목록 페이지 ${action.page}쪽 이동 중"
+        webView.evaluateJavascript(js) { result ->
+            if (result != "true") {
+                batchErrors.put(JSONObject()
+                    .put("url", action.baseUrl)
+                    .put("type", "pagination-action-unavailable")
+                    .put("page", action.page))
+                handler.postDelayed({ loadNextBatchPage() }, 150)
+            } else {
+                // fnSearch가 전체 페이지 이동이 아닌 DOM/AJAX 갱신을 사용하는 경우를 위한 보조 수집.
+                handler.postDelayed({
+                    if (batchRunning && !batchPausedForLogin && !batchCollecting && pendingBatchPageAction == null) {
+                        scheduleBatchSnapshot()
+                    }
+                }, 1100)
+            }
+        }
+    }
+
+    private fun pageActionKey(action: BatchPageAction): String =
+        "${action.baseUrl}|fnSearch|${action.page}"
+
+    private fun canonicalizeBatchUrl(url: String): String {
+        if (url.isBlank()) return ""
+        return try {
+            val uri = Uri.parse(url)
+            val host = uri.host ?: return ""
+            val builder = Uri.Builder()
+                .scheme(uri.scheme ?: "https")
+                .authority(host)
+                .path(uri.path ?: "/")
+
+            val forbidden = Regex("token|session|auth|csrf|transkey|captcha|password|passwd|secret|credential", RegexOption.IGNORE_CASE)
+            val names = uri.queryParameterNames
+            for (name in names) {
+                if (forbidden.containsMatchIn(name)) continue
+                for (value in uri.getQueryParameters(name)) builder.appendQueryParameter(name, value)
+            }
+            builder.build().toString()
+        } catch (_: Exception) {
+            url.substringBefore('#')
+        }
     }
 
     private fun finishBatch(reason: String) {
@@ -556,7 +665,8 @@ class MainActivity : Activity() {
                 .put("successfulPages", batchSnapshots.length())
                 .put("errorPages", batchErrors.length())
                 .put("records", batchRecords.length())
-                .put("resourceLinks", batchResources.length()))
+                .put("resourceLinks", batchResources.length())
+                .put("paginationActionsCompleted", batchPageActionVisited.size))
             .put("errors", batchErrors)
             .put("records", batchRecords)
             .put("snapshots", batchSnapshots)
@@ -606,49 +716,67 @@ class MainActivity : Activity() {
             t=t.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig,'[redacted-email]');
             return t.slice(0,maxLen||3000);
           }
+          function unsafePseudoUrl(raw){
+            raw=String(raw||'').trim();
+            if(!raw || raw.length>4096) return true;
+            if(/^(?:javascript:|data:|mailto:|tel:)/i.test(raw)) return true;
+            if(/^[A-Za-z_$][A-Za-z0-9_$]*\s*\(/.test(raw)) return true;
+            if(/^(?:return\s+false|void\s*\()/i.test(raw)) return true;
+            return false;
+          }
           function safeUrl(raw){
+            if(unsafePseudoUrl(raw)) return '';
             try{
               var u=new URL(raw,location.href);
               if(u.protocol!=='https:' && u.protocol!=='http:') return '';
-              return u.origin+u.pathname+u.hash;
+              return u.origin+u.pathname;
             }catch(e){ return ''; }
           }
           function fullNavigationUrl(raw){
+            if(unsafePseudoUrl(raw)) return '';
             try{
               var u=new URL(raw,location.href);
               if(u.origin!==location.origin) return '';
-              var badKey=/token|session|auth|csrf|transkey|captcha|password|passwd|secret|credential/i;
+              var badKey=/token|session|auth|csrf|transkey|captcha|password|passwd|secret|credential|sysReg|sysChg|userId|ipMac/i;
               var filtered=new URLSearchParams();
               u.searchParams.forEach(function(v,k){ if(!badKey.test(k)) filtered.append(k,v); });
               var q=filtered.toString();
-              return u.origin+u.pathname+(q?'?'+q:'')+u.hash;
+              return u.origin+u.pathname+(q?'?'+q:'');
             }catch(e){ return ''; }
           }
           function safeExportUrl(raw){
+            if(unsafePseudoUrl(raw)) return '';
             try{
               var u=new URL(raw,location.href);
               if(u.protocol!=='https:' && u.protocol!=='http:') return '';
-              var badKey=/token|session|auth|csrf|transkey|captcha|password|passwd|secret|credential|preurl|returnurl|redirect|callback/i;
+              var badKey=/token|session|auth|csrf|transkey|captcha|password|passwd|secret|credential|preurl|returnurl|redirect|callback|sysReg|sysChg|userId|ipMac/i;
               var filtered=new URLSearchParams();
               u.searchParams.forEach(function(v,k){ if(!badKey.test(k)) filtered.append(k,v); });
               var q=filtered.toString();
-              return u.origin+u.pathname+(q?'?'+q:'')+u.hash;
+              return u.origin+u.pathname+(q?'?'+q:'');
             }catch(e){ return ''; }
           }
           function routeFromScript(raw){
-            raw=String(raw||'');
-            if(!raw) return '';
-            var direct=fullNavigationUrl(raw);
-            if(direct && !/^javascript:/i.test(raw)) return direct;
-            var decoded=raw.replace(/&amp;/g,'&');
-            var matches=decoded.match(/(?:https?:\/\/[^'"\s)]+|\/[A-Za-z0-9_./-]+\.do(?:\?[^'"\s)]*)?)/ig)||[];
-            for(var i=0;i<matches.length;i++){
-              var r=fullNavigationUrl(matches[i]);
-              if(r) return r;
+            raw=String(raw||'').replace(/&amp;/g,'&').trim();
+            if(!raw || raw.length>4096) return '';
+
+            // 함수 호출 전체를 URL로 해석하지 않는다. 실제 문자열 URL만 추출한다.
+            var explicit=[
+              /location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i,
+              /location\.(?:assign|replace)\s*\(\s*['"]([^'"]+)['"]/i,
+              /window\.open\s*\(\s*['"]([^'"]+)['"]/i
+            ];
+            for(var i=0;i<explicit.length;i++){
+              var em=raw.match(explicit[i]);
+              if(em && em[1]){
+                var er=fullNavigationUrl(em[1]);
+                if(er) return er;
+              }
             }
-            var quoted=/['"]([^'"]+\.do(?:\?[^'"]*)?)['"]/ig;
+
+            var quoted=/['"]((?:https?:\/\/[^'"]+|\/[^'"]+\.do(?:\?[^'"]*)?))['"]/ig;
             var m;
-            while((m=quoted.exec(decoded))!==null){
+            while((m=quoted.exec(raw))!==null){
               var q=fullNavigationUrl(m[1]);
               if(q) return q;
             }
@@ -728,12 +856,15 @@ class MainActivity : Activity() {
 
           var nav=[];
           var resources=[];
+          var pageActions=[];
           var linkNodes=document.querySelectorAll('a,button,[role=button],[onclick],[data-href],[data-url],[data-link],[data-path]');
           var seenNav={};
           var seenRes={};
+          var seenPageAction={};
           var currentParts=location.pathname.split('/').filter(Boolean);
           var prefix=currentParts.slice(0,2).join('/');
           var scriptCandidates=0;
+          var paginationAllowed=/\/(?:ucp\/uvt\/uni\/univView|ucp\/cls\/uni\/classUnivView|ucp\/prc\/uni\/admssUnivView|sco\/agu\/univScoScaAnlsView|uct\/acd\/adc\/characteristicsView|uct\/acd\/ueg\/univEtenGuideView|uct\/acd\/ade\/criteriaAndResultView|uct\/acd\/dia\/disabledAdmssView)\.do$/i.test(location.pathname);
           for(var li=0;li<linkNodes.length;li++){
             var a=linkNodes[li];
             if(!visible(a)) continue;
@@ -746,12 +877,28 @@ class MainActivity : Activity() {
             if(/logout|signout|로그아웃|delete|withdraw|탈퇴|회원탈퇴|원서접수|결제|삭제|저장/i.test(meta2)) continue;
             if(/^mailto:/i.test(raw) || /^tel:/i.test(raw)) continue;
 
+            var scriptText=(onclick||'')+' '+(/^javascript:/i.test(raw)?raw:'');
+            if(paginationAllowed){
+              var pm=scriptText.match(/\bfnSearch\s*\(\s*([0-9]{1,4})\s*\)/i);
+              if(pm){
+                var pageNum=parseInt(pm[1],10);
+                if(pageNum>1 && pageNum<=500){
+                  var actionKey=fullNavigationUrl(location.href)+'|fnSearch|'+pageNum;
+                  if(!seenPageAction[actionKey]){
+                    pageActions.push({type:'fnSearch',page:pageNum,baseUrl:fullNavigationUrl(location.href)});
+                    seenPageAction[actionKey]=1;
+                  }
+                }
+              }
+            }
+
             var route='';
-            if(raw && !/^javascript:/i.test(raw) && raw!=='#') route=fullNavigationUrl(raw);
+            var directUrlish=/^(?:https?:\/\/|\/|\.\.?\/)/i.test(raw) && !/[{}();]/.test(raw);
+            if(raw && directUrlish && raw!=='#') route=fullNavigationUrl(raw);
             if(!route && onclick){ route=routeFromScript(onclick); if(route) scriptCandidates++; }
             if(!route && /^javascript:/i.test(raw)){ route=routeFromScript(raw); if(route) scriptCandidates++; }
 
-            var resourceRaw=raw || (route||'');
+            var resourceRaw=(raw && directUrlish) ? raw : (route||'');
             var exportUrl=safeExportUrl(resourceRaw);
             var u=null;
             try{ if(resourceRaw) u=new URL(resourceRaw,location.href); }catch(e){ u=null; }
@@ -780,17 +927,45 @@ class MainActivity : Activity() {
             collectedAt:new Date().toISOString(),
             session:{needsLogin:(pass||loginUrl||loginRequired)&&!authenticated,authenticated:authenticated},
             pageState:{isError:pageError,errorType:errorType},
-            discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates},
+            discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length},
             context:context,
             tables:tables,
             blocks:blocks,
             navigationLinks:nav,
+            pageActions:pageActions,
             resourceLinks:resources
           });
         })();
     """.trimIndent()
 
     private fun normalizeSnapshot(snapshot: JSONObject): JSONArray {
+        if (provider == "adiga") {
+            val specialized = normalizeAdigaSnapshot(snapshot)
+            if (specialized != null) return dedupeRecords(specialized)
+        }
+        return normalizeGenericSnapshot(snapshot)
+    }
+
+    private fun normalizeAdigaSnapshot(snapshot: JSONObject): JSONArray? {
+        val url = snapshot.optString("url")
+        return when {
+            url.contains("/ucp/uvt/uni/univView.do") -> parseAdigaUniversityList(snapshot)
+            url.contains("/ucp/cls/uni/classUnivView.do") -> parseAdigaDepartmentList(snapshot)
+            url.contains("/uct/acd/adc/characteristicsView.do") -> parseAdigaCharacteristicsIndex(snapshot)
+            url.contains("/uct/acd/ueg/univEtenGuideView.do") -> parseAdigaGuideIndex(snapshot)
+            url.contains("/uct/acd/ade/criteriaAndResultView.do") -> parseAdigaCriteriaIndex(snapshot)
+            url.contains("/uct/acd/dia/disabledAdmssView.do") -> parseAdigaDisabledAdmissionsIndex(snapshot)
+            // 학생부 성적은 Admission Hub의 검증된 학생부 데이터와 충돌하지 않도록
+            // raw snapshot만 보존하고 일반 입시 레코드로 변환하지 않는다.
+            url.contains("/sco/sca/schScoAnlsView.do") -> JSONArray()
+            // 아직 구조가 확인되지 않은 어디가 페이지는 raw snapshot으로 보존하되
+            // 잘못된 정규화 레코드는 만들지 않는다.
+            url.contains("adiga.kr") -> JSONArray()
+            else -> null
+        }
+    }
+
+    private fun normalizeGenericSnapshot(snapshot: JSONObject): JSONArray {
         val result = JSONArray()
         val contextParts = mutableListOf<String>()
         val context = snapshot.optJSONArray("context") ?: JSONArray()
@@ -799,43 +974,242 @@ class MainActivity : Activity() {
             if (t.isNotBlank()) contextParts.add(t)
         }
         val blocks = snapshot.optJSONArray("blocks") ?: JSONArray()
-        for (i in 0 until minOf(blocks.length(), 30)) {
+        for (i in 0 until minOf(blocks.length(), 20)) {
             val t = blocks.optString(i).trim()
             if (t.isNotBlank()) contextParts.add(t)
         }
-        val pageContext = contextParts.joinToString(" | ").take(12000)
-        val inherited = inferContext(pageContext)
+        val inherited = inferContext(contextParts.joinToString(" | ").take(8000))
 
         val tables = snapshot.optJSONArray("tables") ?: JSONArray()
         for (ti in 0 until tables.length()) {
-            val table = tables.optJSONObject(ti) ?: continue
-            val rows = table.optJSONArray("rows") ?: continue
-            val header = mutableListOf<String>()
-            if (rows.length() > 0) {
-                val first = rows.optJSONArray(0)
-                if (first != null) for (ci in 0 until first.length()) header.add(first.optString(ci))
-            }
+            val rows = tables.optJSONObject(ti)?.optJSONArray("rows") ?: continue
             for (ri in 0 until rows.length()) {
                 val row = rows.optJSONArray(ri) ?: continue
                 val cells = mutableListOf<String>()
                 for (ci in 0 until row.length()) cells.add(row.optString(ci))
-                val evidence = if (header.isNotEmpty() && ri > 0) {
-                    cells.mapIndexed { idx, value ->
-                        val h = header.getOrNull(idx)?.takeIf { it.isNotBlank() }
-                        if (h != null) "$h: $value" else value
-                    }.joinToString(" | ")
-                } else {
-                    cells.joinToString(" | ")
-                }
-                buildRecord(evidence, inherited)?.let { result.put(it) }
+                buildRecord(cells.joinToString(" | "), inherited)?.let { result.put(it) }
             }
         }
-
-        for (i in 0 until blocks.length()) {
-            val evidence = blocks.optString(i)
-            buildRecord(evidence, inherited)?.let { result.put(it) }
-        }
         return dedupeRecords(result)
+    }
+
+    private fun firstAdigaTableRows(snapshot: JSONObject): JSONArray? {
+        val tables = snapshot.optJSONArray("tables") ?: return null
+        if (tables.length() == 0) return null
+        return tables.optJSONObject(0)?.optJSONArray("rows")
+    }
+
+    private fun parseAdigaUniversityList(snapshot: JSONObject): JSONArray {
+        val out = JSONArray()
+        val rows = firstAdigaTableRows(snapshot) ?: return out
+        if (rows.length() < 2) return out
+        val header = rows.optJSONArray(0) ?: return out
+        val pageYear = queryYear(snapshot.optString("url"))
+        val competitionYear = Regex("(20\\d{2})\\s*경쟁률")
+            .find(header.optString(2))?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        for (ri in 1 until rows.length()) {
+            val row = rows.optJSONArray(ri) ?: continue
+            if (row.length() < 6) continue
+            val university = normalizeUniversityCell(row.optString(0))
+            if (!looksLikeUniversity(university)) continue
+            val (early, regular) = parseCompetition(row.optString(2))
+            val metrics = JSONObject()
+                .put("region", valueOrNull(row.optString(1)))
+                .put("earlyCompetition", numberOrNull(early))
+                .put("regularCompetition", numberOrNull(regular))
+                .put("competitionYear", competitionYear ?: JSONObject.NULL)
+                .put("enrollmentCapacity", intOrNull(row.optString(3)))
+                .put("departmentCount", intOrNull(row.optString(4)))
+                .put("admissionCount", intOrNull(row.optString(5)))
+            out.put(JSONObject()
+                .put("recordType", "university-summary")
+                .put("year", pageYear ?: JSONObject.NULL)
+                .put("university", university)
+                .put("department", JSONObject.NULL)
+                .put("admission", JSONObject.NULL)
+                .put("metrics", metrics)
+                .put("confidence", "high")
+                .put("sourcePage", snapshot.optString("url"))
+                .put("rawEvidence", rowToEvidence(row)))
+        }
+        return out
+    }
+
+    private fun parseAdigaDepartmentList(snapshot: JSONObject): JSONArray {
+        val out = JSONArray()
+        val rows = firstAdigaTableRows(snapshot) ?: return out
+        if (rows.length() < 2) return out
+        val header = rows.optJSONArray(0) ?: return out
+        val pageYear = queryYear(snapshot.optString("url"))
+        val competitionYear = Regex("(20\\d{2})\\s*경쟁률")
+            .find(header.optString(3))?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        for (ri in 1 until rows.length()) {
+            val row = rows.optJSONArray(ri) ?: continue
+            if (row.length() < 5) continue
+            val department = row.optString(0).trim()
+            val university = normalizeUniversityCell(row.optString(1))
+            if (department.isBlank() || department.contains("검색결과가 없습니다") || !looksLikeUniversity(university)) continue
+            val (early, regular) = parseCompetition(row.optString(3))
+            val metrics = JSONObject()
+                .put("region", valueOrNull(row.optString(2)))
+                .put("earlyCompetition", numberOrNull(early))
+                .put("regularCompetition", numberOrNull(regular))
+                .put("competitionYear", competitionYear ?: JSONObject.NULL)
+                .put("enrollmentCapacity", intOrNull(row.optString(4)))
+                .put("hasAdmissionResult", row.optString(5).contains("입시결과"))
+            out.put(JSONObject()
+                .put("recordType", "department-summary")
+                .put("year", pageYear ?: JSONObject.NULL)
+                .put("university", university)
+                .put("department", department)
+                .put("admission", JSONObject.NULL)
+                .put("metrics", metrics)
+                .put("confidence", "high")
+                .put("sourcePage", snapshot.optString("url"))
+                .put("rawEvidence", rowToEvidence(row)))
+        }
+        return out
+    }
+
+    private fun parseAdigaCharacteristicsIndex(snapshot: JSONObject): JSONArray {
+        val out = JSONArray()
+        val rows = firstAdigaTableRows(snapshot) ?: return out
+        for (ri in 1 until rows.length()) {
+            val row = rows.optJSONArray(ri) ?: continue
+            if (row.length() < 3) continue
+            val university = normalizeUniversityCell(row.optString(0))
+            if (!looksLikeUniversity(university)) continue
+            val metrics = JSONObject()
+                .put("recruitmentTotal", intOrNull(row.optString(1)))
+                .put("registeredAt", valueOrNull(row.optString(2)))
+            out.put(indexRecord("university-characteristics-index", university, metrics, snapshot, row))
+        }
+        return out
+    }
+
+    private fun parseAdigaGuideIndex(snapshot: JSONObject): JSONArray {
+        val out = JSONArray()
+        val rows = firstAdigaTableRows(snapshot) ?: return out
+        for (ri in 1 until rows.length()) {
+            val row = rows.optJSONArray(ri) ?: continue
+            if (row.length() < 2) continue
+            val university = normalizeUniversityCell(row.optString(0))
+            if (!looksLikeUniversity(university)) continue
+            val metrics = JSONObject().put("registeredAt", valueOrNull(row.optString(1)))
+            out.put(indexRecord("university-guide-index", university, metrics, snapshot, row))
+        }
+        return out
+    }
+
+    private fun parseAdigaCriteriaIndex(snapshot: JSONObject): JSONArray {
+        val out = JSONArray()
+        val rows = firstAdigaTableRows(snapshot) ?: return out
+        if (rows.length() < 2) return out
+
+        var labels = listOf("학생부위주(종합)", "학생부위주(교과)", "수능위주")
+        val maybeLabels = rows.optJSONArray(1)
+        if (maybeLabels != null && maybeLabels.length() >= 3 &&
+            (0 until minOf(3, maybeLabels.length())).all { maybeLabels.optString(it).contains("위주") }) {
+            labels = (0 until 3).map { maybeLabels.optString(it) }
+        }
+
+        for (ri in 1 until rows.length()) {
+            val row = rows.optJSONArray(ri) ?: continue
+            if (row.length() < 5) continue
+            val university = normalizeUniversityCell(row.optString(0))
+            if (!looksLikeUniversity(university)) continue
+            val metrics = JSONObject()
+                .put("holisticRecruitment", intOrNull(row.optString(1)))
+                .put("curriculumRecruitment", intOrNull(row.optString(2)))
+                .put("csatRecruitment", intOrNull(row.optString(3)))
+                .put("registeredAt", valueOrNull(row.optString(4)))
+                .put("columnLabels", JSONArray(labels))
+            out.put(indexRecord("criteria-result-index", university, metrics, snapshot, row))
+        }
+        return out
+    }
+
+    private fun parseAdigaDisabledAdmissionsIndex(snapshot: JSONObject): JSONArray {
+        val out = JSONArray()
+        val rows = firstAdigaTableRows(snapshot) ?: return out
+        val header = if (rows.length() > 0) rows.optJSONArray(0) else null
+        val year = header?.let {
+            Regex("(20\\d{2})").find(it.optString(1))?.groupValues?.getOrNull(1)?.toIntOrNull()
+        }
+        for (ri in 1 until rows.length()) {
+            val row = rows.optJSONArray(ri) ?: continue
+            if (row.length() < 2) continue
+            val university = normalizeUniversityCell(row.optString(0).replace("상세정보", "").trim())
+            if (!looksLikeUniversity(university)) continue
+            val metrics = JSONObject().put("admittedStudents", intOrNull(row.optString(1)))
+            out.put(JSONObject()
+                .put("recordType", "disabled-admissions-index")
+                .put("year", year ?: JSONObject.NULL)
+                .put("university", university)
+                .put("department", JSONObject.NULL)
+                .put("admission", "대학별 장애인 전형")
+                .put("metrics", metrics)
+                .put("confidence", "high")
+                .put("sourcePage", snapshot.optString("url"))
+                .put("rawEvidence", rowToEvidence(row)))
+        }
+        return out
+    }
+
+    private fun indexRecord(
+        type: String,
+        university: String,
+        metrics: JSONObject,
+        snapshot: JSONObject,
+        row: JSONArray
+    ): JSONObject = JSONObject()
+        .put("recordType", type)
+        .put("year", JSONObject.NULL)
+        .put("university", university)
+        .put("department", JSONObject.NULL)
+        .put("admission", JSONObject.NULL)
+        .put("metrics", metrics)
+        .put("confidence", "high")
+        .put("sourcePage", snapshot.optString("url"))
+        .put("rawEvidence", rowToEvidence(row))
+
+    private fun queryYear(url: String): Int? = try {
+        Uri.parse(url).getQueryParameter("searchSyr")?.toIntOrNull()
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun normalizeUniversityCell(value: String): String =
+        value.replace(Regex("\\s+\\["), "[")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    private fun looksLikeUniversity(value: String): Boolean {
+        if (value.isBlank()) return false
+        if (value.contains("대학명을 클릭") || value == "일반대학" || value == "전문대학") return false
+        return Regex("(대학교|대학)(?:\\[(?:본교|분교|제\\d+캠퍼스)\\])?$").containsMatchIn(value)
+    }
+
+    private fun parseCompetition(value: String): Pair<Double?, Double?> {
+        val early = Regex("수시\\s*([0-9]+(?:\\.[0-9]+)?)").find(value)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+        val regular = Regex("정시\\s*([0-9]+(?:\\.[0-9]+)?)").find(value)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+        return early to regular
+    }
+
+    private fun intOrNull(value: String): Any =
+        value.replace(",", "").trim().toIntOrNull() ?: JSONObject.NULL
+
+    private fun numberOrNull(value: Double?): Any = value ?: JSONObject.NULL
+
+    private fun valueOrNull(value: String): Any =
+        value.trim().takeIf { it.isNotBlank() } ?: JSONObject.NULL
+
+    private fun rowToEvidence(row: JSONArray): String {
+        val values = mutableListOf<String>()
+        for (i in 0 until row.length()) values.add(row.optString(i))
+        return values.joinToString(" | ").take(3000)
     }
 
     private data class InferredContext(
@@ -890,8 +1264,7 @@ class MainActivity : Activity() {
             .put("jinhakJudgment", judgmentRegex.find(evidence)?.groupValues?.getOrNull(1) ?: JSONObject.NULL)
 
         val hasMetric = metrics.keys().asSequence().any { !metrics.isNull(it) }
-        val admissionTerms = Regex("(대학|학과|학부|전공|전형|경쟁률|모집인원|산출점수|환산점수|등급|50%|70%|합격예측|칸수|지원자|입결|수능최저|면접)")
-        if (!hasMetric && university == null && department == null && admission == null && !admissionTerms.containsMatchIn(evidence)) return null
+        if (!hasMetric) return null
 
         val confidence = when {
             university != null && department != null && admission != null && hasMetric -> "high"
@@ -916,6 +1289,7 @@ class MainActivity : Activity() {
         for (i in 0 until input.length()) {
             val obj = input.optJSONObject(i) ?: continue
             val key = listOf(
+                obj.optString("recordType"),
                 obj.opt("year")?.toString() ?: "",
                 obj.opt("university")?.toString() ?: "",
                 obj.opt("department")?.toString() ?: "",
@@ -941,6 +1315,7 @@ class MainActivity : Activity() {
     }
 
     private fun recordKey(o: JSONObject): String = listOf(
+        o.optString("recordType"),
         o.opt("year")?.toString() ?: "",
         o.opt("university")?.toString() ?: "",
         o.opt("department")?.toString() ?: "",
@@ -978,8 +1353,9 @@ class MainActivity : Activity() {
             emptyList()
         }
 
-        for (url in seeds) {
-            if (!isProviderUrl(url) || batchVisited.contains(url) || batchQueued.contains(url)) continue
+        for (rawUrl in seeds) {
+            val url = canonicalizeBatchUrl(rawUrl)
+            if (url.isBlank() || !isProviderUrl(url) || batchVisited.contains(url) || batchQueued.contains(url)) continue
             batchQueued.add(url)
             batchQueue.addLast(url)
         }
@@ -988,17 +1364,33 @@ class MainActivity : Activity() {
     private fun enqueueDiscoveredLinks(links: JSONArray) {
         for (i in 0 until links.length()) {
             val obj = links.optJSONObject(i) ?: continue
-            val url = obj.optString("url")
+            val url = canonicalizeBatchUrl(obj.optString("url"))
             if (url.isBlank() || !isProviderUrl(url)) continue
             if (batchVisited.contains(url)) continue
             if (batchQueued.add(url)) batchQueue.addLast(url)
-            if (batchQueue.size + batchVisited.size >= MAX_BATCH_PAGES * 3) break
+            if (batchQueue.size + batchVisited.size >= MAX_BATCH_PAGES * 2) break
+        }
+    }
+
+    private fun enqueuePageActions(actions: JSONArray) {
+        for (i in 0 until actions.length()) {
+            val obj = actions.optJSONObject(i) ?: continue
+            if (obj.optString("type") != "fnSearch") continue
+            val page = obj.optInt("page", -1)
+            val baseUrl = canonicalizeBatchUrl(obj.optString("baseUrl"))
+            if (page <= 1 || page > 500 || baseUrl.isBlank() || !isProviderUrl(baseUrl)) continue
+            val action = BatchPageAction(baseUrl, page)
+            val key = pageActionKey(action)
+            if (batchPageActionVisited.contains(key)) continue
+            if (batchPageActionQueued.add(key)) batchPageActions.addLast(action)
+            if (batchPageActions.size + batchPageActionVisited.size >= MAX_BATCH_PAGES * 2) break
         }
     }
 
     private fun stripNavigationLinksForExport(snapshot: JSONObject): JSONObject {
         val copy = JSONObject(snapshot.toString())
         copy.remove("navigationLinks")
+        copy.remove("pageActions")
         copy.remove("navigationKey")
         return copy
     }
