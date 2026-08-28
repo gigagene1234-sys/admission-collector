@@ -3,6 +3,10 @@ const JSON_HEADERS = {
   "cache-control": "no-store",
 };
 
+// Persistent upstream 5xx pages should not be hammered every time the Android app resumes.
+// They become retryable again after this cooldown while the run itself remains active.
+const SERVER_ERROR_RETRY_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -12,7 +16,7 @@ export default {
         return json({
           ok: true,
           service: "admission-collector-offload",
-          version: "0.3.3",
+          version: "0.3.6",
           time: new Date().toISOString(),
         });
       }
@@ -115,7 +119,7 @@ export default {
         message: String(error?.message || error),
         stack: error?.stack || null,
       }));
-      return json({ error: "internal_error", message: String(error?.message || error) }, 500);
+      return json({ error: "internal_error" }, 500);
     }
   },
 
@@ -379,7 +383,7 @@ async function getStatus(env, runId) {
 
 async function getResumePlan(env, runId, familyKey, requestedYear, totalPages, limit) {
   const rows = await env.DB.prepare(`
-    SELECT page_number, state, retry_count, error_type
+    SELECT page_number, state, retry_count, error_type, updated_at
     FROM run_pages
     WHERE run_id = ?
       AND family_key = ?
@@ -393,6 +397,8 @@ async function getResumePlan(env, runId, familyKey, requestedYear, totalPages, l
 
   const missing = [];
   const retry = [];
+  const deferred = [];
+  const nowMs = Date.now();
 
   for (let page = 1; page <= totalPages; page += 1) {
     const row = stateByPage.get(page);
@@ -400,13 +406,34 @@ async function getResumePlan(env, runId, familyKey, requestedYear, totalPages, l
       if (missing.length < limit) missing.push(page);
       continue;
     }
-    if (row.state !== "completed" && retry.length < limit) {
-      retry.push({
-        page,
-        state: row.state,
-        retryCount: Number(row.retry_count || 0),
-        errorType: row.error_type || null,
-      });
+    if (row.state !== "completed") {
+      const retryCount = Number(row.retry_count || 0);
+      const errorType = row.error_type || null;
+      const updatedMs = Date.parse(row.updated_at || "");
+      const shouldDeferServerError =
+        errorType === "server-error" &&
+        retryCount >= 2 &&
+        Number.isFinite(updatedMs) &&
+        nowMs - updatedMs < SERVER_ERROR_RETRY_COOLDOWN_MS;
+
+      if (shouldDeferServerError) {
+        if (deferred.length < limit) {
+          deferred.push({
+            page,
+            state: row.state,
+            retryCount,
+            errorType,
+            retryAfter: new Date(updatedMs + SERVER_ERROR_RETRY_COOLDOWN_MS).toISOString(),
+          });
+        }
+      } else if (retry.length < limit) {
+        retry.push({
+          page,
+          state: row.state,
+          retryCount,
+          errorType,
+        });
+      }
     }
   }
 
@@ -418,7 +445,9 @@ async function getResumePlan(env, runId, familyKey, requestedYear, totalPages, l
     knownPages: stateByPage.size,
     missing,
     retry,
-    truncated: missing.length >= limit || retry.length >= limit,
+    deferred,
+    serverErrorCooldownSeconds: Math.floor(SERVER_ERROR_RETRY_COOLDOWN_MS / 1000),
+    truncated: missing.length >= limit || retry.length >= limit || deferred.length >= limit,
   });
 }
 
