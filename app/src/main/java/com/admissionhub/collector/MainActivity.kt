@@ -5,58 +5,118 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
-import android.view.View
-import android.webkit.*
-import android.widget.*
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
+import com.admissionhub.collector.capture.SnapshotScript
+import com.admissionhub.collector.parser.RecordUtils
+import com.admissionhub.collector.provider.ProviderAdapter
+import com.admissionhub.collector.provider.ProviderId
+import com.admissionhub.collector.provider.ProviderRegistry
 import java.time.Instant
+import java.util.ArrayDeque
 
 class MainActivity : Activity() {
     private lateinit var webView: WebView
     private lateinit var status: TextView
+    private lateinit var sessionState: TextView
     private lateinit var preview: TextView
+    private lateinit var batchButton: Button
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val sessionKeepAlive = object : Runnable {
+        override fun run() {
+            attemptSessionExtension()
+            handler.postDelayed(this, 45_000L)
+        }
+    }
+    private data class BatchPageAction(val baseUrl: String, val page: Int)
+
+    private val batchQueue = ArrayDeque<String>()
+    private val batchVisited = linkedSetOf<String>()
+    private val batchQueued = linkedSetOf<String>()
+    private val batchPageActions = ArrayDeque<BatchPageAction>()
+    private val batchPageActionQueued = linkedSetOf<String>()
+    private val batchPageActionVisited = linkedSetOf<String>()
+    private val batchBootstrapSearchAttempted = linkedSetOf<String>()
+    private var batchReadinessPolling = false
+    private var batchSnapshots = JSONArray()
+    private var batchRecords = JSONArray()
+    private var batchResources = JSONArray()
+    private var batchErrors = JSONArray()
+    private var batchRunning = false
+    private var batchPausedForLogin = false
+    private var batchCollecting = false
+    private var currentBatchTarget: String? = null
+    private var pendingBatchPageAction: BatchPageAction? = null
+    private var batchPageCount = 0
+
     private var lastJson: String = ""
-    private var provider: String = "adiga"
+    private var provider: ProviderId = ProviderId.ADIGA
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
-        private const val ADIGA_URL = "https://www.adiga.kr/"
-        private const val JINHAK_URL = "https://www.jinhak.com/"
+        private const val MAX_BATCH_PAGES = 900
+        private const val PREVIEW_LIMIT = 16000
+        private const val VERSION = "0.3.0"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
         configureWebView()
-        openProvider("adiga")
+        openProvider(ProviderId.ADIGA)
     }
 
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(12, 12, 12, 12)
+            setPadding(10, 10, 10, 10)
         }
 
         val tabs = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-
-        val adigaButton = Button(this).apply {
+        tabs.addView(Button(this).apply {
             text = "어디가"
-            setOnClickListener { openProvider("adiga") }
-        }
-        val jinhakButton = Button(this).apply {
+            setOnClickListener { openProvider(ProviderId.ADIGA) }
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        tabs.addView(Button(this).apply {
             text = "진학사"
-            setOnClickListener { openProvider("jinhak") }
-        }
-        tabs.addView(adigaButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        tabs.addView(jinhakButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            setOnClickListener { openProvider(ProviderId.JINHAK) }
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
-        val actions = LinearLayout(this).apply {
+        val sessionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        sessionState = TextView(this).apply {
+            text = "세션 상태 확인 중"
+            setPadding(8, 8, 8, 8)
+        }
+        val sessionButton = Button(this).apply {
+            text = "세션 확인/갱신"
+            setOnClickListener { refreshSessionOrOpenLogin() }
+        }
+        sessionRow.addView(sessionState, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        sessionRow.addView(sessionButton)
+
+        val actions1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
@@ -64,20 +124,37 @@ class MainActivity : Activity() {
             text = "←"
             setOnClickListener { if (webView.canGoBack()) webView.goBack() }
         }
-        val collect = Button(this).apply {
+        val currentCollect = Button(this).apply {
             text = "현재 페이지 수집"
             setOnClickListener { collectCurrentPage() }
+        }
+        batchButton = Button(this).apply {
+            text = "접근 가능 정보 일괄 수집"
+            setOnClickListener {
+                if (batchRunning) stopBatch("사용자 중지") else startBatch()
+            }
+        }
+        actions1.addView(back)
+        actions1.addView(currentCollect, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        actions1.addView(batchButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        val actions2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val resume = Button(this).apply {
+            text = "로그인 갱신 후 계속"
+            setOnClickListener { resumeAfterLogin() }
         }
         val save = Button(this).apply {
             text = "JSON 저장"
             setOnClickListener { saveJson() }
         }
-        actions.addView(back)
-        actions.addView(collect, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        actions.addView(save)
+        actions2.addView(resume, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        actions2.addView(save, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
         status = TextView(this).apply {
-            text = "준비 중"
+            text = "Admission Collector v$VERSION 준비 중"
             setPadding(8, 8, 8, 8)
         }
 
@@ -90,7 +167,9 @@ class MainActivity : Activity() {
         val scroll = ScrollView(this).apply { addView(preview) }
 
         root.addView(tabs)
-        root.addView(actions)
+        root.addView(sessionRow)
+        root.addView(actions1)
+        root.addView(actions2)
         root.addView(status)
         root.addView(webView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f))
         root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 2f))
@@ -99,31 +178,61 @@ class MainActivity : Activity() {
 
     @Suppress("SetJavaScriptEnabled")
     private fun configureWebView() {
-        CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        WebView.setWebContentsDebuggingEnabled(false)
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(webView, true)
+        }
 
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
+            cacheMode = WebSettings.LOAD_DEFAULT
             javaScriptCanOpenWindowsAutomatically = true
             setSupportMultipleWindows(true)
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            userAgentString = userAgentString + " AdmissionCollector/0.1"
+            userAgentString = userAgentString + " AdmissionCollector/$VERSION"
         }
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
+
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-                status.text = "불러오는 중: $url"
+                status.text = "불러오는 중: ${safeDisplayUrl(url)}"
             }
+
             override fun onPageFinished(view: WebView, url: String) {
-                status.text = "현재 페이지: $url"
+                CookieManager.getInstance().flush()
+                status.text = "현재 페이지: ${safeDisplayUrl(url)}"
+
+                when {
+                    batchPausedForLogin -> checkSessionState { needsLogin, _ ->
+                        if (!needsLogin) {
+                            sessionState.text = "● 로그인 상태 복구 감지"
+                            resumeAfterLogin()
+                        }
+                    }
+                    batchRunning -> {
+                        val pending = pendingBatchPageAction
+                        if (pending != null && canonicalizeBatchUrl(url) == pending.baseUrl) {
+                            executePendingBatchPageAction()
+                        } else {
+                            scheduleBatchSnapshot()
+                        }
+                    }
+                    else -> checkSessionState()
+                }
             }
         }
 
         webView.webChromeClient = object : WebChromeClient() {
-            override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean {
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean {
                 val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
                 val child = WebView(this@MainActivity)
                 child.settings.javaScriptEnabled = true
@@ -135,6 +244,7 @@ class MainActivity : Activity() {
                         webView.loadUrl(request.url.toString())
                         return true
                     }
+
                     override fun onPageFinished(v: WebView, url: String) {
                         if (url.isNotBlank() && url != "about:blank") webView.loadUrl(url)
                     }
@@ -146,15 +256,8 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun openProvider(which: String) {
-        provider = which
-        val url = if (which == "adiga") ADIGA_URL else JINHAK_URL
-        status.text = if (which == "adiga") "어디가 열기" else "진학사 열기"
-        webView.loadUrl(url)
-    }
-
-    private fun collectCurrentPage() {
-        status.text = "표시된 결과 정보만 수집 중…"
+    private fun attemptSessionExtension() {
+        if (!::webView.isInitialized) return
         val js = """
             (function(){
               function visible(el){
@@ -164,129 +267,632 @@ class MainActivity : Activity() {
                 var r=el.getBoundingClientRect();
                 return r.width>0 && r.height>0;
               }
-              var forbidden=/password|passwd|cookie|session|token|csrf|transkey|captcha|auth|credential|secret/i;
-              var badTags={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,INPUT:1,TEXTAREA:1,SELECT:1,OPTION:1,FORM:1};
-              var rows=[];
-              var candidates=document.querySelectorAll('table tr, [role=row], article, .card, .item, .result, .list-item, .tbl_row, [class*=result], [class*=admission]');
-              for(var i=0;i<candidates.length;i++){
-                var el=candidates[i];
-                if(!visible(el) || badTags[el.tagName]) continue;
-                var meta=(el.id||'')+' '+(el.className||'')+' '+(el.getAttribute('name')||'');
-                if(forbidden.test(meta)) continue;
-                var clone=el.cloneNode(true);
-                var rm=clone.querySelectorAll('script,style,noscript,template,input,textarea,select,option,form,[type=hidden],[hidden],[aria-hidden=true]');
-                for(var j=0;j<rm.length;j++) rm[j].remove();
-                var text=(clone.innerText||clone.textContent||'').replace(/\\s+/g,' ').trim();
-                var sensitiveUi=/(?:아이디|로그인|로그아웃|회원정보|마이페이지|account|sign[ -]?in|sign[ -]?out)/i;
-                var admissionTerms=/(?:대학교|대학|학과|학부|전공|모집단위|전형|경쟁률|모집인원|환산점수|50%|70%|칸수|합격예측|안정|적정|소신)/;
-                if(text.length<4 || text.length>3000 || forbidden.test(text.substring(0,160)) || sensitiveUi.test(text) || !admissionTerms.test(text)) continue;
-                text=text.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/ig,'[redacted-email]');
-                rows.push(text);
-                if(rows.length>=250) break;
+              var body=(document.body&&document.body.innerText?document.body.innerText:'').replace(/\s+/g,' ');
+              if(!/(자동\s*로그아웃|로그인\s*시간.*연장|세션.*연장)/i.test(body)) return false;
+              var nodes=document.querySelectorAll('button,a,[role=button]');
+              for(var i=0;i<nodes.length;i++){
+                var el=nodes[i];
+                if(!visible(el)) continue;
+                var label=(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();
+                if(/^(연장하기|로그인\s*연장|세션\s*연장|시간\s*연장)$/i.test(label)){
+                  try{ el.click(); return true; }catch(e){}
+                }
               }
-              var safeUrl=location.origin+location.pathname;
-              return JSON.stringify({title:document.title||'',url:safeUrl,rows:rows});
+              return false;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) { result ->
+            if (result == "true") {
+                CookieManager.getInstance().flush()
+                sessionState.text = "● 로그인 세션 자동 연장"
+            }
+        }
+    }
+
+    private fun currentAdapter(): ProviderAdapter = ProviderRegistry.adapter(provider)
+
+    private fun openProvider(which: ProviderId) {
+        if (batchRunning) stopBatch("서비스 전환")
+        provider = which
+        CookieManager.getInstance().flush()
+        sessionState.text = "세션 상태 확인 중"
+        status.text = "${which.displayName} 열기"
+        batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
+        webView.loadUrl(which.homeUrl)
+    }
+
+    private fun refreshSessionOrOpenLogin() {
+        checkSessionState { needsLogin, hasAuthenticatedUi ->
+            if (!needsLogin && hasAuthenticatedUi) {
+                sessionState.text = "● 로그인 유지됨"
+                Toast.makeText(this, "로그인 세션이 유지되고 있습니다.", Toast.LENGTH_SHORT).show()
+                return@checkSessionState
+            }
+
+            val js = """
+                (function(){
+                  function visible(el){
+                    if(!el) return false;
+                    var s=getComputedStyle(el);
+                    if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false;
+                    var r=el.getBoundingClientRect();
+                    return r.width>0 && r.height>0;
+                  }
+                  var nodes=document.querySelectorAll('a,button,[role=button]');
+                  for(var i=0;i<nodes.length;i++){
+                    var el=nodes[i];
+                    if(!visible(el)) continue;
+                    var t=(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();
+                    if(!/^(로그인|log\s*in|sign\s*in)$/i.test(t)) continue;
+                    if(el.tagName==='A' && el.href){
+                      try{
+                        var u=new URL(el.href,location.href);
+                        if(u.origin===location.origin) return JSON.stringify({action:'url',url:u.origin+u.pathname+u.hash});
+                      }catch(e){}
+                    }
+                    try{ el.click(); return JSON.stringify({action:'clicked'}); }catch(e2){}
+                  }
+                  return JSON.stringify({action:'home'});
+                })();
+            """.trimIndent()
+
+            webView.evaluateJavascript(js) { encoded ->
+                try {
+                    val raw = decodeJsString(encoded)
+                    val obj = JSONObject(raw)
+                    when (obj.optString("action")) {
+                        "url" -> webView.loadUrl(obj.optString("url"))
+                        "clicked" -> sessionState.text = "○ 로그인 갱신 화면 열림"
+                        else -> webView.loadUrl(provider.homeUrl)
+                    }
+                } catch (_: Exception) {
+                    webView.loadUrl(provider.homeUrl)
+                }
+            }
+        }
+    }
+
+    private fun checkSessionState(callback: ((Boolean, Boolean) -> Unit)? = null) {
+        val js = """
+            (function(){
+              function visible(el){
+                if(!el) return false;
+                var s=getComputedStyle(el);
+                if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false;
+                var r=el.getBoundingClientRect();
+                return r.width>0 && r.height>0;
+              }
+              var pass=false;
+              var pw=document.querySelectorAll('input[type=password]');
+              for(var i=0;i<pw.length;i++){ if(visible(pw[i])) { pass=true; break; } }
+              var text=(document.body && document.body.innerText ? document.body.innerText : '').slice(0,12000);
+              var logoutControl=false;
+              var controls=document.querySelectorAll('a,button,[role=button]');
+              for(var j=0;j<controls.length;j++){
+                var node=controls[j];
+                if(!visible(node)) continue;
+                var label=(node.innerText||node.textContent||node.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim();
+                if(/^(로그아웃|log\s*out|sign\s*out)$/i.test(label)){ logoutControl=true; break; }
+              }
+              var loginUrl=/(\/mbs\/log\/|login|signin|sign-in|member\/login|loginForm)/i.test(location.href);
+              var loginRequired=/(로그인이\s*필요|로그인\s*후\s*(?:이용|사용)|로그인해\s*주세요|로그인해주세요|회원만\s*이용|서비스\s*이용을\s*위해\s*로그인)/i.test(text);
+              var authenticated=logoutControl;
+              return JSON.stringify({needsLogin:(pass||loginUrl||loginRequired)&&!authenticated,authenticated:authenticated});
             })();
         """.trimIndent()
 
         webView.evaluateJavascript(js) { encoded ->
             try {
-                val raw = when {
-                    encoded == null || encoded == "null" -> "{}"
-                    else -> (JSONTokener(encoded).nextValue() as? String) ?: "{}"
+                val obj = JSONObject(decodeJsString(encoded))
+                val needsLogin = obj.optBoolean("needsLogin", false)
+                val authenticated = obj.optBoolean("authenticated", false)
+                sessionState.text = when {
+                    authenticated -> "● 로그인 유지됨"
+                    needsLogin -> "○ 로그인 갱신 필요"
+                    else -> "△ 로그인 상태 미확정"
                 }
-                consumeDomJson(raw)
+                callback?.invoke(needsLogin, authenticated)
+            } catch (_: Exception) {
+                sessionState.text = "△ 로그인 상태 확인 불가"
+                callback?.invoke(false, false)
+            }
+        }
+    }
+
+    private fun startBatch() {
+        val url = webView.url
+        if (url.isNullOrBlank() || !isProviderUrl(url)) {
+            Toast.makeText(this, "먼저 어디가 또는 진학사에서 수집 시작 위치를 여세요.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        if (!currentAdapter().supportsBatchCrawl) {
+            status.text = "진학사는 사이트 전체 순회 대신 현재 화면을 안전하게 구조화합니다."
+            collectCurrentPage()
+            return
+        }
+
+        batchQueue.clear()
+        batchVisited.clear()
+        batchQueued.clear()
+        batchPageActions.clear()
+        batchPageActionQueued.clear()
+        batchPageActionVisited.clear()
+        batchBootstrapSearchAttempted.clear()
+        batchReadinessPolling = false
+        pendingBatchPageAction = null
+        batchSnapshots = JSONArray()
+        batchRecords = JSONArray()
+        batchResources = JSONArray()
+        batchErrors = JSONArray()
+        batchRunning = true
+        batchPausedForLogin = false
+        batchCollecting = false
+        batchPageCount = 0
+        currentBatchTarget = url
+        batchButton.text = "일괄 수집 중지"
+        enqueueProviderSeeds()
+        status.text = "일괄 수집 시작: 기본 정보영역 ${batchQueue.size}개를 포함해 탐색합니다."
+
+        checkSessionState { needsLogin, _ ->
+            if (needsLogin) {
+                pauseBatchForLogin()
+            } else {
+                scheduleBatchSnapshot()
+            }
+        }
+    }
+
+    private fun stopBatch(reason: String) {
+        batchRunning = false
+        batchPausedForLogin = false
+        batchCollecting = false
+        batchQueue.clear()
+        batchQueued.clear()
+        batchPageActions.clear()
+        batchPageActionQueued.clear()
+        batchReadinessPolling = false
+        pendingBatchPageAction = null
+        batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
+        status.text = "일괄 수집 중지: $reason"
+        if (batchSnapshots.length() > 0) finalizeBatchJson("stopped")
+    }
+
+    private fun pauseBatchForLogin() {
+        batchPausedForLogin = true
+        batchCollecting = false
+        sessionState.text = "○ 로그인 갱신 필요"
+        status.text = "수집 일시정지: 로그인 갱신 후 자동/수동으로 계속할 수 있습니다."
+        batchButton.text = "일괄 수집 중지"
+    }
+
+    private fun resumeAfterLogin() {
+        if (!batchRunning || !batchPausedForLogin) {
+            checkSessionState()
+            return
+        }
+
+        checkSessionState { needsLogin, _ ->
+            if (needsLogin) {
+                Toast.makeText(this, "아직 로그인 화면으로 감지됩니다.", Toast.LENGTH_SHORT).show()
+                return@checkSessionState
+            }
+            batchPausedForLogin = false
+            sessionState.text = "● 수집 세션 복구"
+            val retry = currentBatchTarget
+            if (!retry.isNullOrBlank() && isProviderUrl(retry)) {
+                status.text = "로그인 갱신 완료: 중단 지점 재시도"
+                webView.loadUrl(retry)
+            } else {
+                loadNextBatchPage()
+            }
+        }
+    }
+
+    private fun scheduleBatchSnapshot() {
+        if (!batchRunning || batchPausedForLogin || batchCollecting) return
+        val url = canonicalizeBatchUrl(webView.url ?: "")
+        if (currentAdapter().isDynamicListPage(url)) {
+            if (batchReadinessPolling) return
+            batchReadinessPolling = true
+            pollAdigaDynamicListReadiness(url, attempt = 0, afterBootstrap = false)
+        } else {
+            handler.postDelayed({ collectSnapshotForBatch() }, 650)
+        }
+    }
+
+
+    private fun pollAdigaDynamicListReadiness(baseUrl: String, attempt: Int, afterBootstrap: Boolean) {
+        if (!batchRunning || batchPausedForLogin || batchCollecting) {
+            batchReadinessPolling = false
+            return
+        }
+        val current = canonicalizeBatchUrl(webView.url ?: "")
+        if (current != baseUrl) {
+            batchReadinessPolling = false
+            scheduleBatchSnapshot()
+            return
+        }
+
+        val js = """
+            (function(){
+              try{
+                var text=(document.body&&document.body.innerText?document.body.innerText:'').replace(/\s+/g,' ');
+                var m=text.match(/총\s*([0-9,]+)\s*건/);
+                var total=m?parseInt(m[1].replace(/,/g,''),10):-1;
+                var table=document.querySelector('table,[role=table]');
+                var rows=table?table.querySelectorAll('tr,[role=row]').length:0;
+                var noResult=/검색결과가\s*없습니다/.test(text);
+                return JSON.stringify({
+                  total:isNaN(total)?-1:total,
+                  rows:rows,
+                  noResult:noResult,
+                  canFnSearch:(typeof window.fnSearch==='function')
+                });
+              }catch(e){
+                return JSON.stringify({total:-1,rows:0,noResult:false,canFnSearch:false});
+              }
+            })();
+        """.trimIndent()
+
+        webView.evaluateJavascript(js) { encoded ->
+            if (!batchRunning || batchPausedForLogin) {
+                batchReadinessPolling = false
+                return@evaluateJavascript
+            }
+            try {
+                val obj = JSONObject(decodeJsString(encoded))
+                val total = obj.optInt("total", -1)
+                val rows = obj.optInt("rows", 0)
+                val ready = total > 0 && (
+                    !baseUrl.contains("/ucp/uvt/uni/univView.do") &&
+                    !baseUrl.contains("/ucp/cls/uni/classUnivView.do") ||
+                    rows > 1
+                )
+
+                if (ready) {
+                    batchReadinessPolling = false
+                    status.text = "동적 목록 준비 완료: 총 ${total}건"
+                    handler.postDelayed({ collectSnapshotForBatch() }, 250)
+                    return@evaluateJavascript
+                }
+
+                val maxAttempts = if (afterBootstrap) 18 else 12
+                if (attempt < maxAttempts) {
+                    status.text = "동적 목록 로딩 대기: ${attempt + 1}/$maxAttempts"
+                    handler.postDelayed({
+                        pollAdigaDynamicListReadiness(baseUrl, attempt + 1, afterBootstrap)
+                    }, 450)
+                    return@evaluateJavascript
+                }
+
+                val canFnSearch = obj.optBoolean("canFnSearch", false)
+                if (!afterBootstrap && canFnSearch && batchBootstrapSearchAttempted.add(baseUrl)) {
+                    status.text = "초기 검색 실행 후 목록 재대기"
+                    webView.evaluateJavascript(
+                        "(function(){try{window.fnSearch(1);return true;}catch(e){return false;}})();"
+                    ) {
+                        handler.postDelayed({
+                            pollAdigaDynamicListReadiness(baseUrl, attempt = 0, afterBootstrap = true)
+                        }, 900)
+                    }
+                    return@evaluateJavascript
+                }
+
+                batchReadinessPolling = false
+                status.text = "동적 목록 준비 시간 초과: 현재 상태 그대로 안전 수집"
+                collectSnapshotForBatch()
+            } catch (_: Exception) {
+                batchReadinessPolling = false
+                handler.postDelayed({ collectSnapshotForBatch() }, 250)
+            }
+        }
+    }
+
+    private fun collectCurrentPage() {
+        status.text = "현재 페이지의 표·헤더·카드·입시정보를 구조적으로 수집 중…"
+        collectSnapshot { snapshot ->
+            if (snapshot == null) return@collectSnapshot
+            val records = normalizeSnapshot(snapshot)
+            val out = JSONObject()
+                .put("collectorVersion", VERSION)
+                .put("provider", provider.wireName)
+                .put("collectedAt", Instant.now().toString())
+                .put("mode", "single-page")
+                .put("session", snapshot.optJSONObject("session") ?: JSONObject())
+                .put("records", records)
+                .put("snapshots", JSONArray().put(stripNavigationLinksForExport(snapshot)))
+                .put("resourceLinks", snapshot.optJSONArray("resourceLinks") ?: JSONArray())
+            lastJson = out.toString(2)
+            showPreview(lastJson)
+            status.text = "현재 페이지 수집 완료: 구조화 레코드 ${records.length()}개"
+        }
+    }
+
+    private fun collectSnapshotForBatch() {
+        if (!batchRunning || batchPausedForLogin || batchCollecting) return
+        batchCollecting = true
+        collectSnapshot { snapshot ->
+            batchCollecting = false
+            if (!batchRunning || snapshot == null) return@collectSnapshot
+
+            val navigationKey = snapshot.optString("navigationKey")
+            if (navigationKey.isNotBlank()) batchVisited.add(navigationKey)
+            batchPageCount += 1
+
+            val pageState = snapshot.optJSONObject("pageState") ?: JSONObject()
+            if (pageState.optBoolean("isError", false)) {
+                batchErrors.put(JSONObject()
+                    .put("url", snapshot.optString("url"))
+                    .put("type", pageState.optString("errorType", "page-error"))
+                    .put("title", snapshot.optString("title")))
+                status.text = "오류 페이지 건너뜀: ${pageState.optString("errorType", "error")} / 계속 탐색 중"
+                handler.postDelayed({ loadNextBatchPage() }, 250)
+                return@collectSnapshot
+            }
+
+            val session = snapshot.optJSONObject("session") ?: JSONObject()
+            if (session.optBoolean("needsLogin", false)) {
+                pauseBatchForLogin()
+                return@collectSnapshot
+            }
+
+            batchSnapshots.put(stripNavigationLinksForExport(snapshot))
+            RecordUtils.appendUniqueRecords(batchRecords, normalizeSnapshot(snapshot))
+            RecordUtils.appendUniqueResources(batchResources, snapshot.optJSONArray("resourceLinks") ?: JSONArray())
+            enqueueDiscoveredLinks(snapshot.optJSONArray("navigationLinks") ?: JSONArray())
+            enqueuePageActions(snapshot.optJSONArray("pageActions") ?: JSONArray())
+
+            status.text = "일괄 수집: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / URL대기 ${batchQueue.size} / 페이지대기 ${batchPageActions.size} / 레코드 ${batchRecords.length()}"
+
+            if (batchPageCount >= MAX_BATCH_PAGES) {
+                finishBatch("page-limit")
+            } else {
+                handler.postDelayed({ loadNextBatchPage() }, 350)
+            }
+        }
+    }
+
+    private fun loadNextBatchPage() {
+        if (!batchRunning || batchPausedForLogin) return
+
+        while (batchPageActions.isNotEmpty()) {
+            val action = batchPageActions.removeFirst()
+            val key = pageActionKey(action)
+            batchPageActionQueued.remove(key)
+            if (batchPageActionVisited.contains(key)) continue
+
+            val current = canonicalizeBatchUrl(webView.url ?: "")
+            pendingBatchPageAction = action
+            currentBatchTarget = action.baseUrl
+            status.text = "목록 페이지 ${action.page}쪽 탐색 준비"
+
+            if (current == action.baseUrl) {
+                executePendingBatchPageAction()
+            } else {
+                webView.loadUrl(action.baseUrl)
+            }
+            return
+        }
+
+        while (batchQueue.isNotEmpty()) {
+            val nextRaw = batchQueue.removeFirst()
+            val next = canonicalizeBatchUrl(nextRaw)
+            batchQueued.remove(next)
+            if (next.isBlank() || batchVisited.contains(next) || !isProviderUrl(next)) continue
+            currentBatchTarget = next
+            status.text = "다음 입시정보 페이지 탐색: ${safeDisplayUrl(next)}"
+            webView.loadUrl(next)
+            return
+        }
+        finishBatch("completed")
+    }
+
+    private fun executePendingBatchPageAction() {
+        if (!batchRunning || batchPausedForLogin) return
+        val action = pendingBatchPageAction ?: return
+        pendingBatchPageAction = null
+
+        val key = pageActionKey(action)
+        if (!batchPageActionVisited.add(key)) {
+            handler.postDelayed({ loadNextBatchPage() }, 100)
+            return
+        }
+
+        val js = """
+            (function(){
+              try{
+                if(typeof window.fnSearch !== 'function') return false;
+                window.fnSearch(${action.page});
+                return true;
+              }catch(e){
+                return false;
+              }
+            })();
+        """.trimIndent()
+
+        status.text = "목록 페이지 ${action.page}쪽 이동 중"
+        webView.evaluateJavascript(js) { result ->
+            if (result != "true") {
+                batchErrors.put(JSONObject()
+                    .put("url", action.baseUrl)
+                    .put("type", "pagination-action-unavailable")
+                    .put("page", action.page))
+                handler.postDelayed({ loadNextBatchPage() }, 150)
+            } else {
+                // fnSearch가 전체 페이지 이동이 아닌 DOM/AJAX 갱신을 사용하는 경우를 위한 보조 수집.
+                handler.postDelayed({
+                    if (batchRunning && !batchPausedForLogin && !batchCollecting && pendingBatchPageAction == null) {
+                        scheduleBatchSnapshot()
+                    }
+                }, 1100)
+            }
+        }
+    }
+
+    private fun pageActionKey(action: BatchPageAction): String =
+        "${action.baseUrl}|fnSearch|${action.page}"
+
+    private fun canonicalizeBatchUrl(url: String): String {
+        if (url.isBlank()) return ""
+        return try {
+            val uri = Uri.parse(url)
+            val host = uri.host ?: return ""
+            val builder = Uri.Builder()
+                .scheme(uri.scheme ?: "https")
+                .authority(host)
+                .path(uri.path ?: "/")
+
+            val forbidden = Regex("token|session|auth|csrf|transkey|captcha|password|passwd|secret|credential", RegexOption.IGNORE_CASE)
+            val names = uri.queryParameterNames
+            for (name in names) {
+                if (forbidden.containsMatchIn(name)) continue
+                for (value in uri.getQueryParameters(name)) builder.appendQueryParameter(name, value)
+            }
+            builder.build().toString()
+        } catch (_: Exception) {
+            url.substringBefore('#')
+        }
+    }
+
+    private fun finishBatch(reason: String) {
+        batchRunning = false
+        batchPausedForLogin = false
+        batchCollecting = false
+        batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
+        finalizeBatchJson(reason)
+        status.text = "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / 레코드 ${batchRecords.length()}"
+    }
+
+    private fun finalizeBatchJson(reason: String) {
+        val out = JSONObject()
+            .put("collectorVersion", VERSION)
+            .put("provider", provider.wireName)
+            .put("collectedAt", Instant.now().toString())
+            .put("mode", "batch")
+            .put("completion", reason)
+            .put("summary", JSONObject()
+                .put("attemptedPages", batchPageCount)
+                .put("successfulPages", batchSnapshots.length())
+                .put("errorPages", batchErrors.length())
+                .put("records", batchRecords.length())
+                .put("resourceLinks", batchResources.length())
+                .put("paginationActionsCompleted", batchPageActionVisited.size)
+                .put("dynamicSearchBootstraps", batchBootstrapSearchAttempted.size))
+            .put("errors", batchErrors)
+            .put("records", batchRecords)
+            .put("snapshots", batchSnapshots)
+            .put("resourceLinks", batchResources)
+        lastJson = out.toString(2)
+        showPreview(lastJson)
+    }
+
+    private fun collectSnapshot(callback: (JSONObject?) -> Unit) {
+        val js = SnapshotScript.build()
+        webView.evaluateJavascript(js) { encoded ->
+            try {
+                val raw = decodeJsString(encoded)
+                val obj = JSONObject(raw)
+                obj.put("providerPageType", currentAdapter().classify(obj))
+                val session = obj.optJSONObject("session") ?: JSONObject()
+                sessionState.text = when {
+                    session.optBoolean("authenticated", false) -> "● 로그인 유지됨"
+                    session.optBoolean("needsLogin", false) -> "○ 로그인 갱신 필요"
+                    else -> "△ 로그인 상태 미확정"
+                }
+                callback(obj)
             } catch (e: Exception) {
                 status.text = "수집 실패: ${e.message}"
+                callback(null)
             }
         }
     }
 
-    private fun consumeDomJson(raw: String) {
-        val dom = JSONObject(raw)
-        val rows = dom.optJSONArray("rows") ?: JSONArray()
-        val evidence = mutableListOf<String>()
-        for (i in 0 until rows.length()) {
-            val t = rows.optString(i).trim()
-            if (t.isNotBlank()) evidence.add(t)
+
+    private fun normalizeSnapshot(snapshot: JSONObject): JSONArray =
+        currentAdapter().normalize(snapshot)
+
+    private fun enqueueProviderSeeds() {
+        for (rawUrl in currentAdapter().seedUrls()) {
+            val url = canonicalizeBatchUrl(rawUrl)
+            if (url.isBlank() || !isProviderUrl(url) || batchVisited.contains(url) || batchQueued.contains(url)) continue
+            batchQueued.add(url)
+            batchQueue.addLast(url)
         }
-
-        val records = parseRecords(evidence)
-        val out = JSONObject()
-            .put("provider", provider)
-            .put("pageUrl", dom.optString("url", webView.url ?: ""))
-            .put("pageTitle", dom.optString("title", webView.title ?: ""))
-            .put("collectedAt", Instant.now().toString())
-            .put("records", records)
-            .put("evidenceCount", evidence.size)
-
-        lastJson = out.toString(2)
-        preview.text = lastJson
-        status.text = "수집 완료: 구조화 레코드 ${records.length()}개 / 증거 블록 ${evidence.size}개"
     }
 
-    private fun parseRecords(rows: List<String>): JSONArray {
-        val result = JSONArray()
-        val universityRegex = Regex("([가-힣A-Za-z0-9·.()\\- ]{2,40}(대학교|대학))")
-        val deptRegex = Regex("([가-힣A-Za-z0-9·.()\\- ]{2,50}(학과|학부|전공|모집단위))")
-        val admissionRegex = Regex("([가-힣A-Za-z0-9·.()\\- ]{2,50}(전형|교과|종합|추천|면접))")
-        val competitionRegex = Regex("(?:경쟁률)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?\\s*[:대]\\s*1|[0-9]+(?:\\.[0-9]+)?)")
-        val capacityRegex = Regex("(?:모집인원|모집 인원)\\s*[:：]?\\s*([0-9]+)")
-        val cut50Regex = Regex("(?:50%\\s*컷|50%\\s*cut|50\\s*%\\s*cut)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)", RegexOption.IGNORE_CASE)
-        val cut70Regex = Regex("(?:70%\\s*컷|70%\\s*cut|70\\s*%\\s*cut)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)", RegexOption.IGNORE_CASE)
-        val myScoreRegex = Regex("(?:내\\s*(?:환산)?점수|나의\\s*(?:환산)?점수|환산점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)")
-        val barsRegex = Regex("(?:칸수|칸\\s*수)\\s*[:：]?\\s*([0-9]+)")
-        val judgmentRegex = Regex("(?:판정|합격예측)\\s*[:：]?\\s*(안정|적정|소신|위험|상향|하향|가능|불안)")
-
-        val candidates = rows.filter { row ->
-            universityRegex.containsMatchIn(row) ||
-                deptRegex.containsMatchIn(row) ||
-                competitionRegex.containsMatchIn(row) ||
-                capacityRegex.containsMatchIn(row) ||
-                (provider == "jinhak" && (barsRegex.containsMatchIn(row) || judgmentRegex.containsMatchIn(row)))
-        }.take(100)
-
-        for (row in candidates) {
-            val university = universityRegex.find(row)?.groupValues?.getOrNull(1)?.trim()
-            val department = deptRegex.find(row)?.groupValues?.getOrNull(1)?.trim()
-            val admission = admissionRegex.find(row)?.groupValues?.getOrNull(1)?.trim()
-            val metrics = JSONObject()
-                .put("myScore", myScoreRegex.find(row)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: JSONObject.NULL)
-                .put("cut50", cut50Regex.find(row)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: JSONObject.NULL)
-                .put("cut70", cut70Regex.find(row)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: JSONObject.NULL)
-                .put("competition", competitionRegex.find(row)?.groupValues?.getOrNull(1) ?: JSONObject.NULL)
-                .put("capacity", capacityRegex.find(row)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: JSONObject.NULL)
-                .put("jinhakBars", barsRegex.find(row)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: JSONObject.NULL)
-                .put("jinhakJudgment", judgmentRegex.find(row)?.groupValues?.getOrNull(1) ?: JSONObject.NULL)
-
-            if (university != null || department != null || admission != null || metrics.keys().asSequence().any { !metrics.isNull(it) }) {
-                val confidence = when {
-                    university != null && department != null && admission != null -> "medium"
-                    university != null && department != null -> "low"
-                    else -> "raw"
-                }
-                result.put(JSONObject()
-                    .put("university", university ?: JSONObject.NULL)
-                    .put("department", department ?: JSONObject.NULL)
-                    .put("admission", admission ?: JSONObject.NULL)
-                    .put("metrics", metrics)
-                    .put("confidence", confidence)
-                    .put("rawEvidence", row.take(3000)))
-            }
+    private fun enqueueDiscoveredLinks(links: JSONArray) {
+        for (i in 0 until links.length()) {
+            val obj = links.optJSONObject(i) ?: continue
+            val url = canonicalizeBatchUrl(obj.optString("url"))
+            if (url.isBlank() || !isBatchNavigableProviderUrl(url)) continue
+            if (batchVisited.contains(url)) continue
+            if (batchQueued.add(url)) batchQueue.addLast(url)
+            if (batchQueue.size + batchVisited.size >= MAX_BATCH_PAGES * 2) break
         }
+    }
 
-        return result
+    private fun enqueuePageActions(actions: JSONArray) {
+        for (i in 0 until actions.length()) {
+            val obj = actions.optJSONObject(i) ?: continue
+            if (obj.optString("type") != "fnSearch") continue
+            val page = obj.optInt("page", -1)
+            val baseUrl = canonicalizeBatchUrl(obj.optString("baseUrl"))
+            if (page <= 1 || page > 500 || baseUrl.isBlank() || !isProviderUrl(baseUrl)) continue
+            val action = BatchPageAction(baseUrl, page)
+            val key = pageActionKey(action)
+            if (batchPageActionVisited.contains(key)) continue
+            if (batchPageActionQueued.add(key)) batchPageActions.addLast(action)
+            if (batchPageActions.size + batchPageActionVisited.size >= MAX_BATCH_PAGES * 2) break
+        }
+    }
+
+    private fun stripNavigationLinksForExport(snapshot: JSONObject): JSONObject {
+        val copy = JSONObject(snapshot.toString())
+        copy.remove("navigationLinks")
+        copy.remove("pageActions")
+        copy.remove("navigationKey")
+        return copy
+    }
+
+    private fun isBatchNavigableProviderUrl(url: String): Boolean = currentAdapter().isBatchNavigable(url)
+
+    private fun isProviderUrl(url: String): Boolean = currentAdapter().accepts(url)
+
+    private fun safeDisplayUrl(url: String): String {
+        return try {
+            val u = Uri.parse(url)
+            buildString {
+                append(u.scheme ?: "https")
+                append("://")
+                append(u.host ?: "")
+                append(u.path ?: "")
+            }
+        } catch (_: Exception) {
+            url.substringBefore('?')
+        }
+    }
+
+    private fun decodeJsString(encoded: String?): String {
+        if (encoded == null || encoded == "null") return "{}"
+        return (JSONTokener(encoded).nextValue() as? String) ?: "{}"
+    }
+
+    private fun showPreview(json: String) {
+        preview.text = if (json.length <= PREVIEW_LIMIT) json else {
+            json.take(PREVIEW_LIMIT) + "\n\n… 미리보기 생략 (${json.length - PREVIEW_LIMIT}자). JSON 저장 시 전체 데이터가 저장됩니다."
+        }
     }
 
     private fun saveJson() {
         if (lastJson.isBlank()) {
-            Toast.makeText(this, "먼저 현재 페이지를 수집하세요.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "먼저 페이지 또는 일괄 수집을 실행하세요.", Toast.LENGTH_SHORT).show()
             return
         }
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/json"
-            putExtra(Intent.EXTRA_TITLE, "admission-${provider}-${System.currentTimeMillis()}.json")
+            putExtra(Intent.EXTRA_TITLE, "admission-${provider.wireName}-v${VERSION}-${System.currentTimeMillis()}.json")
         }
         startActivityForResult(intent, SAVE_JSON_REQUEST)
     }
@@ -301,12 +907,31 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        handler.removeCallbacks(sessionKeepAlive)
+        handler.postDelayed(sessionKeepAlive, 45_000L)
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(sessionKeepAlive)
+        CookieManager.getInstance().flush()
+        super.onPause()
+    }
+
+    override fun onStop() {
+        CookieManager.getInstance().flush()
+        super.onStop()
+    }
+
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        CookieManager.getInstance().flush()
         webView.stopLoading()
         webView.destroy()
         super.onDestroy()
