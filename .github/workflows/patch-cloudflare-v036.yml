@@ -1,0 +1,44 @@
+name: Apply Cloudflare v0.3.6 Patch
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/patch-cloudflare-v036.yml"
+      - "scripts/patch_worker_v036.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Apply Worker v0.3.6 patch
+        run: python3 scripts/patch_worker_v036.py
+      - name: Verify Worker patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'version: "0.3.6"' cloudflare/src/index.js
+          grep -q 'SERVER_ERROR_RETRY_COOLDOWN_MS' cloudflare/src/index.js
+          grep -q 'deferred' cloudflare/src/index.js
+          grep -q 'retryAfter' cloudflare/src/index.js
+          grep -q 'return json({ error: "internal_error" }, 500)' cloudflare/src/index.js
+      - name: Persist Worker patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cloudflare/src/index.js
+          if git diff --cached --quiet; then
+            echo "Worker patch already persisted"
+          else
+            git commit -m "Apply Cloudflare v0.3.6 server error cooldown"
+            git push origin HEAD:main
+          fi
