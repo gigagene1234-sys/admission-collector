@@ -24,6 +24,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
 import com.admissionhub.collector.capture.SnapshotScript
+import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.parser.RecordUtils
 import com.admissionhub.collector.provider.PaginationPlan
 import com.admissionhub.collector.provider.ProviderAdapter
@@ -38,6 +39,7 @@ class MainActivity : Activity() {
     private lateinit var sessionState: TextView
     private lateinit var preview: TextView
     private lateinit var batchButton: Button
+    private lateinit var cloudOffload: CloudOffloadCoordinator
 
     private val handler = Handler(Looper.getMainLooper())
     private val sessionKeepAlive = object : Runnable {
@@ -99,11 +101,12 @@ class MainActivity : Activity() {
         private const val MAX_BATCH_PAGES = 2000
         private const val MAX_PAGE_RETRIES = 2
         private const val PREVIEW_LIMIT = 16000
-        private const val VERSION = "0.3.1"
+        private const val VERSION = "0.3.2"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        cloudOffload = CloudOffloadCoordinator(this)
         buildUi()
         configureWebView()
         openProvider(ProviderId.ADIGA)
@@ -177,8 +180,21 @@ class MainActivity : Activity() {
             text = "JSON 저장"
             setOnClickListener { saveJson() }
         }
+        val cloudSettings = Button(this).apply {
+            text = "Cloud 설정"
+            setOnClickListener {
+                cloudOffload.showSettingsDialog(this@MainActivity) {
+                    status.text = if (cloudOffload.isConfigured()) {
+                        "Cloudflare Offload 설정됨"
+                    } else {
+                        "Cloudflare Offload 미설정: 로컬 수집 모드"
+                    }
+                }
+            }
+        }
         actions2.addView(resume, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         actions2.addView(save, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        actions2.addView(cloudSettings, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
         status = TextView(this).apply {
             text = "Admission Collector v$VERSION 준비 중"
@@ -466,6 +482,13 @@ class MainActivity : Activity() {
         batchPaginationRetries = 0
         currentBatchTarget = url
         batchButton.text = "일괄 수집 중지"
+        cloudOffload.beginOrResume(provider.wireName, VERSION) { runId ->
+            if (runId != null) {
+                runOnUiThread {
+                    status.text = "Cloud 체크포인트 연결: ${runId.take(8)}… / 수집 시작"
+                }
+            }
+        }
         enqueueProviderSeeds()
         status.text = "일괄 수집 시작: 기본 정보영역 ${batchQueue.size}개를 포함해 탐색합니다."
 
@@ -750,6 +773,14 @@ class MainActivity : Activity() {
                         .put("retryCount", activeAction.retry)
                 }
                 batchErrors.put(error)
+                cloudOffload.uploadError(
+                    provider = provider.wireName,
+                    familyKey = activeAction?.familyKey,
+                    requestedYear = activeAction?.requestedYear,
+                    page = activeAction?.page,
+                    retryCount = activeAction?.retry ?: 0,
+                    error = error
+                )
                 status.text = if (activeAction != null) {
                     "목록 ${activeAction.page}/${activeAction.totalPages}쪽 최종 실패 / 다음 페이지 계속"
                 } else {
@@ -793,7 +824,16 @@ class MainActivity : Activity() {
 
             batchSnapshots.put(stripNavigationLinksForExport(snapshot))
             tableFingerprint(snapshot)?.let { batchLastTableSignatures[canonicalizeBatchUrl(snapshot.optString("url"))] = it }
-            RecordUtils.appendUniqueRecords(batchRecords, normalizeSnapshot(snapshot))
+            val pageRecords = normalizeSnapshot(snapshot)
+            RecordUtils.appendUniqueRecords(batchRecords, pageRecords)
+            cloudOffload.uploadPage(
+                provider = provider.wireName,
+                records = pageRecords,
+                familyKey = activeAction?.familyKey ?: plan?.familyKey,
+                requestedYear = activeAction?.requestedYear ?: plan?.requestedYear,
+                page = activeAction?.page ?: if (plan != null) 1 else null,
+                retryCount = activeAction?.retry ?: 0
+            )
             RecordUtils.appendUniqueResources(batchResources, snapshot.optJSONArray("resourceLinks") ?: JSONArray())
 
             if (activeAction == null) {
@@ -913,14 +953,23 @@ class MainActivity : Activity() {
 
     private fun recordPaginationFailure(action: BatchPageAction, type: String) {
         batchPageActionFailed.add(pageActionKey(action))
-        batchErrors.put(JSONObject()
+        val error = JSONObject()
             .put("url", action.baseUrl)
             .put("type", type)
             .put("page", action.page)
             .put("totalPages", action.totalPages)
             .put("familyKey", action.familyKey)
             .put("requestedYear", action.requestedYear ?: JSONObject.NULL)
-            .put("retryCount", action.retry))
+            .put("retryCount", action.retry)
+        batchErrors.put(error)
+        cloudOffload.uploadError(
+            provider = provider.wireName,
+            familyKey = action.familyKey,
+            requestedYear = action.requestedYear,
+            page = action.page,
+            retryCount = action.retry,
+            error = error
+        )
     }
 
     private fun pageActionStatus(action: BatchPageAction, suffix: String): String {
@@ -965,6 +1014,15 @@ class MainActivity : Activity() {
         batchCollecting = false
         batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
         finalizeBatchJson(reason)
+        cloudOffload.finish(
+            reason = reason,
+            summary = JSONObject()
+                .put("attemptedPages", batchPageCount)
+                .put("successfulPages", batchSnapshots.length())
+                .put("errorPages", batchErrors.length())
+                .put("records", batchRecords.length())
+                .put("paginationRetries", batchPaginationRetries)
+        )
         status.text = "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 최종오류 ${batchErrors.length()} / 재시도 $batchPaginationRetries / 레코드 ${batchRecords.length()}"
     }
 
@@ -990,6 +1048,7 @@ class MainActivity : Activity() {
             .put("errors", batchErrors)
             .put("retryEvents", batchRetryEvents)
             .put("duplicateYearViews", batchDuplicateYearViews)
+            .put("cloudOffload", cloudOffload.snapshotStatus())
             .put("records", batchRecords)
             .put("snapshots", batchSnapshots)
             .put("resourceLinks", batchResources)
@@ -1187,6 +1246,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         CookieManager.getInstance().flush()
+        cloudOffload.shutdown()
         webView.stopLoading()
         webView.destroy()
         super.onDestroy()
