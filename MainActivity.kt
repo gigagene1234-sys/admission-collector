@@ -33,6 +33,12 @@ class MainActivity : Activity() {
     private lateinit var batchButton: Button
 
     private val handler = Handler(Looper.getMainLooper())
+    private val sessionKeepAlive = object : Runnable {
+        override fun run() {
+            attemptSessionExtension()
+            handler.postDelayed(this, 45_000L)
+        }
+    }
     private val batchQueue = ArrayDeque<String>()
     private val batchVisited = linkedSetOf<String>()
     private val batchQueued = linkedSetOf<String>()
@@ -52,9 +58,9 @@ class MainActivity : Activity() {
         private const val SAVE_JSON_REQUEST = 7001
         private const val ADIGA_URL = "https://www.adiga.kr/"
         private const val JINHAK_URL = "https://www.jinhak.com/"
-        private const val MAX_BATCH_PAGES = 120
+        private const val MAX_BATCH_PAGES = 240
         private const val PREVIEW_LIMIT = 16000
-        private const val VERSION = "0.2.0"
+        private const val VERSION = "0.2.1"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -231,6 +237,39 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun attemptSessionExtension() {
+        if (!::webView.isInitialized) return
+        val js = """
+            (function(){
+              function visible(el){
+                if(!el) return false;
+                var s=getComputedStyle(el);
+                if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false;
+                var r=el.getBoundingClientRect();
+                return r.width>0 && r.height>0;
+              }
+              var body=(document.body&&document.body.innerText?document.body.innerText:'').replace(/\s+/g,' ');
+              if(!/(자동\s*로그아웃|로그인\s*시간.*연장|세션.*연장)/i.test(body)) return false;
+              var nodes=document.querySelectorAll('button,a,[role=button]');
+              for(var i=0;i<nodes.length;i++){
+                var el=nodes[i];
+                if(!visible(el)) continue;
+                var label=(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();
+                if(/^(연장하기|로그인\s*연장|세션\s*연장|시간\s*연장)$/i.test(label)){
+                  try{ el.click(); return true; }catch(e){}
+                }
+              }
+              return false;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) { result ->
+            if (result == "true") {
+                CookieManager.getInstance().flush()
+                sessionState.text = "● 로그인 세션 자동 연장"
+            }
+        }
+    }
+
     private fun openProvider(which: String) {
         if (batchRunning) stopBatch("서비스 전환")
         provider = which
@@ -262,8 +301,8 @@ class MainActivity : Activity() {
                   for(var i=0;i<nodes.length;i++){
                     var el=nodes[i];
                     if(!visible(el)) continue;
-                    var t=(el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim();
-                    if(!/^(로그인|log\\s*in|sign\\s*in)$/i.test(t)) continue;
+                    var t=(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();
+                    if(!/^(로그인|log\s*in|sign\s*in)$/i.test(t)) continue;
                     if(el.tagName==='A' && el.href){
                       try{
                         var u=new URL(el.href,location.href);
@@ -306,9 +345,17 @@ class MainActivity : Activity() {
               var pw=document.querySelectorAll('input[type=password]');
               for(var i=0;i<pw.length;i++){ if(visible(pw[i])) { pass=true; break; } }
               var text=(document.body && document.body.innerText ? document.body.innerText : '').slice(0,12000);
-              var authenticated=/(로그아웃|마이페이지|내\\s*정보|회원정보|MY\\s*PAGE|LOG\\s*OUT|SIGN\\s*OUT)/i.test(text);
-              var loginUrl=/(login|signin|sign-in|member\\/login|loginForm)/i.test(location.href);
-              return JSON.stringify({needsLogin:(pass||loginUrl)&&!authenticated,authenticated:authenticated});
+              var authenticated=/(로그아웃|마이페이지|내\s*정보|회원정보|MY\s*PAGE|LOG\s*OUT|SIGN\s*OUT)/i.test(text);
+              var loginUrl=/(login|signin|sign-in|member\/login|loginForm)/i.test(location.href);
+              var loginControl=false;
+              var controls=document.querySelectorAll('a,button,[role=button]');
+              for(var j=0;j<controls.length;j++){
+                var node=controls[j];
+                if(!visible(node)) continue;
+                var label=(node.innerText||node.textContent||node.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim();
+                if(/^(로그인|log\s*in|sign\s*in)$/i.test(label)){ loginControl=true; break; }
+              }
+              return JSON.stringify({needsLogin:(pass||loginUrl||loginControl)&&!authenticated,authenticated:authenticated});
             })();
         """.trimIndent()
 
@@ -349,7 +396,8 @@ class MainActivity : Activity() {
         batchPageCount = 0
         currentBatchTarget = url
         batchButton.text = "일괄 수집 중지"
-        status.text = "일괄 수집 시작: 현재 영역을 탐색합니다."
+        enqueueProviderSeeds()
+        status.text = "일괄 수집 시작: 기본 정보영역 ${batchQueue.size}개를 포함해 탐색합니다."
 
         checkSessionState { needsLogin, _ ->
             if (needsLogin) {
@@ -530,7 +578,7 @@ class MainActivity : Activity() {
             return r.width>0 && r.height>0;
           }
           function cleanText(v){
-            return String(v||'').replace(/\\s+/g,' ').trim();
+            return String(v||'').replace(/\s+/g,' ').trim();
           }
           function safeCloneText(el,maxLen){
             if(!el) return '';
@@ -538,7 +586,7 @@ class MainActivity : Activity() {
             var rm=clone.querySelectorAll('script,style,noscript,template,input,textarea,select,option,form,[type=hidden],[hidden],[aria-hidden=true]');
             for(var i=0;i<rm.length;i++) rm[i].remove();
             var t=cleanText(clone.innerText||clone.textContent||'');
-            t=t.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/ig,'[redacted-email]');
+            t=t.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig,'[redacted-email]');
             return t.slice(0,maxLen||3000);
           }
           function safeUrl(raw){
@@ -559,6 +607,36 @@ class MainActivity : Activity() {
               return u.origin+u.pathname+(q?'?'+q:'')+u.hash;
             }catch(e){ return ''; }
           }
+          function safeExportUrl(raw){
+            try{
+              var u=new URL(raw,location.href);
+              if(u.protocol!=='https:' && u.protocol!=='http:') return '';
+              var badKey=/token|session|auth|csrf|transkey|captcha|password|passwd|secret|credential|preurl|returnurl|redirect|callback/i;
+              var filtered=new URLSearchParams();
+              u.searchParams.forEach(function(v,k){ if(!badKey.test(k)) filtered.append(k,v); });
+              var q=filtered.toString();
+              return u.origin+u.pathname+(q?'?'+q:'')+u.hash;
+            }catch(e){ return ''; }
+          }
+          function routeFromScript(raw){
+            raw=String(raw||'');
+            if(!raw) return '';
+            var direct=fullNavigationUrl(raw);
+            if(direct && !/^javascript:/i.test(raw)) return direct;
+            var decoded=raw.replace(/&amp;/g,'&');
+            var matches=decoded.match(/(?:https?:\/\/[^'"\s)]+|\/[A-Za-z0-9_./-]+\.do(?:\?[^'"\s)]*)?)/ig)||[];
+            for(var i=0;i<matches.length;i++){
+              var r=fullNavigationUrl(matches[i]);
+              if(r) return r;
+            }
+            var quoted=/['"]([^'"]+\.do(?:\?[^'"]*)?)['"]/ig;
+            var m;
+            while((m=quoted.exec(decoded))!==null){
+              var q=fullNavigationUrl(m[1]);
+              if(q) return q;
+            }
+            return '';
+          }
 
           var forbidden=/password|passwd|cookie|session|token|csrf|transkey|captcha|credential|secret/i;
           var loginSensitive=/(아이디|비밀번호|로그인|로그아웃|회원정보|마이페이지|account|sign[ -]?in|sign[ -]?out)/i;
@@ -568,8 +646,16 @@ class MainActivity : Activity() {
           var pw=document.querySelectorAll('input[type=password]');
           for(var p=0;p<pw.length;p++){ if(visible(pw[p])) { pass=true; break; } }
           var bodyText=(document.body&&document.body.innerText?document.body.innerText:'').slice(0,12000);
-          var authenticated=/(로그아웃|마이페이지|내\\s*정보|회원정보|MY\\s*PAGE|LOG\\s*OUT|SIGN\\s*OUT)/i.test(bodyText);
-          var loginUrl=/(login|signin|sign-in|member\\/login|loginForm)/i.test(location.href);
+          var authenticated=/(로그아웃|마이페이지|내\s*정보|회원정보|MY\s*PAGE|LOG\s*OUT|SIGN\s*OUT)/i.test(bodyText);
+          var loginUrl=/(login|signin|sign-in|member\/login|loginForm)/i.test(location.href);
+          var loginControl=false;
+          var sessionControls=document.querySelectorAll('a,button,[role=button]');
+          for(var sc=0;sc<sessionControls.length;sc++){
+            var sn=sessionControls[sc];
+            if(!visible(sn)) continue;
+            var sl=cleanText(sn.innerText||sn.textContent||sn.getAttribute('aria-label')||'');
+            if(/^(로그인|log\s*in|sign\s*in)$/i.test(sl)){ loginControl=true; break; }
+          }
 
           var context=[];
           var contextNodes=document.querySelectorAll('h1,h2,h3,h4,h5,h6,.title,.tit,.sub-title,.breadcrumb,.location,[class*=title],[class*=breadcrumb]');
@@ -619,44 +705,58 @@ class MainActivity : Activity() {
 
           var nav=[];
           var resources=[];
-          var linkNodes=document.querySelectorAll('a[href],[data-href],[data-url]');
+          var linkNodes=document.querySelectorAll('a,button,[role=button],[onclick],[data-href],[data-url],[data-link],[data-path]');
           var seenNav={};
           var seenRes={};
           var currentParts=location.pathname.split('/').filter(Boolean);
           var prefix=currentParts.slice(0,2).join('/');
+          var scriptCandidates=0;
           for(var li=0;li<linkNodes.length;li++){
             var a=linkNodes[li];
             if(!visible(a)) continue;
-            var raw=a.getAttribute('href')||a.getAttribute('data-href')||a.getAttribute('data-url')||'';
-            if(!raw || /^javascript:/i.test(raw) || /^mailto:/i.test(raw) || /^tel:/i.test(raw)) continue;
-            var label=cleanText(a.innerText||a.textContent||a.getAttribute('aria-label')||'').slice(0,500);
-            var meta2=(a.id||'')+' '+(a.className||'')+' '+label+' '+raw;
-            if(/logout|signout|로그아웃|delete|withdraw|탈퇴/i.test(meta2)) continue;
-            var exportUrl=safeUrl(raw);
-            if(!exportUrl) continue;
-            var u;
-            try{ u=new URL(raw,location.href); }catch(e){ continue; }
-            var ext=/\\.(pdf|hwp|hwpx|xls|xlsx|csv|doc|docx|ppt|pptx)(?:$|[?#])/i;
-            if(ext.test(u.pathname)){
-              if(!seenRes[exportUrl]){ resources.push({label:label,url:exportUrl}); seenRes[exportUrl]=1; }
+            var href=a.getAttribute('href')||'';
+            var onclick=a.getAttribute('onclick')||'';
+            var dataRaw=a.getAttribute('data-href')||a.getAttribute('data-url')||a.getAttribute('data-link')||a.getAttribute('data-path')||'';
+            var raw=dataRaw||href||'';
+            var label=cleanText(a.innerText||a.textContent||a.getAttribute('aria-label')||a.getAttribute('title')||'').slice(0,500);
+            var meta2=(a.id||'')+' '+(a.className||'')+' '+label+' '+raw+' '+onclick;
+            if(/logout|signout|로그아웃|delete|withdraw|탈퇴|회원탈퇴|원서접수|결제|삭제|저장/i.test(meta2)) continue;
+            if(/^mailto:/i.test(raw) || /^tel:/i.test(raw)) continue;
+
+            var route='';
+            if(raw && !/^javascript:/i.test(raw) && raw!=='#') route=fullNavigationUrl(raw);
+            if(!route && onclick){ route=routeFromScript(onclick); if(route) scriptCandidates++; }
+            if(!route && /^javascript:/i.test(raw)){ route=routeFromScript(raw); if(route) scriptCandidates++; }
+
+            var resourceRaw=raw || (route||'');
+            var exportUrl=safeExportUrl(resourceRaw);
+            var u=null;
+            try{ if(resourceRaw) u=new URL(resourceRaw,location.href); }catch(e){ u=null; }
+            var ext=/\.(pdf|hwp|hwpx|xls|xlsx|csv|doc|docx|ppt|pptx|zip)(?:$|[?#])/i;
+            if(u && ext.test(u.pathname)){
+              if(exportUrl && !seenRes[exportUrl]){ resources.push({label:label,url:exportUrl}); seenRes[exportUrl]=1; }
               continue;
             }
-            if(u.origin!==location.origin) continue;
-            var sameArea=prefix && u.pathname.split('/').filter(Boolean).slice(0,2).join('/')===prefix;
-            if(!(admissionTerms.test(label+' '+u.pathname) || sameArea)) continue;
-            var navUrl=fullNavigationUrl(raw);
-            if(!navUrl || seenNav[navUrl]) continue;
-            nav.push({label:label,url:navUrl,exportUrl:exportUrl});
-            seenNav[navUrl]=1;
-            if(nav.length>=160) break;
+
+            if(!route) continue;
+            var ru;
+            try{ ru=new URL(route,location.href); }catch(e2){ continue; }
+            if(ru.origin!==location.origin) continue;
+            var sameArea=prefix && ru.pathname.split('/').filter(Boolean).slice(0,2).join('/')===prefix;
+            if(!(admissionTerms.test(label+' '+ru.pathname+' '+onclick) || sameArea)) continue;
+            if(seenNav[route]) continue;
+            nav.push({label:label,url:route,exportUrl:safeExportUrl(route)});
+            seenNav[route]=1;
+            if(nav.length>=240) break;
           }
 
           return JSON.stringify({
             title:document.title||'',
-            url:location.origin+location.pathname+location.hash,
+            url:safeExportUrl(location.href),
             navigationKey:fullNavigationUrl(location.href),
             collectedAt:new Date().toISOString(),
-            session:{needsLogin:(pass||loginUrl)&&!authenticated,authenticated:authenticated},
+            session:{needsLogin:(pass||loginUrl||loginControl)&&!authenticated,authenticated:authenticated},
+            discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates},
             context:context,
             tables:tables,
             blocks:blocks,
@@ -835,6 +935,32 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun enqueueProviderSeeds() {
+        val seeds = if (provider == "adiga") {
+            listOf(
+                "https://www.adiga.kr/ucp/uvt/uni/univView.do?menuId=PCUVTINF2000&searchSyr=2027",
+                "https://www.adiga.kr/ucp/uvt/uni/univView.do?menuId=PCUVTINF2000&searchSyr=2026",
+                "https://www.adiga.kr/ucp/cls/uni/classUnivView.do?menuId=PCCLSINF2000&searchSyr=2027",
+                "https://www.adiga.kr/ucp/cls/uni/classUnivView.do?menuId=PCCLSINF2000&searchSyr=2026",
+                "https://www.adiga.kr/ucp/prc/uni/admssUnivView.do?menuId=PCPRCINF2000&searchSyr=2027",
+                "https://www.adiga.kr/ucp/prc/uni/admssUnivView.do?menuId=PCPRCINF2000&searchSyr=2026",
+                "https://www.adiga.kr/sco/agu/univScoScaAnlsView.do?menuId=PCSCOAGU2000",
+                "https://www.adiga.kr/uct/ces/archiveView.do?menuId=PCUCTCES1000",
+                "https://www.adiga.kr/uct/acd/adc/characteristicsView.do?menuId=PCUCTACD1100",
+                "https://www.adiga.kr/uct/acd/ueg/univEtenGuideView.do?menuId=PCUCTACD3100",
+                "https://www.adiga.kr/uct/acd/ade/criteriaAndResultView.do?menuId=PCUCTACD2000"
+            )
+        } else {
+            emptyList()
+        }
+
+        for (url in seeds) {
+            if (!isProviderUrl(url) || batchVisited.contains(url) || batchQueued.contains(url)) continue
+            batchQueued.add(url)
+            batchQueue.addLast(url)
+        }
+    }
+
     private fun enqueueDiscoveredLinks(links: JSONArray) {
         for (i in 0 until links.length()) {
             val obj = links.optJSONObject(i) ?: continue
@@ -896,7 +1022,7 @@ class MainActivity : Activity() {
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/json"
-            putExtra(Intent.EXTRA_TITLE, "admission-${provider}-v02-${System.currentTimeMillis()}.json")
+            putExtra(Intent.EXTRA_TITLE, "admission-${provider}-v021-${System.currentTimeMillis()}.json")
         }
         startActivityForResult(intent, SAVE_JSON_REQUEST)
     }
@@ -911,7 +1037,14 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        handler.removeCallbacks(sessionKeepAlive)
+        handler.postDelayed(sessionKeepAlive, 45_000L)
+    }
+
     override fun onPause() {
+        handler.removeCallbacks(sessionKeepAlive)
         CookieManager.getInstance().flush()
         super.onPause()
     }
