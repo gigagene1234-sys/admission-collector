@@ -161,7 +161,7 @@ class CloudOffloadCoordinator(context: Context) {
                 return
             }
         }
-        sendFinish(runId, reason, summary)
+        sendFinish(runId ?: return, reason, summary)
     }
 
     fun resumePlan(
@@ -261,7 +261,7 @@ class CloudOffloadCoordinator(context: Context) {
                 return
             }
         }
-        sendChunk(runId, chunk)
+        sendChunk(runId ?: return, chunk)
     }
 
     private fun flushPending() {
