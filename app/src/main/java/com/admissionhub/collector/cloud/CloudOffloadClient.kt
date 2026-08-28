@@ -118,7 +118,8 @@ class CloudOffloadClient(
                 "/v1/runs/${encode(runId)}/resume-plan" +
                     "?familyKey=${encode(familyKey)}" +
                     "&requestedYear=${encode(year)}" +
-                    "&totalPages=$totalPages"
+                    "&totalPages=$totalPages" +
+                    "&limit=500"
             )
         })
     }
