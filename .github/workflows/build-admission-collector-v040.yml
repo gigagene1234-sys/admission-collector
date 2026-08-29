@@ -7,6 +7,11 @@ on:
       - ".github/workflows/build-admission-collector-v040.yml"
       - "scripts/apply_v040.py"
       - "scripts/fix_v040_compile.py"
+      - "scripts/patch_v040_historical_mirror.py"
+      - "MainActivity.kt"
+      - "app/build.gradle.kts"
+      - "app/src/main/AndroidManifest.xml"
+      - "app/src/main/java/com/admissionhub/collector/**"
   workflow_dispatch:
 
 permissions:
@@ -27,10 +32,17 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Apply v0.4.0 local-first patch
+      - name: Prepare v0.4.0 local-first source
+        shell: bash
         run: |
-          python3 scripts/apply_v040.py
-          python3 scripts/fix_v040_compile.py
+          set -euo pipefail
+          if grep -q 'private const val VERSION = "0.4.0"' MainActivity.kt; then
+            echo "v0.4.0 base source already persisted"
+          else
+            python3 scripts/apply_v040.py
+            python3 scripts/fix_v040_compile.py
+          fi
+          python3 scripts/patch_v040_historical_mirror.py
 
       - name: Verify v0.4.0 source invariants
         shell: bash
@@ -42,6 +54,8 @@ jobs:
           grep -q 'cloudRequestsDuringBatch", 0' MainActivity.kt
           grep -q 'verifyLocalCompletionOrFinish' MainActivity.kt
           grep -q 'LocalCollectorStore' MainActivity.kt
+          grep -q 'historicalMirrorUrl(url)?.let' MainActivity.kt
+          grep -q 'withQueryParameter(url, "searchSyr", "2026")' MainActivity.kt
           grep -q 'historical-admission-result-table' app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt
           grep -q 'admission-search-summary' app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt
           grep -q 'numberOrNull(previousCompetition)' app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt
@@ -115,7 +129,7 @@ jobs:
             app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt \
             app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt \
             app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
-            scripts/apply_v040.py scripts/fix_v040_compile.py
+            scripts/apply_v040.py scripts/fix_v040_compile.py scripts/patch_v040_historical_mirror.py
           if git diff --cached --quiet; then
             echo "v0.4.0 source already persisted"
           else
