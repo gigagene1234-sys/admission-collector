@@ -1,0 +1,49 @@
+name: Verify Admission Collector v0.3.9 Production
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/verify-v039-production.yml"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      ADMISSION_INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      WORKER_URL: https://admission-collector-offload.gigagene1234.workers.dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Cloudflare dependencies
+        working-directory: cloudflare
+        run: npm install --no-audit --no-fund
+      - name: Verify Worker and pending recovery set
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEALTH="$(curl --fail --silent --show-error "$WORKER_URL/health")"
+          printf '%s' "$HEALTH" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(j.version!=='0.3.9')throw new Error(JSON.stringify(j));console.log(j)})"
+          LATEST="$(curl --fail --silent --show-error "$WORKER_URL/v1/runs/latest?provider=adiga" -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN")"
+          RUN_ID="$(printf '%s' "$LATEST" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(!j.runId)throw new Error('No Adiga run: '+s);process.stdout.write(j.runId)})")"
+          PENDING="$(curl --fail --silent --show-error "$WORKER_URL/v1/runs/$RUN_ID/pending-pages?limit=500" -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN")"
+          printf '%s' "$PENDING" | tee /tmp/pending.json
+          printf '%s' "$PENDING" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);const got=(j.retry||[]).filter(x=>x.requestedYear===2027).map(x=>x.page).sort((a,b)=>a-b);const expected=[496,498,499,500];if(j.pendingCount!==4||JSON.stringify(got)!==JSON.stringify(expected))throw new Error('Unexpected pending state: '+s);console.log('Verified pending:',got.join(','))})"
+      - name: Verify fingerprint hardening
+        working-directory: cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler d1 execute admission-collector-db --remote --command "SELECT COUNT(*) AS total, SUM(CASE WHEN fingerprint LIKE 'yr:%' THEN 1 ELSE 0 END) AS year_scoped FROM records WHERE provider='adiga';" --json | tee /tmp/fp.json
+          node - <<'NODE'
+          const fs=require('fs');
+          const data=JSON.parse(fs.readFileSync('/tmp/fp.json','utf8'));
+          const row=data?.[0]?.results?.[0];
+          if(!row || Number(row.total)!==Number(row.year_scoped)) throw new Error(JSON.stringify(row));
+          console.log(`Year-scoped fingerprints: ${row.year_scoped}/${row.total}`);
+          NODE
