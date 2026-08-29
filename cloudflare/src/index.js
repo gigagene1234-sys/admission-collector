@@ -293,11 +293,14 @@ async function processChunk(env, envelope) {
   let duplicates = 0;
 
   for (const record of chunk.records) {
-    const fingerprint = String(
+    const recordProvider = String(record.provider || chunk.provider || "");
+    const recordYear = nullableInt(record.year);
+    const rawFingerprint = String(
       record.sourceRowFingerprint ||
       record.fingerprint ||
       fallbackFingerprint(record)
     );
+    const fingerprint = scopeProviderFingerprint(recordProvider, recordYear, rawFingerprint);
 
     const result = await env.DB.prepare(`
       INSERT OR IGNORE INTO records (
@@ -309,9 +312,9 @@ async function processChunk(env, envelope) {
     `).bind(
       fingerprint,
       runId,
-      String(record.provider || chunk.provider || ""),
+      recordProvider,
       nullableString(record.recordType),
-      nullableInt(record.year),
+      recordYear,
       nullableString(record.university),
       nullableString(record.campus),
       nullableString(record.department),
@@ -563,6 +566,12 @@ async function getResumePlan(env, runId, familyKey, requestedYear, totalPages, l
     serverErrorCooldownSeconds: Math.floor(SERVER_ERROR_RETRY_COOLDOWN_MS / 1000),
     truncated: missing.length >= limit || retry.length >= limit || deferred.length >= limit,
   });
+}
+
+function scopeProviderFingerprint(provider, year, fingerprint) {
+  const value = String(fingerprint || "");
+  if (provider !== "adiga" || value.startsWith("yr:")) return value;
+  return `yr:${year == null ? "na" : year}:${value}`;
 }
 
 function fallbackFingerprint(record) {
