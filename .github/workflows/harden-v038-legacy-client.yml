@@ -1,0 +1,118 @@
+name: Harden v0.3.8 Legacy Client Compatibility
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/harden-v038-legacy-client.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Patch Worker legacy fingerprint normalization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('cloudflare/src/index.js')
+          s = p.read_text()
+          old = '''  for (const record of chunk.records) {
+    const fingerprint = String(
+      record.sourceRowFingerprint ||
+      record.fingerprint ||
+      fallbackFingerprint(record)
+    );
+
+    const result = await env.DB.prepare(`
+'''
+          new = '''  for (const record of chunk.records) {
+    const recordProvider = String(record.provider || chunk.provider || "");
+    const recordYear = nullableInt(record.year);
+    const rawFingerprint = String(
+      record.sourceRowFingerprint ||
+      record.fingerprint ||
+      fallbackFingerprint(record)
+    );
+    const fingerprint = scopeProviderFingerprint(recordProvider, recordYear, rawFingerprint);
+
+    const result = await env.DB.prepare(`
+'''
+          if old not in s:
+              raise SystemExit('processChunk fingerprint block not found')
+          s = s.replace(old, new, 1)
+          s = s.replace('''      String(record.provider || chunk.provider || ""),
+      nullableString(record.recordType),
+      nullableInt(record.year),
+''','''      recordProvider,
+      nullableString(record.recordType),
+      recordYear,
+''',1)
+          marker = '''function fallbackFingerprint(record) {
+'''
+          helper = '''function scopeProviderFingerprint(provider, year, fingerprint) {
+  const value = String(fingerprint || "");
+  if (provider !== "adiga" || value.startsWith("yr:")) return value;
+  return `yr:${year == null ? "na" : year}:${value}`;
+}
+
+'''
+          if marker not in s:
+              raise SystemExit('fallbackFingerprint marker not found')
+          s = s.replace(marker, helper + marker, 1)
+          p.write_text(s)
+          PY
+
+      - name: Add repair migration for legacy unscoped rows
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > cloudflare/migrations/0003_repair_legacy_adiga_fingerprints.sql <<'SQL'
+          -- v0.3.8 compatibility hardening: old Android clients can still upload
+          -- the pre-v0.3.8 unscoped row fingerprint. Remove any unscoped row whose
+          -- year-scoped equivalent already exists, then scope the remaining rows.
+          DELETE FROM records
+          WHERE provider = 'adiga'
+            AND fingerprint NOT LIKE 'yr:%'
+            AND EXISTS (
+              SELECT 1
+              FROM records AS scoped
+              WHERE scoped.fingerprint =
+                'yr:' || COALESCE(CAST(records.year AS TEXT), 'na') || ':' || records.fingerprint
+            );
+
+          UPDATE records
+          SET fingerprint =
+            'yr:' || COALESCE(CAST(year AS TEXT), 'na') || ':' || fingerprint
+          WHERE provider = 'adiga'
+            AND fingerprint NOT LIKE 'yr:%';
+          SQL
+
+      - name: Validate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check cloudflare/src/index.js
+          grep -q 'scopeProviderFingerprint' cloudflare/src/index.js
+          grep -q '0003_repair_legacy_adiga_fingerprints' <(printf '%s\n' cloudflare/migrations/0003_repair_legacy_adiga_fingerprints.sql)
+
+      - name: Persist compatibility hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cloudflare/src/index.js cloudflare/migrations/0003_repair_legacy_adiga_fingerprints.sql
+          git commit -m "Harden v0.3.8 against legacy Adiga fingerprints"
+          git push origin HEAD:main
