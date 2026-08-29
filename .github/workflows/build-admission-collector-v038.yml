@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/build-admission-collector-v038.yml"
       - "scripts/apply_v038.py"
+      - "scripts/prepare_v038.py"
   workflow_dispatch:
 
 permissions:
@@ -25,6 +26,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
+
+      - name: Prepare v0.3.8 patch script
+        run: python3 scripts/prepare_v038.py
 
       - name: Apply v0.3.8 global pending recovery patch
         run: python3 scripts/apply_v038.py
@@ -107,7 +111,8 @@ jobs:
             app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt \
             cloudflare/src/index.js \
             cloudflare/migrations/0002_adiga_year_scoped_fingerprints.sql \
-            scripts/apply_v038.py
+            scripts/apply_v038.py \
+            scripts/prepare_v038.py
           if git diff --cached --quiet; then
             echo "v0.3.8 source already persisted"
           else
