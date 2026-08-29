@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-collector-v040.yml"
       - "scripts/apply_v040.py"
+      - "scripts/fix_v040_compile.py"
   workflow_dispatch:
 
 permissions:
@@ -27,7 +28,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply v0.4.0 local-first patch
-        run: python3 scripts/apply_v040.py
+        run: |
+          python3 scripts/apply_v040.py
+          python3 scripts/fix_v040_compile.py
 
       - name: Verify v0.4.0 source invariants
         shell: bash
@@ -41,6 +44,8 @@ jobs:
           grep -q 'LocalCollectorStore' MainActivity.kt
           grep -q 'historical-admission-result-table' app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt
           grep -q 'admission-search-summary' app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt
+          grep -q 'numberOrNull(previousCompetition)' app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt
+          grep -q 'numberOrNull(previousGrade)' app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt
           grep -q 'inferredUniversityDetailRoute' app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
           grep -q 'class LocalCollectorStore' app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
           grep -q 'versionCode = 10400' app/build.gradle.kts
@@ -110,7 +115,7 @@ jobs:
             app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt \
             app/src/main/java/com/admissionhub/collector/provider/AdigaAdapter.kt \
             app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
-            scripts/apply_v040.py
+            scripts/apply_v040.py scripts/fix_v040_compile.py
           if git diff --cached --quiet; then
             echo "v0.4.0 source already persisted"
           else
