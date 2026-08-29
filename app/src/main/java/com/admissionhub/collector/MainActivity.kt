@@ -104,6 +104,7 @@ class MainActivity : Activity() {
     private var batchSessionSyncRetries = 0
     private var batchNavigationWatchdogGeneration = 0
     private var batchNavigationWatchdogRecovery = false
+    private var batchCloudFinalCheckInProgress = false
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
@@ -115,7 +116,7 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.3.7"
+        private const val VERSION = "0.3.8"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -545,6 +546,7 @@ class MainActivity : Activity() {
         batchContextRecoveries = 0
         batchSessionSyncRetries = 0
         batchNavigationWatchdogRecovery = false
+        batchCloudFinalCheckInProgress = false
         disarmBatchNavigationWatchdog()
         currentBatchTarget = canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
@@ -556,23 +558,93 @@ class MainActivity : Activity() {
         cloudOffload.beginOrResume(provider.wireName, VERSION) { runId ->
             runOnUiThread {
                 if (!batchRunning) return@runOnUiThread
-                enqueueProviderSeeds()
-                status.text = if (runId != null) {
-                    "Cloud 체크포인트 연결: ${runId.take(8)}… / 기본 정보영역 ${batchQueue.size}개 탐색"
-                } else {
-                    "로컬 안전모드: 기본 정보영역 ${batchQueue.size}개 탐색"
-                }
-                checkSessionState { needsLogin, _ ->
-                    if (needsLogin) {
-                        pauseBatchForLogin()
-                    } else {
-                        val startUrl = currentBatchTarget
-                        if (!startUrl.isNullOrBlank()) webView.loadUrl(startUrl)
-                        else loadNextBatchPage()
-                    }
-                }
+                prepareCloudRecoveryAndStart(runId)
             }
         }
+    }
+
+    private fun prepareCloudRecoveryAndStart(runId: String?) {
+        if (runId.isNullOrBlank() || !cloudOffload.isConfigured()) {
+            beginBatchNavigation(runId)
+            return
+        }
+        status.text = "Cloud 전체 미완료 체크포인트 확인 중…"
+        cloudOffload.pendingPages { result ->
+            runOnUiThread {
+                if (!batchRunning) return@runOnUiThread
+                val response = result.getOrNull()
+                if (response != null) {
+                    val scheduled = enqueueGlobalPendingRecovery(response)
+                    batchCloudPagesDeferred = response.optJSONArray("deferred")?.length() ?: 0
+                    status.text = "Cloud 전역 복구: ${scheduled}쪽 우선 재시도 / ${batchCloudPagesDeferred}쪽 cooldown 보류"
+                } else {
+                    status.text = "Cloud 전역 복구 조회 실패: 기존 목록 resume-plan으로 계속"
+                }
+                beginBatchNavigation(runId)
+            }
+        }
+    }
+
+    private fun beginBatchNavigation(runId: String?) {
+        enqueueProviderSeeds()
+        if (runId != null && batchPageActions.isEmpty()) {
+            status.text = "Cloud 체크포인트 연결: ${runId.take(8)}… / 기본 정보영역 ${batchQueue.size}개 탐색"
+        } else if (runId == null) {
+            status.text = "로컬 안전모드: 기본 정보영역 ${batchQueue.size}개 탐색"
+        }
+        checkSessionState { needsLogin, _ ->
+            if (needsLogin) {
+                pauseBatchForLogin()
+            } else if (batchPageActions.isNotEmpty()) {
+                loadNextBatchPage()
+            } else {
+                val startUrl = currentBatchTarget
+                if (!startUrl.isNullOrBlank()) webView.loadUrl(startUrl)
+                else loadNextBatchPage()
+            }
+        }
+    }
+
+    private fun enqueueGlobalPendingRecovery(response: JSONObject): Int {
+        val retry = response.optJSONArray("retry") ?: JSONArray()
+        var scheduled = 0
+        for (i in 0 until retry.length()) {
+            val item = retry.optJSONObject(i) ?: continue
+            val familyKey = item.optString("familyKey")
+            val page = item.optInt("page", -1)
+            if (familyKey.isBlank() || page < 1) continue
+            val requestedYear = if (item.isNull("requestedYear")) null else item.optInt("requestedYear").takeIf { it > 0 }
+            val totalPages = item.optInt("totalPages", page).coerceAtLeast(page)
+            val baseUrl = recoveryUrlForPending(familyKey, requestedYear) ?: continue
+            val action = BatchPageAction(
+                baseUrl = baseUrl,
+                page = page,
+                familyKey = familyKey,
+                requestedYear = requestedYear,
+                totalPages = totalPages,
+                pageSize = 0,
+                totalItems = 0,
+                retry = 0
+            )
+            val key = pageActionKey(action)
+            if (batchPageActionVisited.contains(key) || batchPageActionFailed.contains(key)) continue
+            if (batchPageActionQueued.add(key)) {
+                batchPageActions.addFirst(action)
+                scheduled += 1
+            }
+        }
+        batchCloudPagesScheduled += scheduled
+        return scheduled
+    }
+
+    private fun recoveryUrlForPending(familyKey: String, requestedYear: Int?): String? {
+        if (provider != ProviderId.ADIGA) return null
+        val raw = if (familyKey.startsWith("http://") || familyKey.startsWith("https://")) {
+            familyKey
+        } else {
+            "https://www.adiga.kr" + if (familyKey.startsWith("/")) familyKey else "/$familyKey"
+        }
+        return if (requestedYear != null) withQueryParameter(raw, "searchSyr", requestedYear.toString()) else raw
     }
 
     private fun armBatchNavigationWatchdog(expectedUrl: String) {
@@ -625,6 +697,7 @@ class MainActivity : Activity() {
         batchPausedForLogin = false
         batchCollecting = false
         batchNavigationWatchdogRecovery = false
+        batchCloudFinalCheckInProgress = false
         disarmBatchNavigationWatchdog()
         webView.stopLoading()
         hideBatchCover()
@@ -645,6 +718,7 @@ class MainActivity : Activity() {
         batchPausedForLogin = true
         batchCollecting = false
         batchNavigationWatchdogRecovery = false
+        batchCloudFinalCheckInProgress = false
         disarmBatchNavigationWatchdog()
         hideBatchCover()
         if (autoOpenLogin) {
@@ -1043,7 +1117,59 @@ class MainActivity : Activity() {
             webView.loadUrl(next)
             return
         }
-        finishBatch("completed")
+        verifyCloudCompletionOrFinish()
+    }
+
+    private fun verifyCloudCompletionOrFinish(drainAttempt: Int = 0) {
+        if (!batchRunning || batchPausedForLogin) return
+        if (!cloudOffload.isConfigured()) {
+            finishBatch("completed")
+            return
+        }
+        if (batchCloudFinalCheckInProgress) return
+        batchCloudFinalCheckInProgress = true
+        status.text = "Cloud Queue 및 전체 체크포인트 최종 검증 중…"
+        cloudOffload.status { statusResult ->
+            runOnUiThread {
+                if (!batchRunning) {
+                    batchCloudFinalCheckInProgress = false
+                    return@runOnUiThread
+                }
+                val run = statusResult.getOrNull()?.optJSONObject("run")
+                val uploaded = run?.optInt("uploaded_chunks", 0) ?: 0
+                val processed = run?.optInt("processed_chunks", 0) ?: 0
+                if (run != null && processed < uploaded && drainAttempt < 20) {
+                    batchCloudFinalCheckInProgress = false
+                    status.text = "Cloud Queue 반영 대기: $processed/$uploaded"
+                    handler.postDelayed({ verifyCloudCompletionOrFinish(drainAttempt + 1) }, 500L)
+                    return@runOnUiThread
+                }
+                cloudOffload.pendingPages { pendingResult ->
+                    runOnUiThread {
+                        batchCloudFinalCheckInProgress = false
+                        if (!batchRunning) return@runOnUiThread
+                        val response = pendingResult.getOrNull()
+                        if (response == null) {
+                            finishBatch("cloud-verification-failed")
+                            return@runOnUiThread
+                        }
+                        val deferred = response.optJSONArray("deferred") ?: JSONArray()
+                        batchCloudPagesDeferred = deferred.length()
+                        val scheduled = enqueueGlobalPendingRecovery(response)
+                        if (scheduled > 0) {
+                            status.text = "Cloud 미완료 ${scheduled}쪽을 완료 판정 전에 우선 복구합니다."
+                            handler.postDelayed({ loadNextBatchPage() }, 120L)
+                            return@runOnUiThread
+                        }
+                        if (batchCloudPagesDeferred > 0) {
+                            finishBatch("completed-with-deferred-errors")
+                        } else {
+                            finishBatch("completed")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun executePendingBatchPageAction() {
@@ -1225,6 +1351,7 @@ class MainActivity : Activity() {
         batchPausedForLogin = false
         batchCollecting = false
         batchNavigationWatchdogRecovery = false
+        batchCloudFinalCheckInProgress = false
         disarmBatchNavigationWatchdog()
         webView.stopLoading()
         hideBatchCover()
@@ -1232,7 +1359,7 @@ class MainActivity : Activity() {
         batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
         val effectiveReason = if (reason == "completed" && batchCloudPagesDeferred > 0) "completed-with-deferred-errors" else reason
         finalizeBatchJson(effectiveReason)
-        if (batchCloudPagesDeferred == 0) {
+        if (effectiveReason == "completed" && batchCloudPagesDeferred == 0) {
             cloudOffload.finish(
                 reason = effectiveReason,
                 summary = JSONObject()
@@ -1247,10 +1374,13 @@ class MainActivity : Activity() {
                     .put("cloudPagesDeferred", batchCloudPagesDeferred)
             )
         }
-        status.text = if (batchCloudPagesDeferred > 0) {
-            "수집 완료: 서버 오류 ${batchCloudPagesDeferred}쪽은 Cloud에 보류 / 나머지 완료 페이지는 유지됨"
-        } else {
-            "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 최종오류 ${batchErrors.length()} / 재시도 $batchPaginationRetries / 레코드 ${batchRecords.length()}"
+        status.text = when {
+            effectiveReason == "cloud-verification-failed" ->
+                "로컬 수집 종료: Cloud 최종 완결성 확인 실패 / 서버 run은 닫지 않고 유지합니다."
+            batchCloudPagesDeferred > 0 ->
+                "수집 종료: 서버 오류 ${batchCloudPagesDeferred}쪽은 Cloud에 보류 / 전체 완료로 확정하지 않습니다."
+            else ->
+                "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 최종오류 ${batchErrors.length()} / 재시도 $batchPaginationRetries / 레코드 ${batchRecords.length()}"
         }
     }
 

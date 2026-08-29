@@ -234,7 +234,9 @@ for path in main_paths:
     reset_marker = "        batchNavigationWatchdogRecovery = false\n        disarmBatchNavigationWatchdog()\n"
     reset_repl = "        batchNavigationWatchdogRecovery = false\n        batchCloudFinalCheckInProgress = false\n        disarmBatchNavigationWatchdog()\n"
     if reset_repl not in text:
-        text = replace_once(text, reset_marker, reset_repl, f"{path.name} final-check reset")
+        if reset_marker not in text:
+            raise SystemExit(f"{path.name}: final-check reset marker not found")
+        text = text.replace(reset_marker, reset_repl)
 
     # Queue exhaustion must be verified against the server-global checkpoint set.
     if "        verifyCloudCompletionOrFinish()\n    }\n\n    private fun executePendingBatchPageAction" not in text:

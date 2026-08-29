@@ -135,6 +135,15 @@ class CloudOffloadClient(
         })
     }
 
+    fun getPendingPages(
+        runId: String,
+        callback: (Result<JSONObject>) -> Unit
+    ) = io.execute {
+        callback(runCatching {
+            get("/v1/runs/${encode(runId)}/pending-pages?limit=500")
+        })
+    }
+
     fun shutdown() {
         io.shutdownNow()
     }

@@ -222,6 +222,26 @@ class CloudOffloadCoordinator(context: Context) {
         currentClient.getResumePlan(runId, familyKey, requestedYear, totalPages, callback)
     }
 
+    fun pendingPages(callback: (Result<JSONObject>) -> Unit) {
+        val runId = synchronized(lock) { activeRunId }
+        val currentClient = synchronized(lock) { ensureClientLocked(); client }
+        if (runId.isNullOrBlank() || currentClient == null) {
+            callback(Result.failure(IllegalStateException("No active cloud run")))
+            return
+        }
+        currentClient.getPendingPages(runId, callback)
+    }
+
+    fun status(callback: (Result<JSONObject>) -> Unit) {
+        val runId = synchronized(lock) { activeRunId }
+        val currentClient = synchronized(lock) { ensureClientLocked(); client }
+        if (runId.isNullOrBlank() || currentClient == null) {
+            callback(Result.failure(IllegalStateException("No active cloud run")))
+            return
+        }
+        currentClient.getStatus(runId, callback)
+    }
+
     fun snapshotStatus(): JSONObject = JSONObject()
         .put("configured", isConfigured())
         .put("workerUrl", workerUrl())

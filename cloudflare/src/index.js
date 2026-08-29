@@ -16,7 +16,7 @@ export default {
         return json({
           ok: true,
           service: "admission-collector-offload",
-          version: "0.3.6",
+          version: "0.3.8",
           time: new Date().toISOString(),
         });
       }
@@ -72,6 +72,18 @@ export default {
         const body = await readJson(request, 128_000);
         await assertRunExists(env, runId);
 
+        if ((body.completionReason || "") === "completed") {
+          const pending = await env.DB.prepare(`
+            SELECT COUNT(*) AS pending_count
+            FROM run_pages
+            WHERE run_id = ? AND state != 'completed'
+          `).bind(runId).first();
+          const pendingCount = Number(pending?.pending_count || 0);
+          if (pendingCount > 0) {
+            return json({ error: "run_incomplete", runId, pendingPages: pendingCount }, 409);
+          }
+        }
+
         await env.DB.prepare(`
           UPDATE runs
           SET status = ?,
@@ -94,6 +106,13 @@ export default {
       if (request.method === "GET" && statusMatch) {
         const runId = decodeURIComponent(statusMatch[1]);
         return getStatus(env, runId);
+      }
+
+      const pendingMatch = url.pathname.match(/^\/v1\/runs\/([^/]+)\/pending-pages$/);
+      if (request.method === "GET" && pendingMatch) {
+        const runId = decodeURIComponent(pendingMatch[1]);
+        const limit = boundedInt(url.searchParams.get("limit") || "500", 1, 500);
+        return getPendingPages(env, runId, limit);
       }
 
       const planMatch = url.pathname.match(/^\/v1\/runs\/([^/]+)\/resume-plan$/);
@@ -175,12 +194,35 @@ async function readJson(request, maxBytes) {
 
 async function getLatestActiveRun(env, provider) {
   const row = await env.DB.prepare(`
-    SELECT run_id, provider, collector_version, status, created_at, updated_at
-    FROM runs
-    WHERE provider = ? AND status = 'collecting'
-    ORDER BY updated_at DESC
+    SELECT r.run_id, r.provider, r.collector_version, r.status, r.created_at, r.updated_at,
+           EXISTS(
+             SELECT 1 FROM run_pages p
+             WHERE p.run_id = r.run_id AND p.state != 'completed'
+           ) AS has_pending
+    FROM runs r
+    WHERE r.provider = ?
+      AND (
+        r.status = 'collecting'
+        OR EXISTS(
+          SELECT 1 FROM run_pages p
+          WHERE p.run_id = r.run_id AND p.state != 'completed'
+        )
+      )
+    ORDER BY CASE WHEN r.status = 'collecting' THEN 0 ELSE 1 END,
+             r.updated_at DESC
     LIMIT 1
   `).bind(provider).first();
+
+  if (row && row.status !== "collecting" && Number(row.has_pending || 0) > 0) {
+    const now = new Date().toISOString();
+    await env.DB.prepare(`
+      UPDATE runs
+      SET status = 'collecting', completion_reason = NULL, updated_at = ?
+      WHERE run_id = ?
+    `).bind(now, row.run_id).run();
+    row.status = "collecting";
+    row.updated_at = now;
+  }
 
   return json({
     runId: row?.run_id || null,
@@ -188,6 +230,7 @@ async function getLatestActiveRun(env, provider) {
     collectorVersion: row?.collector_version || null,
     status: row?.status || null,
     updatedAt: row?.updated_at || null,
+    recoveredPending: Number(row?.has_pending || 0) > 0,
   });
 }
 
@@ -378,6 +421,77 @@ async function getStatus(env, runId) {
   return json({
     run,
     recentErrors: recentErrors.results || [],
+  });
+}
+
+async function getPendingPages(env, runId, limit) {
+  const run = await env.DB.prepare(`
+    SELECT run_id FROM runs WHERE run_id = ? LIMIT 1
+  `).bind(runId).first();
+  if (!run) return json({ error: "run_not_found" }, 404);
+
+  const countRow = await env.DB.prepare(`
+    SELECT COUNT(*) AS pending_count
+    FROM run_pages
+    WHERE run_id = ? AND state != 'completed'
+  `).bind(runId).first();
+
+  const rows = await env.DB.prepare(`
+    SELECT p.family_key, p.requested_year, p.page_number, p.state,
+           p.retry_count, p.error_type, p.updated_at,
+           (
+             SELECT MAX(p2.page_number)
+             FROM run_pages p2
+             WHERE p2.run_id = p.run_id
+               AND p2.family_key = p.family_key
+               AND p2.requested_year = p.requested_year
+           ) AS total_pages
+    FROM run_pages p
+    WHERE p.run_id = ? AND p.state != 'completed'
+    ORDER BY p.requested_year DESC, p.family_key, p.page_number
+    LIMIT ?
+  `).bind(runId, limit).all();
+
+  const retry = [];
+  const deferred = [];
+  const nowMs = Date.now();
+  for (const row of rows.results || []) {
+    const retryCount = Number(row.retry_count || 0);
+    const errorType = row.error_type || null;
+    const updatedMs = Date.parse(row.updated_at || "");
+    const shouldDeferServerError =
+      errorType === "server-error" &&
+      retryCount >= 2 &&
+      Number.isFinite(updatedMs) &&
+      nowMs - updatedMs < SERVER_ERROR_RETRY_COOLDOWN_MS;
+    const item = {
+      familyKey: row.family_key,
+      requestedYear: Number(row.requested_year) === -1 ? null : Number(row.requested_year),
+      page: Number(row.page_number),
+      totalPages: Number(row.total_pages || row.page_number),
+      state: row.state,
+      retryCount,
+      errorType,
+      updatedAt: row.updated_at,
+    };
+    if (shouldDeferServerError) {
+      item.retryAfter = new Date(updatedMs + SERVER_ERROR_RETRY_COOLDOWN_MS).toISOString();
+      deferred.push(item);
+    } else {
+      retry.push(item);
+    }
+  }
+
+  const pendingCount = Number(countRow?.pending_count || 0);
+  return json({
+    runId,
+    pendingCount,
+    retryCount: retry.length,
+    deferredCount: deferred.length,
+    retry,
+    deferred,
+    serverErrorCooldownSeconds: Math.floor(SERVER_ERROR_RETRY_COOLDOWN_MS / 1000),
+    truncated: pendingCount > (retry.length + deferred.length),
   });
 }
 

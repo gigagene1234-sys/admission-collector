@@ -148,7 +148,7 @@ object AdigaAdapter : ProviderAdapter {
                 .put("sourcePage", snapshot.optString("url"))
                 .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
                 .put("sourceRowOrdinal", sourceRowOrdinal(snapshot, ri))
-                .put("sourceRowFingerprint", rowFingerprint("university-summary", row))
+                .put("sourceRowFingerprint", scopedRowFingerprint("university-summary", pageYear, row))
                 .put("rawEvidence", rowToEvidence(row)))
         }
         return out
@@ -187,7 +187,7 @@ object AdigaAdapter : ProviderAdapter {
                 .put("sourcePage", snapshot.optString("url"))
                 .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
                 .put("sourceRowOrdinal", sourceRowOrdinal(snapshot, ri))
-                .put("sourceRowFingerprint", rowFingerprint("department-summary", row))
+                .put("sourceRowFingerprint", scopedRowFingerprint("department-summary", pageYear, row))
                 .put("rawEvidence", rowToEvidence(row)))
         }
         return out
@@ -259,7 +259,7 @@ object AdigaAdapter : ProviderAdapter {
                 .put("confidence", "high")
                 .put("sourcePage", snapshot.optString("url"))
                 .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
-                .put("sourceRowFingerprint", rowFingerprint("disabled-admissions-index", row))
+                .put("sourceRowFingerprint", scopedRowFingerprint("disabled-admissions-index", year, row))
                 .put("rawEvidence", rowToEvidence(row)))
         }
         return out
@@ -271,7 +271,7 @@ object AdigaAdapter : ProviderAdapter {
         .put("department", JSONObject.NULL).put("admission", JSONObject.NULL).put("metrics", metrics)
         .put("confidence", "high").put("sourcePage", snapshot.optString("url"))
         .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
-        .put("sourceRowFingerprint", rowFingerprint(type, row))
+        .put("sourceRowFingerprint", scopedRowFingerprint(type, null, row))
         .put("rawEvidence", rowToEvidence(row))
 
     private fun queryYear(url: String): Int? = queryParam(url, "searchSyr")?.toIntOrNull()
@@ -312,6 +312,9 @@ object AdigaAdapter : ProviderAdapter {
         if (pageSize <= 0) return JSONObject.NULL
         return (page - 1) * pageSize + rowIndex
     }
+
+    private fun scopedRowFingerprint(type: String, year: Int?, row: JSONArray): String =
+        "yr:${year ?: "na"}:${rowFingerprint(type, row)}"
 
     private fun rowFingerprint(type: String, row: JSONArray): String =
         RecordUtils.sha256("$type|${rowToEvidence(row)}")
