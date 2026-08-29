@@ -18,17 +18,20 @@ object AdigaAdapter : ProviderAdapter {
     }
 
     override fun seedUrls(): List<String> = listOf(
+        // 2027 current admissions + university codes/details. 2027 university detail pages
+        // contain the 2026 actual result section.
         "https://www.adiga.kr/ucp/uvt/uni/univView.do?menuId=PCUVTINF2000&searchSyr=2027",
-        "https://www.adiga.kr/ucp/uvt/uni/univView.do?menuId=PCUVTINF2000&searchSyr=2026",
         "https://www.adiga.kr/ucp/cls/uni/classUnivView.do?menuId=PCCLSINF2000&searchSyr=2027",
-        "https://www.adiga.kr/ucp/cls/uni/classUnivView.do?menuId=PCCLSINF2000&searchSyr=2026",
         "https://www.adiga.kr/ucp/prc/uni/admssUnivView.do?menuId=PCPRCINF2000&searchSyr=2027",
+        // 2026 university/admission views expose 2025 actual results. The huge 2026
+        // department list is intentionally omitted because it duplicated the 2027 list
+        // in prior device runs and is not needed to obtain the 2025 historical result.
+        "https://www.adiga.kr/ucp/uvt/uni/univView.do?menuId=PCUVTINF2000&searchSyr=2026",
         "https://www.adiga.kr/ucp/prc/uni/admssUnivView.do?menuId=PCPRCINF2000&searchSyr=2026",
-        "https://www.adiga.kr/sco/agu/univScoScaAnlsView.do?menuId=PCSCOAGU2000",
-        "https://www.adiga.kr/uct/ces/archiveView.do?menuId=PCUCTCES1000",
+        "https://www.adiga.kr/uct/acd/ade/criteriaAndResultView.do?menuId=PCUCTACD2000&searchSyr=2027",
+        "https://www.adiga.kr/uct/acd/ade/criteriaAndResultView.do?menuId=PCUCTACD2000&searchSyr=2026",
         "https://www.adiga.kr/uct/acd/adc/characteristicsView.do?menuId=PCUCTACD1100",
-        "https://www.adiga.kr/uct/acd/ueg/univEtenGuideView.do?menuId=PCUCTACD3100",
-        "https://www.adiga.kr/uct/acd/ade/criteriaAndResultView.do?menuId=PCUCTACD2000"
+        "https://www.adiga.kr/uct/acd/ueg/univEtenGuideView.do?menuId=PCUCTACD3100"
     )
 
     override fun isBatchNavigable(url: String): Boolean {
@@ -86,6 +89,8 @@ object AdigaAdapter : ProviderAdapter {
             url.contains("/ucp/uvt/uni/univView.do") -> "adiga-university-list"
             url.contains("/ucp/cls/uni/classUnivView.do") -> "adiga-department-list"
             url.contains("/ucp/prc/uni/admssUnivView.do") -> "adiga-admission-list"
+            url.contains("/ucp/uvt/uni/univDetailSelection.do") -> "adiga-university-detail"
+            url.contains("/uct/acd/ade/criteriaAndResultPopup.do") -> "adiga-criteria-result-detail"
             url.contains("/uct/acd/adc/characteristicsView.do") -> "adiga-university-characteristics"
             url.contains("/uct/acd/ueg/univEtenGuideView.do") -> "adiga-university-guide"
             url.contains("/uct/acd/ade/criteriaAndResultView.do") -> "adiga-criteria-result"
@@ -100,6 +105,9 @@ object AdigaAdapter : ProviderAdapter {
         val out = when {
             url.contains("/ucp/uvt/uni/univView.do") -> parseUniversityList(snapshot)
             url.contains("/ucp/cls/uni/classUnivView.do") -> parseDepartmentList(snapshot)
+            url.contains("/ucp/prc/uni/admssUnivView.do") -> parseAdmissionList(snapshot)
+            url.contains("/ucp/uvt/uni/univDetailSelection.do") -> parseUniversityDetail(snapshot)
+            url.contains("/uct/acd/ade/criteriaAndResultPopup.do") -> parseUniversityDetail(snapshot)
             url.contains("/uct/acd/adc/characteristicsView.do") -> parseCharacteristicsIndex(snapshot)
             url.contains("/uct/acd/ueg/univEtenGuideView.do") -> parseGuideIndex(snapshot)
             url.contains("/uct/acd/ade/criteriaAndResultView.do") -> parseCriteriaIndex(snapshot)
@@ -193,6 +201,129 @@ object AdigaAdapter : ProviderAdapter {
         return out
     }
 
+    private fun parseAdmissionList(snapshot: JSONObject): JSONArray {
+        val out = JSONArray()
+        val rows = firstTableRows(snapshot) ?: return out
+        if (rows.length() < 2) return out
+        val pageYear = queryYear(snapshot.optString("url"))
+        val previousYear = pageYear?.minus(1)
+        for (ri in 1 until rows.length()) {
+            val row = rows.optJSONArray(ri) ?: continue
+            if (row.length() < 6) continue
+            val university = normalizeUniversityCell(row.optString(0))
+            val department = row.optString(1).trim()
+            if (!looksLikeUniversity(university) || department.isBlank() || department.contains("검색결과가 없습니다")) continue
+            val previousCompetition = Regex("[0-9]+(?:\\.[0-9]+)?").find(row.optString(3))?.value?.toDoubleOrNull()
+            val previousGrade = Regex("[0-9]+(?:\\.[0-9]+)?").find(row.optString(5))?.value?.toDoubleOrNull()
+            val metrics = JSONObject()
+                .put("region", valueOrNull(row.optString(2)))
+                .put("previousCompetition", numberOrNull(previousCompetition))
+                .put("competitionYear", previousYear ?: JSONObject.NULL)
+                .put("capacity", intOrNull(row.optString(4)))
+                .put("previousAdmissionGrade", numberOrNull(previousGrade))
+                .put("historicalResultYear", previousYear ?: JSONObject.NULL)
+            out.put(JSONObject()
+                .put("recordType", "admission-search-summary")
+                .put("year", pageYear ?: JSONObject.NULL)
+                .put("university", university)
+                .put("campus", extractCampus(university) ?: JSONObject.NULL)
+                .put("department", department)
+                .put("admission", JSONObject.NULL)
+                .put("metrics", metrics)
+                .put("confidence", "high")
+                .put("sourcePage", snapshot.optString("url"))
+                .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
+                .put("sourceRowOrdinal", sourceRowOrdinal(snapshot, ri))
+                .put("sourceRowFingerprint", scopedRowFingerprint("admission-search-summary", pageYear, row))
+                .put("rawEvidence", rowToEvidence(row)))
+        }
+        return out
+    }
+
+    private fun parseUniversityDetail(snapshot: JSONObject): JSONArray {
+        val out = JSONArray()
+        val url = snapshot.optString("url")
+        val admissionYear = queryYear(url)
+        val resultYear = admissionYear?.minus(1)
+        val universityCode = queryParam(url, "unvCd")
+        val university = inferUniversityFromSnapshot(snapshot)
+        val tables = snapshot.optJSONArray("tables") ?: JSONArray()
+        for (ti in 0 until tables.length()) {
+            val table = tables.optJSONObject(ti) ?: continue
+            val rows = table.optJSONArray("rows") ?: continue
+            if (rows.length() == 0) continue
+            val evidence = rows.toString()
+            val historical = resultYear != null && (
+                evidence.contains("${resultYear}학년도") ||
+                    Regex("(경쟁률|충원|최종등록|등록자|50%|70%|입시결과|전형 결과)").containsMatchIn(evidence)
+                )
+            val recordYear = if (historical) resultYear else admissionYear
+            val recordType = if (historical) "historical-admission-result-table" else "current-admission-criteria-table"
+            val metrics = JSONObject()
+                .put("admissionYear", admissionYear ?: JSONObject.NULL)
+                .put("historicalResultYear", resultYear ?: JSONObject.NULL)
+                .put("universityCode", universityCode ?: JSONObject.NULL)
+                .put("tableIndex", ti)
+                .put("caption", valueOrNull(table.optString("caption")))
+                .put("rows", rows)
+            out.put(JSONObject()
+                .put("recordType", recordType)
+                .put("year", recordYear ?: JSONObject.NULL)
+                .put("university", university ?: JSONObject.NULL)
+                .put("campus", university?.let { extractCampus(it) } ?: JSONObject.NULL)
+                .put("department", JSONObject.NULL)
+                .put("admission", JSONObject.NULL)
+                .put("metrics", metrics)
+                .put("confidence", if (university != null && recordYear != null) "high" else "medium")
+                .put("sourcePage", url)
+                .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
+                .put("sourceRowFingerprint", scopedRowFingerprint(recordType, recordYear, rows))
+                .put("rawEvidence", evidence.take(12000)))
+        }
+        if (out.length() == 0) {
+            val evidence = buildString {
+                val context = snapshot.optJSONArray("context") ?: JSONArray()
+                for (i in 0 until context.length()) append(context.optString(i)).append(' ')
+                val blocks = snapshot.optJSONArray("blocks") ?: JSONArray()
+                for (i in 0 until minOf(blocks.length(), 80)) append(blocks.optString(i)).append(' ')
+            }.trim()
+            if (evidence.isNotBlank()) {
+                out.put(JSONObject()
+                    .put("recordType", "university-detail-text")
+                    .put("year", admissionYear ?: JSONObject.NULL)
+                    .put("university", university ?: JSONObject.NULL)
+                    .put("campus", university?.let { extractCampus(it) } ?: JSONObject.NULL)
+                    .put("department", JSONObject.NULL)
+                    .put("admission", JSONObject.NULL)
+                    .put("metrics", JSONObject()
+                        .put("admissionYear", admissionYear ?: JSONObject.NULL)
+                        .put("historicalResultYear", resultYear ?: JSONObject.NULL)
+                        .put("universityCode", universityCode ?: JSONObject.NULL))
+                    .put("confidence", "medium")
+                    .put("sourcePage", url)
+                    .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
+                    .put("sourceRowFingerprint", RecordUtils.sha256("${admissionYear ?: "na"}|$evidence"))
+                    .put("rawEvidence", evidence.take(12000)))
+            }
+        }
+        return out
+    }
+
+    private fun inferUniversityFromSnapshot(snapshot: JSONObject): String? {
+        val candidates = mutableListOf<String>()
+        val context = snapshot.optJSONArray("context") ?: JSONArray()
+        for (i in 0 until context.length()) candidates += context.optString(i)
+        val blocks = snapshot.optJSONArray("blocks") ?: JSONArray()
+        for (i in 0 until minOf(blocks.length(), 60)) candidates += blocks.optString(i)
+        val regex = Regex("([가-힣A-Za-z0-9·()\\- ]+(?:대학교|대학)(?:\\[[^]]+])?)")
+        for (candidate in candidates) {
+            val match = regex.find(candidate)?.groupValues?.getOrNull(1)?.trim() ?: continue
+            val normalized = normalizeUniversityCell(match)
+            if (looksLikeUniversity(normalized)) return normalized
+        }
+        return null
+    }
+
     private fun parseCharacteristicsIndex(snapshot: JSONObject): JSONArray {
         val out = JSONArray(); val rows = firstTableRows(snapshot) ?: return out
         for (ri in 1 until rows.length()) {
@@ -228,13 +359,16 @@ object AdigaAdapter : ProviderAdapter {
             val row = rows.optJSONArray(ri) ?: continue
             if (row.length() < 5) continue
             val university = normalizeUniversityCell(row.optString(0)); if (!looksLikeUniversity(university)) continue
+            val admissionYear = queryYear(snapshot.optString("url"))
             val metrics = JSONObject()
                 .put("holisticRecruitment", intOrNull(row.optString(1)))
                 .put("curriculumRecruitment", intOrNull(row.optString(2)))
                 .put("csatRecruitment", intOrNull(row.optString(3)))
                 .put("registeredAt", valueOrNull(row.optString(4)))
                 .put("columnLabels", JSONArray(labels))
-            out.put(indexRecord("criteria-result-index", university, metrics, snapshot, row))
+                .put("admissionYear", admissionYear ?: JSONObject.NULL)
+                .put("historicalResultYear", admissionYear?.minus(1) ?: JSONObject.NULL)
+            out.put(indexRecord("criteria-result-index", university, metrics, snapshot, row, admissionYear))
         }
         return out
     }
@@ -265,13 +399,13 @@ object AdigaAdapter : ProviderAdapter {
         return out
     }
 
-    private fun indexRecord(type: String, university: String, metrics: JSONObject, snapshot: JSONObject, row: JSONArray): JSONObject = JSONObject()
-        .put("recordType", type).put("year", JSONObject.NULL).put("university", university)
+    private fun indexRecord(type: String, university: String, metrics: JSONObject, snapshot: JSONObject, row: JSONArray, year: Int? = null): JSONObject = JSONObject()
+        .put("recordType", type).put("year", year ?: JSONObject.NULL).put("university", university)
         .put("campus", extractCampus(university) ?: JSONObject.NULL)
         .put("department", JSONObject.NULL).put("admission", JSONObject.NULL).put("metrics", metrics)
         .put("confidence", "high").put("sourcePage", snapshot.optString("url"))
         .put("sourcePageNumber", snapshot.optInt("collectionPage", 1))
-        .put("sourceRowFingerprint", scopedRowFingerprint(type, null, row))
+        .put("sourceRowFingerprint", scopedRowFingerprint(type, year, row))
         .put("rawEvidence", rowToEvidence(row))
 
     private fun queryYear(url: String): Int? = queryParam(url, "searchSyr")?.toIntOrNull()

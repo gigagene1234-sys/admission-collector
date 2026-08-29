@@ -27,6 +27,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import com.admissionhub.collector.capture.SnapshotScript
 import com.admissionhub.collector.cloud.CloudOffloadCoordinator
+import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.parser.RecordUtils
 import com.admissionhub.collector.provider.PaginationPlan
 import com.admissionhub.collector.provider.ProviderAdapter
@@ -43,6 +44,7 @@ class MainActivity : Activity() {
     private lateinit var batchButton: Button
     private lateinit var batchCover: TextView
     private lateinit var cloudOffload: CloudOffloadCoordinator
+    private lateinit var localStore: LocalCollectorStore
 
     private val handler = Handler(Looper.getMainLooper())
     private val sessionKeepAlive = object : Runnable {
@@ -105,23 +107,31 @@ class MainActivity : Activity() {
     private var batchNavigationWatchdogGeneration = 0
     private var batchNavigationWatchdogRecovery = false
     private var batchCloudFinalCheckInProgress = false
+    private var batchLocalResumePlans = 0
+    private var batchLocalPagesScheduled = 0
+    private var batchLocalPagesSkipped = 0
+    private var batchLocalRecordsPersisted = 0
+    private var localRunId: String? = null
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
-        private const val MAX_BATCH_PAGES = 2000
-        private const val MAX_PAGE_RETRIES = 2
+        private const val MAX_BATCH_PAGES = 3200
+        private const val MAX_PAGE_RETRIES = 3
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.3.9"
+        private const val VERSION = "0.4.0"
+        private const val BUILD_CODE = 10400
+        private const val LOCAL_FIRST_BETA = true
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         cloudOffload = CloudOffloadCoordinator(this)
+        localStore = LocalCollectorStore(this)
         buildUi()
         configureWebView()
         openProvider(ProviderId.ADIGA)
@@ -134,7 +144,7 @@ class MainActivity : Activity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "Admission Collector v$VERSION · build 10039"
+            text = "Admission Collector v$VERSION · build $BUILD_CODE · LOCAL-FIRST"
             gravity = Gravity.CENTER
             textSize = 13f
             setPadding(8, 6, 8, 6)
@@ -205,21 +215,25 @@ class MainActivity : Activity() {
             text = "JSON 저장"
             setOnClickListener { saveJson() }
         }
-        val cloudSettings = Button(this).apply {
-            text = "Cloud 설정"
+        val localState = Button(this).apply {
+            text = "로컬 진행상태"
             setOnClickListener {
-                cloudOffload.showSettingsDialog(this@MainActivity) {
-                    status.text = if (cloudOffload.isConfigured()) {
-                        "Cloudflare Offload 설정됨"
-                    } else {
-                        "Cloudflare Offload 미설정: 로컬 수집 모드"
-                    }
+                val runId = localRunId ?: localStore.latestResumableRun(provider.wireName)
+                val message = if (runId == null) {
+                    "현재 이어받을 로컬 수집이 없습니다."
+                } else {
+                    localStore.stats(runId).toString(2)
                 }
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Local-First 저장 상태")
+                    .setMessage(message)
+                    .setPositiveButton("확인", null)
+                    .show()
             }
         }
         actions2.addView(resume, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         actions2.addView(save, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        actions2.addView(cloudSettings, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        actions2.addView(localState, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
         status = TextView(this).apply {
             text = "Admission Collector v$VERSION 준비 중"
@@ -557,19 +571,20 @@ class MainActivity : Activity() {
         batchSessionSyncRetries = 0
         batchNavigationWatchdogRecovery = false
         batchCloudFinalCheckInProgress = false
+        batchLocalResumePlans = 0
+        batchLocalPagesScheduled = 0
+        batchLocalPagesSkipped = 0
+        batchLocalRecordsPersisted = 0
         disarmBatchNavigationWatchdog()
         currentBatchTarget = canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
-        status.text = if (cloudOffload.isConfigured()) {
-            "Cloud 체크포인트 연결 준비 중…"
+        if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
+            localRunId = localStore.beginOrResume(provider.wireName, VERSION)
+            status.text = "Local-First 수집 시작: Cloudflare 호출 없음 / run ${localRunId?.take(8)}…"
+            beginBatchNavigation(null)
         } else {
-            "Cloud 토큰 미설정: 로컬 안전모드로 수집 시작"
-        }
-        cloudOffload.beginOrResume(provider.wireName, VERSION) { runId ->
-            runOnUiThread {
-                if (!batchRunning) return@runOnUiThread
-                prepareCloudRecoveryAndStart(runId)
-            }
+            status.text = "현재 공급자는 로컬 단일 페이지 모드"
+            beginBatchNavigation(null)
         }
     }
 
@@ -721,7 +736,8 @@ class MainActivity : Activity() {
         activeBatchPageAction = null
         batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
         status.text = "일괄 수집 중지: $reason"
-        if (batchSnapshots.length() > 0) finalizeBatchJson("stopped")
+        localRunId?.let { localStore.markRun(it, "stopped", reason) }
+        if (batchSnapshots.length() > 0 || localRunId != null) finalizeBatchJson("stopped")
     }
 
     private fun pauseBatchForLogin(autoOpenLogin: Boolean = true) {
@@ -1004,14 +1020,16 @@ class MainActivity : Activity() {
                         .put("retryCount", activeAction.retry)
                 }
                 batchErrors.put(error)
-                cloudOffload.uploadError(
-                    provider = provider.wireName,
-                    familyKey = activeAction?.familyKey,
-                    requestedYear = activeAction?.requestedYear,
-                    page = activeAction?.page,
-                    retryCount = activeAction?.retry ?: 0,
-                    error = error
-                )
+                localRunId?.let { runId ->
+                    val key = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
+                    localStore.markDocument(runId, key, "error", activeAction?.retry ?: 0, errorType)
+                    if (activeAction != null) {
+                        localStore.markPage(
+                            runId, activeAction.familyKey, activeAction.requestedYear,
+                            activeAction.page, activeAction.totalPages, "error", activeAction.retry, errorType
+                        )
+                    }
+                }
                 status.text = if (activeAction != null) {
                     "목록 ${activeAction.page}/${activeAction.totalPages}쪽 최종 실패 / 다음 페이지 계속"
                 } else {
@@ -1058,14 +1076,21 @@ class MainActivity : Activity() {
             tableFingerprint(snapshot)?.let { batchLastTableSignatures[canonicalizeBatchUrl(snapshot.optString("url"))] = it }
             val pageRecords = normalizeSnapshot(snapshot)
             RecordUtils.appendUniqueRecords(batchRecords, pageRecords)
-            cloudOffload.uploadPage(
-                provider = provider.wireName,
-                records = pageRecords,
-                familyKey = activeAction?.familyKey ?: plan?.familyKey,
-                requestedYear = activeAction?.requestedYear ?: plan?.requestedYear,
-                page = activeAction?.page ?: if (plan != null) 1 else null,
-                retryCount = activeAction?.retry ?: 0
-            )
+            localRunId?.let { runId ->
+                batchLocalRecordsPersisted += localStore.storeRecords(runId, provider.wireName, pageRecords)
+                val navKey = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
+                localStore.markDocument(runId, navKey, "completed")
+                when {
+                    activeAction != null -> localStore.markPage(
+                        runId, activeAction.familyKey, activeAction.requestedYear,
+                        activeAction.page, activeAction.totalPages, "completed", activeAction.retry
+                    )
+                    plan != null -> localStore.markPage(
+                        runId, plan.familyKey, plan.requestedYear,
+                        1, plan.totalPages, "completed", 0
+                    )
+                }
+            }
             RecordUtils.appendUniqueResources(batchResources, snapshot.optJSONArray("resourceLinks") ?: JSONArray())
 
             if (activeAction == null) {
@@ -1127,7 +1152,20 @@ class MainActivity : Activity() {
             webView.loadUrl(next)
             return
         }
-        verifyCloudCompletionOrFinish()
+        if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) verifyLocalCompletionOrFinish()
+        else verifyCloudCompletionOrFinish()
+    }
+
+    private fun verifyLocalCompletionOrFinish() {
+        if (!batchRunning || batchPausedForLogin) return
+        val runId = localRunId
+        if (runId == null) {
+            finishBatch("completed")
+            return
+        }
+        val unresolved = localStore.unresolvedCount(runId)
+        if (unresolved > 0) finishBatch("completed-with-local-errors")
+        else finishBatch("completed")
     }
 
     private fun verifyCloudCompletionOrFinish(drainAttempt: Int = 0) {
@@ -1254,14 +1292,13 @@ class MainActivity : Activity() {
             .put("requestedYear", action.requestedYear ?: JSONObject.NULL)
             .put("retryCount", action.retry)
         batchErrors.put(error)
-        cloudOffload.uploadError(
-            provider = provider.wireName,
-            familyKey = action.familyKey,
-            requestedYear = action.requestedYear,
-            page = action.page,
-            retryCount = action.retry,
-            error = error
-        )
+        localRunId?.let { runId ->
+            localStore.markPage(
+                runId, action.familyKey, action.requestedYear,
+                action.page, action.totalPages, "error", action.retry, type
+            )
+            localStore.markDocument(runId, canonicalizeBatchUrl(action.baseUrl), "error", action.retry, type)
+        }
     }
 
     private fun pageActionStatus(action: BatchPageAction, suffix: String): String {
@@ -1367,9 +1404,17 @@ class MainActivity : Activity() {
         hideBatchCover()
         stopCollectionKeepAlive()
         batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
-        val effectiveReason = if (reason == "completed" && batchCloudPagesDeferred > 0) "completed-with-deferred-errors" else reason
+        val effectiveReason = if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
+            reason
+        } else if (reason == "completed" && batchCloudPagesDeferred > 0) {
+            "completed-with-deferred-errors"
+        } else reason
+        localRunId?.let { runId ->
+            val runState = if (effectiveReason == "completed" && localStore.unresolvedCount(runId) == 0) "completed" else "incomplete"
+            localStore.markRun(runId, runState, effectiveReason)
+        }
         finalizeBatchJson(effectiveReason)
-        if (effectiveReason == "completed" && batchCloudPagesDeferred == 0) {
+        if (!LOCAL_FIRST_BETA && effectiveReason == "completed" && batchCloudPagesDeferred == 0) {
             cloudOffload.finish(
                 reason = effectiveReason,
                 summary = JSONObject()
@@ -1385,6 +1430,10 @@ class MainActivity : Activity() {
             )
         }
         status.text = when {
+            LOCAL_FIRST_BETA && effectiveReason == "completed-with-local-errors" ->
+                "Local-First 1차 순회 종료: 미해결 오류는 로컬에 저장됨 / 다음 실행에서 해당 지점만 재개합니다."
+            LOCAL_FIRST_BETA && effectiveReason == "completed" ->
+                "어디가 로컬 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 재시도 $batchPaginationRetries / 로컬 레코드 ${localRunId?.let { localStore.stats(it).optInt("records") } ?: batchRecords.length()}"
             effectiveReason == "cloud-verification-failed" ->
                 "로컬 수집 종료: Cloud 최종 완결성 확인 실패 / 서버 run은 닫지 않고 유지합니다."
             batchCloudPagesDeferred > 0 ->
@@ -1395,6 +1444,8 @@ class MainActivity : Activity() {
     }
 
     private fun finalizeBatchJson(reason: String) {
+        val persistedRecords = localRunId?.let { localStore.loadRecords(it) } ?: batchRecords
+        val localStats = localRunId?.let { localStore.stats(it) } ?: JSONObject()
         val out = JSONObject()
             .put("collectorVersion", VERSION)
             .put("provider", provider.wireName)
@@ -1405,7 +1456,7 @@ class MainActivity : Activity() {
                 .put("attemptedPages", batchPageCount)
                 .put("successfulPages", batchSnapshots.length())
                 .put("errorPages", batchErrors.length())
-                .put("records", batchRecords.length())
+                .put("records", persistedRecords.length())
                 .put("resourceLinks", batchResources.length())
                 .put("paginationActionsCompleted", batchPageActionVisited.size)
                 .put("paginationActionsFailed", batchPageActionFailed.size)
@@ -1418,12 +1469,21 @@ class MainActivity : Activity() {
                 .put("contextRecoveries", batchContextRecoveries)
                 .put("collectionTransport", "authenticated-webview-covered")
                 .put("duplicateYearViewsSkipped", batchDuplicateYearViews.length())
-                .put("dynamicSearchBootstraps", batchBootstrapSearchAttempted.size))
+                .put("dynamicSearchBootstraps", batchBootstrapSearchAttempted.size)
+                .put("localResumePlans", batchLocalResumePlans)
+                .put("localPagesScheduled", batchLocalPagesScheduled)
+                .put("localPagesSkipped", batchLocalPagesSkipped)
+                .put("localRecordsPersistedThisSegment", batchLocalRecordsPersisted))
+            .put("localFirst", JSONObject()
+                .put("enabled", LOCAL_FIRST_BETA)
+                .put("cloudRequestsDuringBatch", 0)
+                .put("snapshotScope", "current-process-segment")
+                .put("stats", localStats))
             .put("errors", batchErrors)
             .put("retryEvents", batchRetryEvents)
             .put("duplicateYearViews", batchDuplicateYearViews)
-            .put("cloudOffload", cloudOffload.snapshotStatus())
-            .put("records", batchRecords)
+            .put("cloudOffload", JSONObject().put("mode", "disabled-during-v0.4.0-local-first"))
+            .put("records", persistedRecords)
             .put("snapshots", batchSnapshots)
             .put("resourceLinks", batchResources)
         lastJson = out.toString(2)
@@ -1461,6 +1521,8 @@ class MainActivity : Activity() {
         for (rawUrl in currentAdapter().seedUrls()) {
             val url = canonicalizeBatchUrl(rawUrl)
             if (url.isBlank() || !isProviderUrl(url) || batchVisited.contains(url) || batchQueued.contains(url)) continue
+            val runId = localRunId
+            if (runId != null && !currentAdapter().isDynamicListPage(url) && localStore.isDocumentCompleted(runId, url)) continue
             batchQueued.add(url)
             batchQueue.addLast(url)
         }
@@ -1472,6 +1534,8 @@ class MainActivity : Activity() {
             val url = canonicalizeBatchUrl(obj.optString("url"))
             if (url.isBlank() || !isBatchNavigableProviderUrl(url)) continue
             if (batchVisited.contains(url)) continue
+            val runId = localRunId
+            if (runId != null && localStore.isDocumentCompleted(runId, url)) continue
             if (batchQueued.add(url)) batchQueue.addLast(url)
             if (batchQueue.size + batchVisited.size >= MAX_BATCH_PAGES * 2) break
         }
@@ -1491,6 +1555,21 @@ class MainActivity : Activity() {
         val planKey = "${plan.familyKey}|year=${plan.requestedYear ?: "unknown"}|${plan.totalItems}|${plan.pageSize}|${plan.totalPages}"
         if (!batchPaginationPlanned.add(planKey)) return
 
+        if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
+            val runId = localRunId
+            if (runId == null) {
+                enqueuePageActions(baseUrl, plan, (2..plan.totalPages).toList())
+                return
+            }
+            val localPlan = localStore.resumePlan(runId, plan.familyKey, plan.requestedYear, plan.totalPages)
+            val pages = (localPlan.retry + localPlan.missing).distinct().sorted()
+            batchLocalResumePlans += 1
+            batchLocalPagesScheduled += pages.size
+            batchLocalPagesSkipped += localPlan.completedCount
+            status.text = "Local resume: ${pages.size}쪽 수집 / ${localPlan.completedCount}쪽 완료로 건너뜀"
+            enqueuePageActions(baseUrl, plan, pages)
+            return
+        }
         if (!cloudOffload.isConfigured()) {
             enqueuePageActions(baseUrl, plan, (2..plan.totalPages).toList())
             return
@@ -1673,12 +1752,11 @@ class MainActivity : Activity() {
         CookieManager.getInstance().flush()
         stopCollectionKeepAlive()
         cloudOffload.shutdown()
+        localStore.close()
         if (::webView.isInitialized) {
             webView.stopLoading()
             webView.destroy()
         }
-        webView.stopLoading()
-        webView.destroy()
         super.onDestroy()
     }
 }

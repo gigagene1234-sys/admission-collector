@@ -89,6 +89,29 @@ object SnapshotScript {
     return '';
   }
 
+  function inferAcademicYear(){
+    try{
+      var q=new URL(location.href).searchParams.get('searchSyr');
+      if(/^20[0-9]{2}$/.test(String(q||''))) return String(q);
+    }catch(e){}
+    var controls=document.querySelectorAll('[name=searchSyr],#searchSyr,select[name*=Syr],input[name*=Syr]');
+    for(var i=0;i<controls.length;i++){
+      var v=String(controls[i].value||'').trim();
+      if(/^20[0-9]{2}$/.test(v)) return v;
+    }
+    var m=(document.body&&document.body.innerText?document.body.innerText:'').match(/(20[0-9]{2})학년도/);
+    return m?m[1]:'';
+  }
+  function inferredUniversityDetailRoute(script){
+    if(!/\/ucp\/uvt\/uni\/univView\.do$/i.test(location.pathname)) return '';
+    script=String(script||'');
+    var codeMatch=script.match(/\b(0[0-9]{6})\b/);
+    if(!codeMatch) return '';
+    var year=inferAcademicYear();
+    if(!year) return '';
+    return location.origin+'/ucp/uvt/uni/univDetailSelection.do?menuId=PCUVTINF2000&searchSyr='+encodeURIComponent(year)+'&unvCd='+encodeURIComponent(codeMatch[1]);
+  }
+
   var forbidden=/password|passwd|cookie|session|token|csrf|transkey|captcha|credential|secret/i;
   var loginSensitive=/(아이디|비밀번호|로그인|로그아웃|회원정보|마이페이지|account|sign[ -]?in|sign[ -]?out)/i;
   var admissionTerms=/(대학|대학교|학과|학부|전공|모집|전형|입시|입결|성적|환산|등급|경쟁률|합격|예측|지원|교과|종합|면접|수능|최저|50%|70%|칸수|모집요강|전년도|202[0-9])/i;
@@ -125,20 +148,21 @@ object SnapshotScript {
   }
 
   var tables=[];
+  var captureHiddenDetail=/\/(?:ucp\/uvt\/uni\/univDetailSelection|uct\/acd\/ade\/criteriaAndResultPopup)\.do$/i.test(location.pathname);
   var tableNodes=document.querySelectorAll('table,[role=table]');
-  for(var ti=0;ti<tableNodes.length && tables.length<50;ti++){
+  for(var ti=0;ti<tableNodes.length && tables.length<120;ti++){
     var table=tableNodes[ti];
-    if(!visible(table)) continue;
+    if(!captureHiddenDetail && !visible(table)) continue;
     var rows=[];
     var trNodes=table.querySelectorAll('tr,[role=row]');
     for(var ri=0;ri<trNodes.length && rows.length<250;ri++){
       var tr=trNodes[ri];
-      if(!visible(tr)) continue;
+      if(!captureHiddenDetail && !visible(tr)) continue;
       var cells=[];
       var cellNodes=tr.querySelectorAll('th,td,[role=columnheader],[role=cell]');
       for(var ci=0;ci<cellNodes.length && cells.length<40;ci++){
         var cell=cellNodes[ci];
-        if(!visible(cell)) continue;
+        if(!captureHiddenDetail && !visible(cell)) continue;
         var cellText=safeCloneText(cell,1200);
         if(cellText && !forbidden.test(cellText.substring(0,160))) cells.push(cellText);
       }
@@ -204,6 +228,10 @@ object SnapshotScript {
     if(raw && directUrlish && raw!=='#') route=fullNavigationUrl(raw);
     if(!route && onclick){ route=routeFromScript(onclick); if(route) scriptCandidates++; }
     if(!route && /^javascript:/i.test(raw)){ route=routeFromScript(raw); if(route) scriptCandidates++; }
+    if(!route){
+      route=inferredUniversityDetailRoute(scriptText+' '+dataRaw+' '+raw);
+      if(route) scriptCandidates++;
+    }
 
     var resourceRaw=(raw && directUrlish) ? raw : (route||'');
     var exportUrl=safeExportUrl(resourceRaw);
@@ -224,7 +252,7 @@ object SnapshotScript {
     if(seenNav[route]) continue;
     nav.push({label:label,url:route,exportUrl:safeExportUrl(route)});
     seenNav[route]=1;
-    if(nav.length>=240) break;
+    if(nav.length>=700) break;
   }
 
   var totalMatch=bodyText.match(/총\s*([0-9,]+)\s*건/);
