@@ -116,7 +116,7 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.3.8"
+        private const val VERSION = "0.3.9"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -132,6 +132,16 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(10, 10, 10, 10)
         }
+
+        root.addView(TextView(this).apply {
+            text = "Admission Collector v$VERSION · build 10039"
+            gravity = Gravity.CENTER
+            textSize = 13f
+            setPadding(8, 6, 8, 6)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
 
         val tabs = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
