@@ -1533,12 +1533,34 @@ class MainActivity : Activity() {
             val obj = links.optJSONObject(i) ?: continue
             val url = canonicalizeBatchUrl(obj.optString("url"))
             if (url.isBlank() || !isBatchNavigableProviderUrl(url)) continue
-            if (batchVisited.contains(url)) continue
-            val runId = localRunId
-            if (runId != null && localStore.isDocumentCompleted(runId, url)) continue
-            if (batchQueued.add(url)) batchQueue.addLast(url)
+            enqueueDiscoveredUrl(url)
+            // One 2027 university-list pass is enough to discover university codes.
+            // Mirror each 2027 university detail to 2026 so the same university's
+            // 2025 actual-result section is collected without crawling the huge
+            // duplicate 2026 department list.
+            historicalMirrorUrl(url)?.let { mirror -> enqueueDiscoveredUrl(mirror) }
             if (batchQueue.size + batchVisited.size >= MAX_BATCH_PAGES * 2) break
         }
+    }
+
+    private fun enqueueDiscoveredUrl(url: String) {
+        if (url.isBlank() || !isBatchNavigableProviderUrl(url)) return
+        if (batchVisited.contains(url)) return
+        val runId = localRunId
+        if (runId != null && localStore.isDocumentCompleted(runId, url)) return
+        if (batchQueued.add(url)) batchQueue.addLast(url)
+    }
+
+    private fun historicalMirrorUrl(url: String): String? {
+        if (provider != ProviderId.ADIGA) return null
+        return try {
+            val uri = Uri.parse(url)
+            if (uri.path != "/ucp/uvt/uni/univDetailSelection.do") return null
+            if (uri.getQueryParameter("searchSyr") != "2027") return null
+            val code = uri.getQueryParameter("unvCd")?.trim().orEmpty()
+            if (!Regex("^0[0-9]{6}$").matches(code)) return null
+            canonicalizeBatchUrl(withQueryParameter(url, "searchSyr", "2026"))
+        } catch (_: Exception) { null }
     }
 
     private fun tableFingerprint(snapshot: JSONObject): String? {
