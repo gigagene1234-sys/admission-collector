@@ -112,6 +112,9 @@ class MainActivity : Activity() {
     private var batchLocalPagesSkipped = 0
     private var batchLocalRecordsPersisted = 0
     private var localRunId: String? = null
+    private val batchPersistedPageSignatureOwners = linkedMapOf<String, MutableMap<String, Int>>()
+    private var batchAuditPagesScheduled = 0
+    private var batchUniversityDiscoveryPagesScheduled = 0
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
@@ -123,8 +126,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.4.0"
-        private const val BUILD_CODE = 10400
+        private const val VERSION = "0.4.1"
+        private const val BUILD_CODE = 10410
         private const val LOCAL_FIRST_BETA = true
     }
 
@@ -575,6 +578,9 @@ class MainActivity : Activity() {
         batchLocalPagesScheduled = 0
         batchLocalPagesSkipped = 0
         batchLocalRecordsPersisted = 0
+        batchAuditPagesScheduled = 0
+        batchUniversityDiscoveryPagesScheduled = 0
+        batchPersistedPageSignatureOwners.clear()
         disarmBatchNavigationWatchdog()
         currentBatchTarget = canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
@@ -1072,10 +1078,24 @@ class MainActivity : Activity() {
 
             if (plan != null) registerListFingerprint(plan)
 
-            batchSnapshots.put(stripNavigationLinksForExport(snapshot))
-            tableFingerprint(snapshot)?.let { batchLastTableSignatures[canonicalizeBatchUrl(snapshot.optString("url"))] = it }
             val pageRecords = normalizeSnapshot(snapshot)
-            RecordUtils.appendUniqueRecords(batchRecords, pageRecords)
+            if (activeAction != null && LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
+                val duplicateOwner = persistedDuplicatePageOwner(activeAction, pageRecords)
+                if (duplicateOwner != null && duplicateOwner != activeAction.page) {
+                    activeBatchPageAction = null
+                    status.text = "페이지 ${activeAction.page} 내용이 기존 ${duplicateOwner}쪽과 동일함: stale 응답으로 판정 후 재시도"
+                    schedulePageActionRetry(activeAction, "stale-pagination-content")
+                    return@collectSnapshot
+                }
+            }
+
+            batchSnapshots.put(snapshotForLocalExport(snapshot))
+            tableFingerprint(snapshot)?.let { batchLastTableSignatures[canonicalizeBatchUrl(snapshot.optString("url"))] = it }
+            // University detail records can be large. SQLite is the authoritative local store;
+            // avoid keeping a second in-memory copy during the long detail crawl.
+            if (!(LOCAL_FIRST_BETA && snapshot.optString("providerPageType") == "adiga-university-detail")) {
+                RecordUtils.appendUniqueRecords(batchRecords, pageRecords)
+            }
             localRunId?.let { runId ->
                 batchLocalRecordsPersisted += localStore.storeRecords(runId, provider.wireName, pageRecords)
                 val navKey = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
@@ -1091,10 +1111,17 @@ class MainActivity : Activity() {
                     )
                 }
             }
+            if (activeAction != null) rememberAcceptedPageSignature(activeAction, pageRecords)
             RecordUtils.appendUniqueResources(batchResources, snapshot.optJSONArray("resourceLinks") ?: JSONArray())
 
-            if (activeAction == null) {
+            // v0.4.0 only followed links from page 1 because pagination actions skipped
+            // discovery. University-list pagination is safe and bounded (220 universities),
+            // so collect detail URLs from every university-list page as well.
+            val pageType = snapshot.optString("providerPageType")
+            if (activeAction == null || pageType == "adiga-university-list") {
                 enqueueDiscoveredLinks(snapshot.optJSONArray("navigationLinks") ?: JSONArray())
+            }
+            if (activeAction == null) {
                 if (plan != null) enqueueCalculatedPageActions(snapshot, plan)
             } else {
                 batchPageActionVisited.add(pageActionKey(activeAction))
@@ -1113,6 +1140,99 @@ class MainActivity : Activity() {
                 handler.postDelayed({ loadNextBatchPage() }, 350)
             }
         }
+    }
+
+    private fun snapshotForLocalExport(snapshot: JSONObject): JSONObject {
+        if (!(LOCAL_FIRST_BETA && provider == ProviderId.ADIGA &&
+                snapshot.optString("providerPageType") == "adiga-university-detail")) {
+            return stripNavigationLinksForExport(snapshot)
+        }
+        // Detailed tables are already normalized into durable SQLite records. Keep only
+        // lightweight diagnostics here to prevent hundreds of university details from
+        // being duplicated in RAM and again in the exported JSON.
+        return JSONObject()
+            .put("title", snapshot.optString("title"))
+            .put("url", snapshot.optString("url"))
+            .put("collectedAt", snapshot.optString("collectedAt"))
+            .put("providerPageType", snapshot.optString("providerPageType"))
+            .put("collectionPage", snapshot.optInt("collectionPage", 1))
+            .put("pageState", snapshot.optJSONObject("pageState") ?: JSONObject())
+            .put("listMeta", snapshot.optJSONObject("listMeta") ?: JSONObject())
+            .put("discovery", snapshot.optJSONObject("discovery") ?: JSONObject())
+    }
+
+    private fun pageAuditCacheKey(familyKey: String, requestedYear: Int?): String =
+        "$familyKey|year=${requestedYear ?: "unknown"}"
+
+    private fun stableRecordMaterial(obj: JSONObject): String = listOf(
+        obj.optString("recordType"),
+        obj.optString("university"),
+        obj.optString("department"),
+        obj.optString("admission"),
+        obj.optString("rawEvidence")
+    ).joinToString("|")
+
+    private fun normalizedPageSignature(records: JSONArray): String? {
+        if (records.length() == 0) return null
+        val parts = mutableListOf<String>()
+        for (i in 0 until records.length()) {
+            records.optJSONObject(i)?.let { parts += stableRecordMaterial(it) }
+        }
+        if (parts.isEmpty()) return null
+        return RecordUtils.sha256(parts.sorted().joinToString("\n"))
+    }
+
+    private fun persistedPageSignatureOwners(action: BatchPageAction): MutableMap<String, Int> {
+        val runId = localRunId ?: return linkedMapOf()
+        val cacheKey = pageAuditCacheKey(action.familyKey, action.requestedYear)
+        batchPersistedPageSignatureOwners[cacheKey]?.let { return it }
+
+        val familyPath = action.familyKey.substringBefore('?')
+        val grouped = linkedMapOf<Int, MutableList<String>>()
+        val stored = localStore.loadRecords(runId)
+        for (i in 0 until stored.length()) {
+            val obj = stored.optJSONObject(i) ?: continue
+            val source = obj.optString("sourcePage")
+            if (!source.contains(familyPath)) continue
+            if (action.requestedYear != null) {
+                if (obj.isNull("year") || obj.optInt("year", -1) != action.requestedYear) continue
+            }
+            val page = obj.optInt("sourcePageNumber", -1)
+            if (page < 1) continue
+            grouped.getOrPut(page) { mutableListOf() }.add(stableRecordMaterial(obj))
+        }
+        val owners = linkedMapOf<String, Int>()
+        for ((page, parts) in grouped) {
+            if (parts.isNotEmpty()) owners[RecordUtils.sha256(parts.sorted().joinToString("\n"))] = page
+        }
+        batchPersistedPageSignatureOwners[cacheKey] = owners
+        return owners
+    }
+
+    private fun persistedPagesWithRecords(runId: String, familyKey: String, requestedYear: Int?): Set<Int> {
+        val familyPath = familyKey.substringBefore('?')
+        val pages = linkedSetOf<Int>()
+        val stored = localStore.loadRecords(runId)
+        for (i in 0 until stored.length()) {
+            val obj = stored.optJSONObject(i) ?: continue
+            if (!obj.optString("sourcePage").contains(familyPath)) continue
+            if (requestedYear != null) {
+                if (obj.isNull("year") || obj.optInt("year", -1) != requestedYear) continue
+            }
+            val page = obj.optInt("sourcePageNumber", -1)
+            if (page >= 1) pages.add(page)
+        }
+        return pages
+    }
+
+    private fun persistedDuplicatePageOwner(action: BatchPageAction, records: JSONArray): Int? {
+        val signature = normalizedPageSignature(records) ?: return null
+        return persistedPageSignatureOwners(action)[signature]
+    }
+
+    private fun rememberAcceptedPageSignature(action: BatchPageAction, records: JSONArray) {
+        val signature = normalizedPageSignature(records) ?: return
+        persistedPageSignatureOwners(action)[signature] = action.page
     }
 
     private fun loadNextBatchPage() {
@@ -1473,7 +1593,9 @@ class MainActivity : Activity() {
                 .put("localResumePlans", batchLocalResumePlans)
                 .put("localPagesScheduled", batchLocalPagesScheduled)
                 .put("localPagesSkipped", batchLocalPagesSkipped)
-                .put("localRecordsPersistedThisSegment", batchLocalRecordsPersisted))
+                .put("localRecordsPersistedThisSegment", batchLocalRecordsPersisted)
+                .put("localAuditPagesScheduled", batchAuditPagesScheduled)
+                .put("universityDiscoveryPagesScheduled", batchUniversityDiscoveryPagesScheduled))
             .put("localFirst", JSONObject()
                 .put("enabled", LOCAL_FIRST_BETA)
                 .put("cloudRequestsDuringBatch", 0)
@@ -1584,12 +1706,38 @@ class MainActivity : Activity() {
                 return
             }
             val localPlan = localStore.resumePlan(runId, plan.familyKey, plan.requestedYear, plan.totalPages)
-            val pages = (localPlan.retry + localPlan.missing).distinct().sorted()
+            val pages = linkedSetOf<Int>()
+            pages.addAll(localPlan.retry)
+            pages.addAll(localPlan.missing)
+
+            // Checkpoint state alone is insufficient: v0.4.0 proved that a stale AJAX
+            // response could be marked completed while another page's rows were stored.
+            // Re-open any checkpoint that has no persisted row evidence, plus neighbors
+            // so stale-content detection has a reference page on either side.
+            val evidencePages = persistedPagesWithRecords(runId, plan.familyKey, plan.requestedYear)
+            val evidenceMissing = (2..plan.totalPages).filter { it !in evidencePages }
+            for (page in evidenceMissing) {
+                for (candidate in (page - 1)..(page + 1)) {
+                    if (candidate in 2..plan.totalPages) pages.add(candidate)
+                }
+            }
+            batchAuditPagesScheduled += evidenceMissing.size
+
+            // v0.4.0 already has all 220 university summary rows, but only page 1 links
+            // were followed. Revisit the 21 remaining 2027 university-list pages solely
+            // to discover detail URLs; completed detail documents are still skipped.
+            if (plan.familyKey.contains("/ucp/uvt/uni/univView.do") && plan.requestedYear == 2027) {
+                val discoveryPages = (2..plan.totalPages).toList()
+                pages.addAll(discoveryPages)
+                batchUniversityDiscoveryPagesScheduled += discoveryPages.size
+            }
+
+            val sortedPages = pages.distinct().sorted()
             batchLocalResumePlans += 1
-            batchLocalPagesScheduled += pages.size
-            batchLocalPagesSkipped += localPlan.completedCount
-            status.text = "Local resume: ${pages.size}쪽 수집 / ${localPlan.completedCount}쪽 완료로 건너뜀"
-            enqueuePageActions(baseUrl, plan, pages)
+            batchLocalPagesScheduled += sortedPages.size
+            batchLocalPagesSkipped += (plan.totalPages - 1 - sortedPages.size).coerceAtLeast(0)
+            status.text = "Local audit/resume: ${sortedPages.size}쪽 수집 / 증거누락 ${evidenceMissing.size}쪽 / 대학상세 발견 ${batchUniversityDiscoveryPagesScheduled}쪽"
+            enqueuePageActions(baseUrl, plan, sortedPages)
             return
         }
         if (!cloudOffload.isConfigured()) {
