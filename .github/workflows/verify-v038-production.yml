@@ -7,7 +7,7 @@ on:
       - ".github/workflows/verify-v038-production.yml"
   workflow_dispatch:
 
-# Recheck after Android run observed at 2026-08-29 12:31 KST.
+# Final recheck after legacy-client hardening deployment.
 jobs:
   verify:
     runs-on: ubuntu-latest
