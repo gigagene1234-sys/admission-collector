@@ -34,7 +34,7 @@ jobs:
           RUN_ID="$(printf '%s' "$LATEST" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(!j.runId)throw new Error('No Adiga run: '+s);process.stdout.write(j.runId)})")"
           PENDING="$(curl --fail --silent --show-error "$WORKER_URL/v1/runs/$RUN_ID/pending-pages?limit=500" -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN")"
           printf '%s' "$PENDING" | tee /tmp/pending.json
-          printf '%s' "$PENDING" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);const got=(j.retry||[]).filter(x=>x.requestedYear===2027).map(x=>x.page).sort((a,b)=>a-b);const expected=[496,498,499,500];if(j.pendingCount!==4||JSON.stringify(got)!==JSON.stringify(expected))throw new Error('Unexpected pending state: '+s);console.log('Verified pending:',got.join(','))})"
+          printf '%s' "$PENDING" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);const all=[...(j.retry||[]),...(j.deferred||[])].filter(x=>x.requestedYear===2027).map(x=>x.page).sort((a,b)=>a-b);const expected=[496,498,499,500];if(j.pendingCount!==4||JSON.stringify(all)!==JSON.stringify(expected))throw new Error('Unexpected pending state: '+s);console.log('Verified pending set:',all.join(','),'retry=',j.retryCount,'deferred=',j.deferredCount)})"
       - name: Verify fingerprint hardening
         working-directory: cloudflare
         shell: bash
