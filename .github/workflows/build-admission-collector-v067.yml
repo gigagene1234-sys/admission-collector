@@ -1,0 +1,185 @@
+name: Build Admission Collector v0.6.7 Targeted Jinhak Analyzer
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v067.yml"
+      - "scripts/apply_v067.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip ci]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.6.7 patch
+        run: python3 scripts/apply_v067.py
+
+      - name: Verify v0.6.7 source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp -s MainActivity.kt app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          grep -q 'private const val VERSION = "0.6.7"' MainActivity.kt
+          grep -q 'private const val BUILD_CODE = 10670' MainActivity.kt
+          grep -q 'versionCode = 10670' app/build.gradle.kts
+          grep -q 'versionName = "0.6.7"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.6.7 Targeted Jinhak Analyzer' app/src/main/AndroidManifest.xml
+          grep -q 'override val supportsBatchCrawl = false' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'override fun isBatchNavigable(url: String): Boolean = false' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'jinhak-university-admission-info' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'jinhak-editorial-content' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'jinhak-navigation-error' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'jinhak-historical-competition' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'compact-recommendation-card' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'private fun isJinhakAutoCaptureRelevant' MainActivity.kt
+          grep -q 'collectCurrentPage(autoUnified = true)' MainActivity.kt
+          grep -q 'jinhak-nonadmission-page-skipped' MainActivity.kt
+          grep -q 'analysisRelevance' MainActivity.kt
+          grep -q 'fun writeUnifiedExport' app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
+          grep -q 'version: "0.3.9"' cloudflare/src/index.js
+
+      - name: Verify Jinhak service boundary and parser fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          j=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          if 'override val supportsBatchCrawl = true' in j:
+              raise SystemExit('Jinhak batch crawl accidentally enabled')
+          if 'override fun isBatchNavigable(url: String): Boolean = false' not in j:
+              raise SystemExit('Jinhak batch navigation not hard-disabled')
+
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          a=m.index('if (unifiedRunning && unifiedPhase == "jinhak" && unifiedPendingJinhakStart')
+          b=m.index('if (!batchRunning && unifiedRunning && unifiedPhase == "jinhak"', a)
+          pending=m[a:b]
+          if 'startBatch()' in pending:
+              raise SystemExit('Unified Jinhak transition still starts autonomous crawler')
+          if 'scheduleUnifiedJinhakAutoCapture(url)' not in pending:
+              raise SystemExit('User-navigation auto capture not wired')
+
+          # Fixtures derived from sanitized v0.6.6 screen text, with no personal identifiers.
+          title='충남대학교에 대한 모든 입시정보 | 대학정보 | 진학사'
+          if not re.search(r'^.{2,100}에 대한 모든 입시정보\s*\|\s*대학정보\s*\|\s*진학사$', title):
+              raise SystemExit('university admission-info title fixture failed')
+          editorial='대학알리미 취업률 순위 | 대학 심층분석 | 진학사'
+          if not re.search(r'(학과\s*심층분석|대학\s*심층분석|대학학과\s*심층분석|지도로\s*보는\s*대학|대학교\s*지도|캠퍼스맵)', editorial):
+              raise SystemExit('editorial fixture failed')
+          card='7칸건국대(GLOCAL)[교과]교과우수바이오메디컬공27명내 점수858.108점 수시합격가능성적정전형방법학생부(100)리포트'
+          um=re.search(r'^(?:[0-9]{1,2}\s*칸\s*)?([가-힣A-Za-z0-9·.&+\-]+(?:\([^)]+\))?)(?=\[)', card)
+          if not um or um.group(1) != '건국대(GLOCAL)':
+              raise SystemExit('recommendation university fixture failed')
+          if not re.search(r'([0-9,]+)\s*명\s*내\s*점수', card):
+              raise SystemExit('recommendation capacity fixture failed')
+          if not re.search(r'(?:합격예측|합격가능성|지원판정|지원전략)?\s*[:：]?\s*(안정지원|안정|적정지원|적정|소신지원|소신|위험|상향|하향|불안)', card):
+              raise SystemExit('recommendation prediction label fixture failed')
+
+          # Preserve memory-safe v0.6.6 finish.
+          a=m.index('    private fun finishUnifiedCollection(')
+          b=m.index('    private fun isAdigaBlockingErrorMessage', a)
+          finish=m[a:b]
+          if 'buildUnifiedExport(' in finish or 'stopBatch(' in finish:
+              raise SystemExit('memory-safe finish regression')
+          if 'stopBatchForUnifiedFinish' not in finish:
+              raise SystemExit('lightweight unified stop missing')
+
+          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          a=snap.index('    function departmentContextFor(el,rootText){')
+          b=snap.index('    function universityContextFor(el,rootText){', a)
+          section=snap[a:b]
+          for forbidden in ['previousElementSibling','nextElementSibling','structuredCardText(prev','structuredCardText(next']:
+              if forbidden in section:
+                  raise SystemExit(f'cross-card department inheritance reintroduced: {forbidden}')
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -pass env:ANDROID_SIGNING_SECRET \
+            -in signing/admission-upload.keystore.enc \
+            -out "$STORE"
+          keytool -list -keystore "$STORE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build v0.6.7 APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "versionCode='10670'" /tmp/badging.txt
+          grep -q "versionName='0.6.7'" /tmp/badging.txt
+          sha256sum "$APK" | tee /tmp/apk.sha256
+
+      - name: Persist generated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt \
+            scripts/apply_v067.py
+          if git diff --cached --quiet; then
+            echo "source already persisted"
+          else
+            git commit -m "Apply v0.6.7 targeted Jinhak analyzer [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-v0.6.7-targeted-jinhak-analyzer-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
