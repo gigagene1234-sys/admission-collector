@@ -1,0 +1,120 @@
+name: Build Admission Collector v0.5.5 Jinhak University Context
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v055.yml"
+      - "scripts/apply_v055.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip ci]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.5.5 patch
+        run: python3 scripts/apply_v055.py
+
+      - name: Verify source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp -s MainActivity.kt app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          grep -q 'private const val VERSION = "0.5.5"' MainActivity.kt
+          grep -q 'private const val BUILD_CODE = 10550' MainActivity.kt
+          grep -q 'universityBoundRoots' app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          grep -q 'cleanStorageUniversity' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'bindingStats' MainActivity.kt
+          grep -q 'versionCode = 10550' app/build.gradle.kts
+          grep -q 'versionName = "0.5.5"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.5.5 Jinhak' app/src/main/AndroidManifest.xml
+          grep -q 'version: "0.3.9"' cloudflare/src/index.js
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -pass env:ANDROID_SIGNING_SECRET \
+            -in signing/admission-upload.keystore.enc \
+            -out "$STORE"
+          keytool -list -keystore "$STORE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build v0.5.5 APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "versionCode='10550'" /tmp/badging.txt
+          grep -q "versionName='0.5.5'" /tmp/badging.txt
+          sha256sum "$APK" | tee /tmp/apk.sha256
+
+      - name: Persist generated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
+            app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt \
+            scripts/apply_v055.py
+          if git diff --cached --quiet; then
+            echo "source already persisted"
+          else
+            git commit -m "Apply v0.5.5 Jinhak university-context binding [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-v0.5.5-jinhak-university-context-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
