@@ -1,0 +1,29 @@
+name: Admission Collector Quality Gates
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt"
+      - "app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt"
+      - "scripts/verify_embedded_snapshot_js.py"
+      - ".github/workflows/quality-gates.yml"
+  pull_request:
+    paths:
+      - "app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt"
+      - "app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt"
+      - "scripts/verify_embedded_snapshot_js.py"
+      - ".github/workflows/quality-gates.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parser-static-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify embedded JavaScript and Jinhak service boundary
+        run: python3 scripts/verify_embedded_snapshot_js.py
