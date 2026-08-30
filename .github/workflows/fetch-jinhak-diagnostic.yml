@@ -44,3 +44,5 @@ jobs:
           path: out/jinhak-diagnostic-sanitized.json
           if-no-files-found: error
           retention-days: 2
+
+# manual refresh: 2026-08-30T17:29+09:00
