@@ -12,12 +12,12 @@ for line in lines:
         if line.rstrip().endswith('"),'):
             idx = line.rfind('"),')
             line = line[:idx] + '"""),' + line[idx+3:]
-    if 'val polluted = Regex("' in line:
+    if 'val polluted = Regex("' in line and 'Regex("""' not in line:
         line = line.replace('Regex("', 'Regex("""', 1)
         idx = line.rfind('")')
         if idx >= 0:
             line = line[:idx] + '""")' + line[idx+2:]
-    if 'val token = Regex("' in line:
+    if 'val token = Regex("' in line and 'Regex("""' not in line:
         line = line.replace('Regex("', 'Regex("""', 1)
         idx = line.rfind('")')
         if idx >= 0:
@@ -25,8 +25,8 @@ for line in lines:
     out.append(line)
 
 fixed = '\n'.join(out) + ('\n' if t.endswith('\n') else '')
-# Guard against the exact illegal literals that caused the previous compile failure.
-for bad in ['Regex("\\s+")', 'Regex("^(?:지역인재교과', 'val polluted = Regex("', 'val token = Regex("']:
+# Guard only exact illegal ordinary-string forms. Raw Kotlin strings intentionally begin Regex(""".
+for bad in ['Regex("\\s+")', 'Regex("^(?:지역인재교과']:
     if bad in fixed:
         raise SystemExit(f'unfixed Kotlin regex literal: {bad}')
 p.write_text(fixed)
