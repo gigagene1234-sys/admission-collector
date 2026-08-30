@@ -10,9 +10,11 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.JsResult
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -131,6 +133,11 @@ class MainActivity : Activity() {
     private val unifiedJinhakCapturedPages = linkedSetOf<String>()
     private var unifiedAutoCaptureScheduled = false
     private var batchSkipSnapshotUntilMs = 0L
+    private var runtimeLastSafePath = ""
+    private var runtimeRendererRecovering = false
+    private var jinhakStallWatchdogGeneration = 0
+    private var jinhakConsecutiveStalls = 0
+    private var jinhakRecoveredStalls = 0
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -140,19 +147,41 @@ class MainActivity : Activity() {
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
         private const val MAX_JINHAK_AUTONAV_PAGES = 420
-        private const val VERSION = "0.6.3"
-        private const val BUILD_CODE = 10630
+        private const val JINHAK_SOFT_STALL_MS = 12_000L
+        private const val JINHAK_HARD_STALL_MS = 24_000L
+        private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
+        private const val RUNTIME_PREFS = "collector_runtime_v064"
+        private const val VERSION = "0.6.4"
+        private const val BUILD_CODE = 10640
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        installRuntimeCrashGuard()
         cloudOffload = CloudOffloadCoordinator(this)
         localStore = LocalCollectorStore(this)
         buildUi()
         configureWebView()
-        openProvider(ProviderId.JINHAK)
+        val resumed = resumeInterruptedUnifiedSessionIfNeeded()
+        if (!resumed) openProvider(ProviderId.JINHAK)
+        handler.postDelayed({ sendPendingRuntimeEvents() }, 1200L)
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_RUNNING_LOW) {
+            recordRuntimeEvent("memory-trim", JSONObject().put("level", level))
+            if (provider == ProviderId.JINHAK) {
+                // SQLite is authoritative. Do not retain large autonomous-crawl copies in RAM.
+                batchSnapshots = JSONArray()
+                batchRecords = JSONArray()
+                batchResources = JSONArray()
+                lastJinhakDigest = JSONObject()
+                lastJson = ""
+            }
+        }
     }
 
     private fun buildUi() {
@@ -319,6 +348,7 @@ class MainActivity : Activity() {
 
     @Suppress("SetJavaScriptEnabled")
     private fun configureWebView() {
+        runtimeRendererRecovering = false
         WebView.setWebContentsDebuggingEnabled(false)
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
@@ -340,6 +370,8 @@ class MainActivity : Activity() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                runtimeLastSafePath = runtimeSafePath(url)
+                persistRuntimeCheckpoint()
                 if (batchRunning && !batchPausedForLogin) {
                     armBatchNavigationWatchdog(url)
                     status.text = "수집 엔진 로딩: ${safeDisplayUrl(url)}"
@@ -395,6 +427,33 @@ class MainActivity : Activity() {
                     status.text = "현재 페이지: ${safeDisplayUrl(url)}"
                     checkSessionState()
                 }
+            }
+
+            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                if (runtimeRendererRecovering) return true
+                runtimeRendererRecovering = true
+                val didCrash = detail?.didCrash() ?: false
+                recordRuntimeEvent(
+                    "webview-renderer-gone",
+                    JSONObject()
+                        .put("didCrash", didCrash)
+                        .put("priorityAtExit", detail?.rendererPriorityAtExit() ?: -1)
+                        .put("batchRunning", batchRunning)
+                )
+                localRunId?.let { runId ->
+                    val key = currentBatchTarget?.let { canonicalizeBatchUrl(it) }.orEmpty()
+                    if (key.isNotBlank()) localStore.markDocument(runId, key, "error", 0, "webview-renderer-gone")
+                }
+                persistRuntimeCheckpoint(forceResume = unifiedRunning)
+                batchRunning = false
+                batchCollecting = false
+                disarmBatchNavigationWatchdog()
+                runCatching {
+                    (view?.parent as? ViewGroup)?.removeView(view)
+                    view?.destroy()
+                }
+                handler.postDelayed({ recreate() }, 250L)
+                return true
             }
         }
 
@@ -608,6 +667,135 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun runtimeSafePath(url: String?): String {
+        if (url.isNullOrBlank()) return ""
+        return try {
+            val uri = Uri.parse(url)
+            val host = uri.host.orEmpty().lowercase()
+            val path = uri.path.orEmpty().ifBlank { "/" }
+            if (host.isBlank()) path.take(300) else "$host$path".take(300)
+        } catch (_: Exception) { "unparseable" }
+    }
+
+    private fun persistRuntimeCheckpoint(forceResume: Boolean = unifiedRunning) {
+        runCatching {
+            getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
+                .putBoolean("resumeUnified", forceResume)
+                .putString("provider", provider.wireName)
+                .putString("phase", unifiedPhase)
+                .putString("safePath", runtimeLastSafePath)
+                .putInt("batchPageCount", batchPageCount)
+                .putInt("queueSize", batchQueue.size)
+                .putInt("errorCount", batchErrors.length())
+                .apply()
+        }
+    }
+
+    private fun recordRuntimeEvent(type: String, detail: JSONObject = JSONObject(), synchronous: Boolean = false) {
+        runCatching {
+            val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
+            val arr = runCatching { JSONArray(prefs.getString("events", "[]")) }.getOrElse { JSONArray() }
+            val event = JSONObject()
+                .put("at", Instant.now().toString())
+                .put("type", type.take(80))
+                .put("collectorVersion", VERSION)
+                .put("provider", provider.wireName)
+                .put("phase", unifiedPhase.take(40))
+                .put("safePath", runtimeLastSafePath.take(300))
+                .put("batchPageCount", batchPageCount)
+                .put("queueSize", batchQueue.size)
+                .put("errorCount", batchErrors.length())
+                .put("detail", detail)
+            arr.put(event)
+            while (arr.length() > 40) arr.remove(0)
+            val editor = prefs.edit().putString("events", arr.toString())
+                .putBoolean("hasPendingEvents", true)
+            if (synchronous) editor.commit() else editor.apply()
+        }
+    }
+
+    private fun installRuntimeCrashGuard() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            runCatching {
+                val frames = JSONArray()
+                throwable.stackTrace.take(18).forEach { frame ->
+                    frames.put("${frame.className}.${frame.methodName}:${frame.lineNumber}".take(220))
+                }
+                recordRuntimeEvent(
+                    "uncaught-exception",
+                    JSONObject()
+                        .put("exceptionClass", throwable.javaClass.name.take(160))
+                        .put("thread", thread.name.take(80))
+                        .put("frames", frames),
+                    synchronous = true
+                )
+                persistRuntimeCheckpoint(forceResume = unifiedRunning)
+            }
+            previous?.uncaughtException(thread, throwable)
+        }
+    }
+
+    private fun sendPendingRuntimeEvents() {
+        val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
+        if (!prefs.getBoolean("hasPendingEvents", false)) return
+        val arr = runCatching { JSONArray(prefs.getString("events", "[]")) }.getOrElse { JSONArray() }
+        if (arr.length() == 0) {
+            prefs.edit().putBoolean("hasPendingEvents", false).apply()
+            return
+        }
+        val payload = JSONObject()
+            .put("schemaVersion", 1)
+            .put("type", "collector-runtime-events")
+            .put("collectorVersion", VERSION)
+            .put("events", arr)
+            .put("privacy", "class-method-stack-and-sanitized-host-path-only-no-query-no-cookie-no-session-token-no-form-values")
+        cloudOffload.sendDiagnostic("runtime", VERSION, payload) { result ->
+            if (result.isSuccess) {
+                prefs.edit().remove("events").putBoolean("hasPendingEvents", false).apply()
+            }
+        }
+    }
+
+    private fun resumeInterruptedUnifiedSessionIfNeeded(): Boolean {
+        val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
+        val requested = prefs.getBoolean("resumeUnified", false)
+        val sessionId = localStore.latestUnifiedSession() ?: return false
+        val session = localStore.unifiedStatus(sessionId)
+        if (!requested || session.optString("status") != "running") return false
+
+        unifiedSessionId = sessionId
+        unifiedRunning = true
+        unifiedPhase = session.optString("phase", "jinhak")
+        unifiedButton.text = "통합 수집 종료"
+        jinhakConsecutiveStalls = 0
+        batchRunning = false
+        batchCollecting = false
+
+        return if (unifiedPhase == "adiga") {
+            provider = ProviderId.ADIGA
+            localRunId = session.optJSONObject("adiga")?.optString("runId")?.takeIf { it.isNotBlank() && it != "null" }
+                ?: localStore.beginOrResume(ProviderId.ADIGA.wireName, VERSION)
+            unifiedPendingAdigaStart = true
+            unifiedPendingJinhakStart = false
+            status.text = "이전 튕김/중단 감지: 어디가 체크포인트에서 통합 수집을 자동 복구합니다."
+            val seed = ProviderRegistry.adapter(ProviderId.ADIGA).seedUrls().firstOrNull() ?: ProviderId.ADIGA.homeUrl
+            webView.loadUrl(seed)
+            true
+        } else {
+            provider = ProviderId.JINHAK
+            unifiedPhase = "jinhak"
+            localRunId = session.optJSONObject("jinhak")?.optString("runId")?.takeIf { it.isNotBlank() && it != "null" }
+                ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
+            unifiedPendingAdigaStart = false
+            unifiedPendingJinhakStart = true
+            unifiedJinhakAutoCapture = true
+            status.text = "이전 튕김/중단 감지: 진학사 완료 체크포인트를 건너뛰며 자동 탐색을 재개합니다."
+            webView.loadUrl(ProviderId.JINHAK.homeUrl)
+            true
+        }
+    }
+
     private fun startUnifiedCollection() {
         if (batchRunning) {
             Toast.makeText(this, "현재 개별 수집을 먼저 종료한 뒤 통합 수집을 시작하세요.", Toast.LENGTH_LONG).show()
@@ -624,6 +812,7 @@ class MainActivity : Activity() {
         unifiedAutoCaptureScheduled = false
         unifiedButton.text = "통합 수집 종료"
         localStore.updateUnifiedSession(sessionId, "adiga", "running", "user-start")
+        persistRuntimeCheckpoint(forceResume = true)
 
         provider = ProviderId.ADIGA
         localRunId = localStore.beginOrResume(ProviderId.ADIGA.wireName, VERSION)
@@ -656,6 +845,7 @@ class MainActivity : Activity() {
         localRunId = localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
         localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId) }
         localStore.updateUnifiedSession(sessionId, "jinhak", "running", "adiga:$adigaReason")
+        persistRuntimeCheckpoint(forceResume = true)
         CookieManager.getInstance().flush()
         sessionState.text = "세션 상태 확인 중"
         batchButton.text = "진학사 자동 탐색 준비"
@@ -704,6 +894,7 @@ class MainActivity : Activity() {
             return
         }
         localStore.updateUnifiedSession(sessionId, "completed", "completed", reason)
+        getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit().putBoolean("resumeUnified", false).apply()
         val export = localStore.buildUnifiedExport(sessionId)
         lastJson = export.toString(2)
         showPreview(lastJson)
@@ -940,6 +1131,10 @@ class MainActivity : Activity() {
     }
 
     private fun armBatchNavigationWatchdog(expectedUrl: String) {
+        if (provider == ProviderId.JINHAK) {
+            armJinhakStallWatchdog(expectedUrl)
+            return
+        }
         val generation = ++batchNavigationWatchdogGeneration
         handler.postDelayed({
             if (!batchRunning || batchPausedForLogin || generation != batchNavigationWatchdogGeneration) return@postDelayed
@@ -962,6 +1157,77 @@ class MainActivity : Activity() {
 
     private fun disarmBatchNavigationWatchdog() {
         batchNavigationWatchdogGeneration += 1
+        jinhakStallWatchdogGeneration += 1
+    }
+
+    private fun armJinhakStallWatchdog(expectedUrl: String) {
+        val generation = ++jinhakStallWatchdogGeneration
+        val expectedSafe = runtimeSafePath(expectedUrl)
+        handler.postDelayed({
+            if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK || generation != jinhakStallWatchdogGeneration) return@postDelayed
+            val probe = """
+                (function(){
+                  try{
+                    var t=String(document.title||'').trim();
+                    var b=(document.body&&document.body.innerText?document.body.innerText:'').replace(/\s+/g,' ').trim();
+                    var rs=String(document.readyState||'');
+                    var err=/(404\s*Not\s*Found|500\s*(?:Internal\s*Server\s*Error)?|웹페이지를\s*사용할\s*수\s*없|net::ERR_|일시적인\s*오류)/i.test(t+' '+b.slice(0,8000));
+                    return JSON.stringify({readyState:rs,textLength:b.length,error:err,titleLength:t.length});
+                  }catch(e){return JSON.stringify({readyState:'error',textLength:0,error:true,titleLength:0});}
+                })();
+            """.trimIndent()
+            webView.evaluateJavascript(probe) { encoded ->
+                if (!batchRunning || provider != ProviderId.JINHAK || generation != jinhakStallWatchdogGeneration) return@evaluateJavascript
+                val state = runCatching { JSONObject(decodeJsString(encoded)) }.getOrNull() ?: JSONObject()
+                val meaningful = state.optInt("textLength", 0) >= 80 || state.optInt("titleLength", 0) >= 3
+                if (meaningful && !state.optBoolean("error", false)) {
+                    jinhakRecoveredStalls += 1
+                    recordRuntimeEvent("jinhak-soft-stall-recovered", JSONObject()
+                        .put("safePath", runtimeSafePath(webView.url ?: expectedUrl))
+                        .put("readyState", state.optString("readyState"))
+                        .put("textLength", state.optInt("textLength")))
+                    status.text = "진학사 로딩 지연 복구: 렌더된 DOM을 수집하고 다음 페이지로 진행합니다."
+                    batchNavigationWatchdogRecovery = true
+                    runCatching { webView.stopLoading() }
+                    handler.postDelayed({
+                        if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return@postDelayed
+                        batchNavigationWatchdogRecovery = false
+                        if (!batchCollecting) collectSnapshotForBatch()
+                    }, 220L)
+                }
+            }
+        }, JINHAK_SOFT_STALL_MS)
+
+        handler.postDelayed({
+            if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK || generation != jinhakStallWatchdogGeneration) return@postDelayed
+            val stalled = canonicalizeBatchUrl(webView.url ?: currentBatchTarget ?: expectedUrl)
+            jinhakConsecutiveStalls += 1
+            jinhakRecoveredStalls += 1
+            recordRuntimeEvent("jinhak-hard-stall-skip", JSONObject()
+                .put("safePath", runtimeSafePath(stalled.ifBlank { expectedUrl }))
+                .put("consecutive", jinhakConsecutiveStalls)
+                .put("expectedSafePath", expectedSafe))
+            localRunId?.let { runId ->
+                if (stalled.isNotBlank()) localStore.markDocument(runId, stalled, "error", 0, "jinhak-navigation-stall")
+            }
+            if (stalled.isNotBlank()) batchVisited.add(stalled)
+            batchErrors.put(JSONObject()
+                .put("type", "jinhak-navigation-stall")
+                .put("safePath", runtimeSafePath(stalled.ifBlank { expectedUrl })))
+            currentBatchTarget = null
+            pendingBatchPageAction = null
+            activeBatchPageAction = null
+            batchCollecting = false
+            batchNavigationWatchdogRecovery = false
+            ++jinhakStallWatchdogGeneration
+            runCatching { webView.stopLoading() }
+            status.text = if (jinhakConsecutiveStalls >= MAX_JINHAK_CONSECUTIVE_STALLS) {
+                "진학사 연속 로딩 지연 ${jinhakConsecutiveStalls}회: 문제 페이지를 격리하고 큐를 계속 진행합니다."
+            } else {
+                "진학사 로딩 중단 페이지 건너뜀: 다음 탐색 대상으로 계속합니다."
+            }
+            handler.postDelayed({ if (batchRunning && !batchPausedForLogin) loadNextBatchPage() }, 280L)
+        }, JINHAK_HARD_STALL_MS)
     }
 
     private fun showBatchCover() {
@@ -1355,7 +1621,11 @@ class MainActivity : Activity() {
                 .put("departmentContextDepth", r.optInt("departmentContextDepth", -1)))
         }
 
-        val textBudgetLimit = 180_000
+        val highValuePage = snapshot.optString("providerPageType") in setOf(
+            "jinhak-early-storage", "jinhak-prediction-report", "jinhak-mock-support-report",
+            "jinhak-actual-admit-report", "jinhak-score-calc-report", "jinhak-sat-minimum"
+        )
+        val textBudgetLimit = if (batchRunning && provider == ProviderId.JINHAK && !highValuePage) 32_000 else 180_000
         var remainingBudget = textBudgetLimit
         var capturedTextCharacters = 0
         fun budgeted(raw: String, maxLen: Int): String {
@@ -1612,6 +1882,7 @@ class MainActivity : Activity() {
             if (plan != null) registerListFingerprint(plan)
 
             val pageRecords = normalizeSnapshot(snapshot)
+            if (provider == ProviderId.JINHAK) jinhakConsecutiveStalls = 0
             if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
                 val sessionId = unifiedSessionId
                 val runId = localRunId ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION).also { localRunId = it }
@@ -1644,11 +1915,12 @@ class MainActivity : Activity() {
 
             batchSnapshots.put(snapshotForLocalExport(snapshot))
             tableFingerprint(snapshot)?.let { batchLastTableSignatures[canonicalizeBatchUrl(snapshot.optString("url"))] = it }
-            // University detail records can be large. SQLite is the authoritative local store;
-            // avoid keeping a second in-memory copy during the long detail crawl.
-            if (!(LOCAL_FIRST_BETA && snapshot.optString("providerPageType") == "adiga-university-detail")) {
-                RecordUtils.appendUniqueRecords(batchRecords, pageRecords)
-            }
+            // SQLite is authoritative for long crawls. Jinhak pages can be substantially larger
+            // than Adiga list rows, so never duplicate their normalized records in RAM.
+            val keepRecordsInMemory = !(LOCAL_FIRST_BETA && (
+                provider == ProviderId.JINHAK || snapshot.optString("providerPageType") == "adiga-university-detail"
+            ))
+            if (keepRecordsInMemory) RecordUtils.appendUniqueRecords(batchRecords, pageRecords)
             localRunId?.let { runId ->
                 batchLocalRecordsPersisted += localStore.storeRecords(runId, provider.wireName, pageRecords)
                 val navKey = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
@@ -1696,13 +1968,13 @@ class MainActivity : Activity() {
     }
 
     private fun snapshotForLocalExport(snapshot: JSONObject): JSONObject {
-        if (!(LOCAL_FIRST_BETA && provider == ProviderId.ADIGA &&
-                snapshot.optString("providerPageType") == "adiga-university-detail")) {
-            return stripNavigationLinksForExport(snapshot)
-        }
-        // Detailed tables are already normalized into durable SQLite records. Keep only
-        // lightweight diagnostics here to prevent hundreds of university details from
-        // being duplicated in RAM and again in the exported JSON.
+        val lightweight = LOCAL_FIRST_BETA && (
+            provider == ProviderId.JINHAK ||
+                (provider == ProviderId.ADIGA && snapshot.optString("providerPageType") == "adiga-university-detail")
+        )
+        if (!lightweight) return stripNavigationLinksForExport(snapshot)
+        // Full Jinhak analysis is already persisted in unified_analysis_captures and normalized
+        // records are in SQLite. Keep only a tiny batch diagnostic copy in RAM.
         return JSONObject()
             .put("title", snapshot.optString("title"))
             .put("url", snapshot.optString("url"))
