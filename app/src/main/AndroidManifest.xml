@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.7.0 Observation Foundation"
+        android:label="Admission Collector v0.7.1 Autonomous Analysis Ready"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
