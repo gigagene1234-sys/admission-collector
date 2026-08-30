@@ -151,8 +151,8 @@ class MainActivity : Activity() {
         private const val JINHAK_HARD_STALL_MS = 24_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.6.4"
-        private const val BUILD_CODE = 10640
+        private const val VERSION = "0.6.5"
+        private const val BUILD_CODE = 10650
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1187,6 +1187,10 @@ class MainActivity : Activity() {
                         .put("readyState", state.optString("readyState"))
                         .put("textLength", state.optInt("textLength")))
                     status.text = "진학사 로딩 지연 복구: 렌더된 DOM을 수집하고 다음 페이지로 진행합니다."
+                    // The 24s hard timer belongs to the same stalled navigation. Once a
+                    // meaningful DOM is accepted at 12s, invalidate that hard timer so it
+                    // cannot race the snapshot parser and skip a valid page.
+                    ++jinhakStallWatchdogGeneration
                     batchNavigationWatchdogRecovery = true
                     runCatching { webView.stopLoading() }
                     handler.postDelayed({

@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.6.4 Crash Guard and Stall Recovery"
+        android:label="Admission Collector v0.6.5 Safe Jinhak Explorer"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

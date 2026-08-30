@@ -162,7 +162,14 @@ object SnapshotScript {
 
   var jinhakCards=[];
   var jinhakCardStats={metricSeeds:0,candidateRoots:0,uniqueRoots:0,universityBoundRoots:0,universityContextRoots:0,universityMissingRoots:0,departmentBoundRoots:0,departmentContextRoots:0,departmentMissingRoots:0};
-  if(/(^|\.)jinhak\.com$/i.test(location.hostname)){
+  var isJinhakHost=/(^|\.)jinhak\.com$/i.test(location.hostname);
+  var jinhakBarSignals=(bodyText.match(/[0-9]{1,2}\s*칸/g)||[]).length;
+  var jinhakDeepPage=isJinhakHost && (
+    /(?:storage|save|predict|prediction|sapplysample|admitreport|resultreport|score|calc|report)/i.test(location.href) ||
+    jinhakBarSignals>=2 ||
+    /(?:내\s*순위|예상\s*(?:합격선|컷)|모의지원자\s*수|지원판정|합격안정성)/i.test(bodyText)
+  );
+  if(jinhakDeepPage){
     var metricRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|경쟁률|모의지원|합격예측|지원판정|내\s*순위|모집인원)/i;
     var primaryRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|합격예측|지원판정|내\s*순위|예상\s*(?:합격선|컷))/i;
     var exactUniRx=/(?:[가-힣A-Za-z0-9·.()\-]{2,35}(?:대학교|교육대학교|과학기술원))/i;
@@ -201,7 +208,7 @@ object SnapshotScript {
       }
       return -1;
     }
-    for(var ji=0;ji<metricNodes.length&&roots.length<120;ji++){
+    for(var ji=0;ji<metricNodes.length&&roots.length<120&&jinhakCardStats.metricSeeds<650;ji++){
       var mn=metricNodes[ji];
       if(!visible(mn)) continue;
       var seed=structuredCardText(mn,420);
@@ -357,14 +364,16 @@ object SnapshotScript {
   }
 
   var tables=[];
-  var captureHiddenDetail=/(^|\.)jinhak\.com$/i.test(location.hostname) || /\/(?:ucp\/uvt\/uni\/univDetailSelection|uct\/acd\/ade\/criteriaAndResultPopup)\.do$/i.test(location.pathname);
+  var captureHiddenDetail=(isJinhakHost&&jinhakDeepPage) || /\/(?:ucp\/uvt\/uni\/univDetailSelection|uct\/acd\/ade\/criteriaAndResultPopup)\.do$/i.test(location.pathname);
+  var maxCapturedTables=(isJinhakHost&&!jinhakDeepPage)?24:120;
+  var maxCapturedRows=(isJinhakHost&&!jinhakDeepPage)?100:250;
   var tableNodes=document.querySelectorAll('table,[role=table]');
-  for(var ti=0;ti<tableNodes.length && tables.length<120;ti++){
+  for(var ti=0;ti<tableNodes.length && tables.length<maxCapturedTables;ti++){
     var table=tableNodes[ti];
     if(!captureHiddenDetail && !visible(table)) continue;
     var rows=[];
     var trNodes=table.querySelectorAll('tr,[role=row]');
-    for(var ri=0;ri<trNodes.length && rows.length<250;ri++){
+    for(var ri=0;ri<trNodes.length && rows.length<maxCapturedRows;ri++){
       var tr=trNodes[ri];
       if(!captureHiddenDetail && !visible(tr)) continue;
       var cells=[];
@@ -383,8 +392,9 @@ object SnapshotScript {
   }
 
   var blocks=[];
+  var maxCapturedBlocks=(isJinhakHost&&!jinhakDeepPage)?100:300;
   var blockNodes=document.querySelectorAll('article,.card,.item,.result,.list-item,.tbl_row,[class*=result],[class*=admission],[class*=score],[class*=grade],[class*=competition],[class*=apply],dl,section');
-  for(var bi=0;bi<blockNodes.length && blocks.length<300;bi++){
+  for(var bi=0;bi<blockNodes.length && blocks.length<maxCapturedBlocks;bi++){
     var be=blockNodes[bi];
     if(!visible(be)) continue;
     var meta=(be.id||'')+' '+(be.className||'')+' '+(be.getAttribute('name')||'');
@@ -405,7 +415,8 @@ object SnapshotScript {
   var prefix=currentParts.slice(0,2).join('/');
   var scriptCandidates=0;
   var paginationAllowed=/\/(?:ucp\/uvt\/uni\/univView|ucp\/cls\/uni\/classUnivView|ucp\/prc\/uni\/admssUnivView|sco\/agu\/univScoScaAnlsView|uct\/acd\/adc\/characteristicsView|uct\/acd\/ueg\/univEtenGuideView|uct\/acd\/ade\/criteriaAndResultView|uct\/acd\/dia\/disabledAdmssView)\.do$/i.test(location.pathname);
-  for(var li=0;li<linkNodes.length;li++){
+  var maxNavigationScan=(isJinhakHost&&!jinhakDeepPage)?1800:5000;
+  for(var li=0;li<linkNodes.length&&li<maxNavigationScan;li++){
     var a=linkNodes[li];
     if(!visible(a)) continue;
     var href=a.getAttribute('href')||'';
@@ -479,7 +490,7 @@ object SnapshotScript {
     session:{needsLogin:(pass||loginUrl||loginRequired)&&!authenticated,authenticated:authenticated},
     pageState:{isError:pageError,errorType:errorType},
     listMeta:{totalItems:isNaN(listTotal)?-1:listTotal,visibleDataRows:visibleDataRows},
-    discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length},
+    discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length,jinhakDeepPage:jinhakDeepPage},
     context:context,
     selectionContext:selectionContext,
     jinhakCards:jinhakCards,
