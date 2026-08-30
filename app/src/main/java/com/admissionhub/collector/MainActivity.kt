@@ -44,6 +44,7 @@ class MainActivity : Activity() {
     private lateinit var batchButton: Button
     private lateinit var batchCover: TextView
     private lateinit var diagnosticButton: Button
+    private lateinit var unifiedButton: Button
     private lateinit var cloudOffload: CloudOffloadCoordinator
     private lateinit var localStore: LocalCollectorStore
 
@@ -120,6 +121,13 @@ class MainActivity : Activity() {
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
     private var lastJinhakDigest = JSONObject()
+    private var unifiedSessionId: String? = null
+    private var unifiedRunning = false
+    private var unifiedPhase = "idle"
+    private var unifiedPendingAdigaStart = false
+    private var unifiedJinhakAutoCapture = false
+    private val unifiedJinhakCapturedPages = linkedSetOf<String>()
+    private var unifiedAutoCaptureScheduled = false
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -128,8 +136,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.6.0"
-        private const val BUILD_CODE = 10600
+        private const val VERSION = "0.6.1"
+        private const val BUILD_CODE = 10610
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -245,12 +253,19 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
+        unifiedButton = Button(this).apply {
+            text = "두 사이트 통합 수집 시작"
+            setOnClickListener {
+                if (unifiedRunning) finishUnifiedCollection("user-finish") else startUnifiedCollection()
+            }
+        }
         diagnosticButton = Button(this).apply {
             text = "진학사 전체 분석 전송"
             setOnClickListener {
                 if (provider == ProviderId.JINHAK) sendLatestJinhakAnalysisDigest() else sendLatestLocalDiagnostic(manual = true)
             }
         }
+        actions3.addView(unifiedButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         actions3.addView(diagnosticButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
         status = TextView(this).apply {
@@ -334,6 +349,16 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
+                if (unifiedRunning && unifiedPhase == "adiga" && unifiedPendingAdigaStart && provider == ProviderId.ADIGA && !batchRunning) {
+                    unifiedPendingAdigaStart = false
+                    handler.postDelayed({
+                        if (unifiedRunning && unifiedPhase == "adiga" && !batchRunning) startBatch()
+                    }, 350L)
+                    return
+                }
+                if (!batchRunning && unifiedRunning && unifiedPhase == "jinhak" && provider == ProviderId.JINHAK && unifiedJinhakAutoCapture) {
+                    scheduleUnifiedJinhakAutoCapture(url)
+                }
                 if (batchRunning && !batchPausedForLogin) {
                     disarmBatchNavigationWatchdog()
                     if (batchNavigationWatchdogRecovery) {
@@ -430,6 +455,10 @@ class MainActivity : Activity() {
     private fun currentAdapter(): ProviderAdapter = ProviderRegistry.adapter(provider)
 
     private fun openProvider(which: ProviderId) {
+        if (unifiedRunning) {
+            Toast.makeText(this, "통합 수집 중에는 서비스 전환을 수집 엔진이 관리합니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (batchRunning) stopBatch("서비스 전환")
         provider = which
         localRunId = localStore.latestResumableRun(which.wireName)
@@ -546,6 +575,113 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun startUnifiedCollection() {
+        if (batchRunning) {
+            Toast.makeText(this, "현재 개별 수집을 먼저 종료한 뒤 통합 수집을 시작하세요.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val sessionId = localStore.beginOrResumeUnifiedSession(VERSION)
+        unifiedSessionId = sessionId
+        unifiedRunning = true
+        unifiedPhase = "adiga"
+        unifiedPendingAdigaStart = true
+        unifiedJinhakAutoCapture = false
+        unifiedJinhakCapturedPages.clear()
+        unifiedAutoCaptureScheduled = false
+        unifiedButton.text = "통합 수집 종료"
+        localStore.updateUnifiedSession(sessionId, "adiga", "running", "user-start")
+
+        provider = ProviderId.ADIGA
+        localRunId = localStore.beginOrResume(ProviderId.ADIGA.wireName, VERSION)
+        localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.ADIGA.wireName, runId) }
+        CookieManager.getInstance().flush()
+        sessionState.text = "세션 상태 확인 중"
+        batchButton.text = "어디가 통합 수집 준비"
+        diagnosticButton.text = "어디가 진단 로그 전송"
+        status.text = "통합 수집 1/2 · 어디가 전국 공식 입시정보 resume/audit 준비 중…"
+
+        val seed = ProviderRegistry.adapter(ProviderId.ADIGA).seedUrls().firstOrNull()
+        if (seed.isNullOrBlank()) {
+            finishUnifiedCollection("adiga-seed-missing")
+            return
+        }
+        webView.loadUrl(seed)
+    }
+
+    private fun transitionUnifiedToJinhak(adigaReason: String) {
+        if (!unifiedRunning || unifiedPhase != "adiga") return
+        val sessionId = unifiedSessionId ?: return
+        unifiedPhase = "jinhak"
+        unifiedPendingAdigaStart = false
+        unifiedJinhakAutoCapture = true
+        unifiedAutoCaptureScheduled = false
+        unifiedJinhakCapturedPages.clear()
+
+        provider = ProviderId.JINHAK
+        localRunId = localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
+        localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId) }
+        localStore.updateUnifiedSession(sessionId, "jinhak", "running", "adiga:$adigaReason")
+        CookieManager.getInstance().flush()
+        sessionState.text = "세션 상태 확인 중"
+        batchButton.text = "현재 진학사 화면 전체 분석·누적"
+        diagnosticButton.text = "진학사 전체 분석 전송"
+        unifiedButton.text = "통합 수집 종료"
+        status.text = "통합 수집 2/2 · 진학사 단계: 로그인 후 필요한 화면을 열기만 하면 자동 분석·누적됩니다."
+        webView.loadUrl(ProviderId.JINHAK.homeUrl)
+    }
+
+    private fun scheduleUnifiedJinhakAutoCapture(url: String) {
+        if (!unifiedRunning || unifiedPhase != "jinhak" || provider != ProviderId.JINHAK || !unifiedJinhakAutoCapture) return
+        if (unifiedAutoCaptureScheduled) return
+        val canonical = canonicalizeBatchUrl(url)
+        if (canonical.isBlank()) return
+        val pageKey = RecordUtils.sha256(canonical)
+        if (unifiedJinhakCapturedPages.contains(pageKey)) return
+        unifiedAutoCaptureScheduled = true
+        handler.postDelayed({
+            unifiedAutoCaptureScheduled = false
+            if (!unifiedRunning || unifiedPhase != "jinhak" || provider != ProviderId.JINHAK) return@postDelayed
+            checkSessionState { needsLogin, _ ->
+                if (needsLogin) {
+                    status.text = "통합 수집 2/2 · 진학사 로그인 후 페이지를 열면 자동 수집을 재개합니다."
+                    return@checkSessionState
+                }
+                if (!unifiedJinhakCapturedPages.add(pageKey)) return@checkSessionState
+                collectCurrentPage()
+            }
+        }, 900L)
+    }
+
+    private fun finishUnifiedCollection(reason: String) {
+        val sessionId = unifiedSessionId ?: localStore.latestUnifiedSession()
+        val wasBatchRunning = batchRunning
+        unifiedRunning = false
+        unifiedJinhakAutoCapture = false
+        unifiedPendingAdigaStart = false
+        unifiedAutoCaptureScheduled = false
+        unifiedPhase = "completed"
+        if (wasBatchRunning) stopBatch("unified-$reason")
+
+        if (sessionId == null) {
+            unifiedButton.text = "두 사이트 통합 수집 시작"
+            status.text = "종료할 통합 수집 세션이 없습니다."
+            return
+        }
+        localStore.updateUnifiedSession(sessionId, "completed", "completed", reason)
+        val export = localStore.buildUnifiedExport(sessionId)
+        lastJson = export.toString(2)
+        showPreview(lastJson)
+        unifiedButton.text = "두 사이트 통합 수집 시작"
+        val summary = localStore.unifiedStatus(sessionId)
+        cloudOffload.sendDiagnostic(
+            "unified", VERSION,
+            JSONObject(summary.toString())
+                .put("trigger", "unified-finish")
+                .put("containsRawAdmissionRecords", false)
+        ) { }
+        status.text = "통합 수집 종료 · 어디가/진학사 데이터가 하나의 세션으로 연결되었습니다. JSON 저장으로 통합 결과를 내보낼 수 있습니다."
+    }
+
     private fun startBatch() {
         val url = webView.url
         if (url.isNullOrBlank() || !isProviderUrl(url)) {
@@ -553,7 +689,7 @@ class MainActivity : Activity() {
             return
         }
 
-        if (provider == ProviderId.ADIGA && ADIGA_RETRY_SUSPENDED) {
+        if (provider == ProviderId.ADIGA && ADIGA_RETRY_SUSPENDED && !unifiedRunning) {
             status.text = "어디가 복구는 현재 보류 중입니다. 진학사 분석 버전 검증 후 한밭대 381쪽을 우선 재시도합니다."
             Toast.makeText(this, "어디가 재시도는 진학사 분석 이후 진행합니다.", Toast.LENGTH_LONG).show()
             return
@@ -613,7 +749,14 @@ class MainActivity : Activity() {
         batchButton.text = "일괄 수집 중지"
         if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
             localRunId = localStore.beginOrResume(provider.wireName, VERSION)
-            status.text = "Local-First 수집 시작: Cloudflare 호출 없음 / run ${localRunId?.take(8)}…"
+            unifiedSessionId?.takeIf { unifiedRunning }?.let { sessionId ->
+                localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, provider.wireName, runId) }
+            }
+            status.text = if (unifiedRunning) {
+                "통합 수집 1/2 · 어디가 Local-First 수집 시작 / run ${localRunId?.take(8)}…"
+            } else {
+                "Local-First 수집 시작: Cloudflare 호출 없음 / run ${localRunId?.take(8)}…"
+            }
             beginBatchNavigation(null)
         } else {
             status.text = "현재 공급자는 로컬 단일 페이지 모드"
@@ -1015,6 +1158,29 @@ class MainActivity : Activity() {
                 localStore.markDocument(runId, canonicalizeBatchUrl(snapshot.optString("url")), "completed")
                 localStats = localStore.stats(runId)
                 lastJinhakDigest = buildJinhakDigest(snapshot, records, runId, collectedAt)
+                if (unifiedRunning && unifiedPhase == "jinhak") {
+                    unifiedSessionId?.let { sessionId ->
+                        localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId)
+                        val localPageKey = RecordUtils.sha256(canonicalizeBatchUrl(snapshot.optString("url")))
+                        localStore.storeUnifiedAnalysisCapture(
+                            sessionId = sessionId,
+                            provider = ProviderId.JINHAK.wireName,
+                            pageKey = localPageKey,
+                            pageType = snapshot.optString("providerPageType"),
+                            payload = lastJinhakDigest
+                        )
+                        localStore.updateUnifiedSession(sessionId, "jinhak", "running", null)
+                        unifiedJinhakCapturedPages.add(localPageKey)
+                        // The bundle is already privacy-sanitized by buildJinhakDigest.
+                        // One explicit unified-session start authorizes these user-viewed page captures.
+                        cloudOffload.sendDiagnostic(
+                            "jinhak", VERSION,
+                            JSONObject(lastJinhakDigest.toString())
+                                .put("trigger", "unified-user-viewed-page")
+                                .put("unifiedSessionId", sessionId)
+                        ) { }
+                    }
+                }
             }
             val out = JSONObject()
                 .put("collectorVersion", VERSION)
@@ -1880,6 +2046,14 @@ class MainActivity : Activity() {
                 "수집 종료: 서버 오류 ${batchCloudPagesDeferred}쪽은 Cloud에 보류 / 전체 완료로 확정하지 않습니다."
             else ->
                 "일괄 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 최종오류 ${batchErrors.length()} / 재시도 $batchPaginationRetries / 레코드 ${batchRecords.length()}"
+        }
+        if (unifiedRunning && unifiedPhase == "adiga" && provider == ProviderId.ADIGA) {
+            val sessionId = unifiedSessionId
+            if (sessionId != null) {
+                localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.ADIGA.wireName, runId) }
+                localStore.updateUnifiedSession(sessionId, "jinhak", "running", "adiga:$effectiveReason")
+            }
+            handler.postDelayed({ transitionUnifiedToJinhak(effectiveReason) }, 350L)
         }
     }
 

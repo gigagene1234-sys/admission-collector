@@ -20,7 +20,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "admission_collector_local_v1.db",
     null,
-    2
+    3
 ) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("""
@@ -87,6 +87,33 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE INDEX idx_pages_run_state ON pages(run_id,state)")
         db.execSQL("CREATE INDEX idx_documents_run_state ON documents(run_id,state)")
         db.execSQL("CREATE INDEX idx_records_run_year ON records(run_id,year)")
+        db.execSQL("""
+            CREATE TABLE unified_sessions(
+              session_id TEXT PRIMARY KEY,
+              collector_version TEXT NOT NULL,
+              status TEXT NOT NULL,
+              phase TEXT NOT NULL,
+              adiga_run_id TEXT,
+              jinhak_run_id TEXT,
+              completion_reason TEXT,
+              started_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("""
+            CREATE TABLE unified_analysis_captures(
+              session_id TEXT NOT NULL,
+              capture_id TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              page_key TEXT NOT NULL,
+              page_type TEXT,
+              payload_json TEXT NOT NULL,
+              captured_at TEXT NOT NULL,
+              PRIMARY KEY(session_id,capture_id)
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX idx_unified_sessions_status ON unified_sessions(status,updated_at)")
+        db.execSQL("CREATE UNIQUE INDEX idx_unified_capture_page ON unified_analysis_captures(session_id,provider,page_key)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -106,6 +133,205 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_records_run_quality ON records(run_id,quality_state)")
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_records_application_identity ON records(run_id,application_identity_key)")
         }
+        if (oldVersion < 3) {
+            db.execSQL("""
+                CREATE TABLE IF NOT EXISTS unified_sessions(
+                  session_id TEXT PRIMARY KEY,
+                  collector_version TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  phase TEXT NOT NULL,
+                  adiga_run_id TEXT,
+                  jinhak_run_id TEXT,
+                  completion_reason TEXT,
+                  started_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                )
+            """.trimIndent())
+            db.execSQL("""
+                CREATE TABLE IF NOT EXISTS unified_analysis_captures(
+                  session_id TEXT NOT NULL,
+                  capture_id TEXT NOT NULL,
+                  provider TEXT NOT NULL,
+                  page_key TEXT NOT NULL,
+                  page_type TEXT,
+                  payload_json TEXT NOT NULL,
+                  captured_at TEXT NOT NULL,
+                  PRIMARY KEY(session_id,capture_id)
+                )
+            """.trimIndent())
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_unified_sessions_status ON unified_sessions(status,updated_at)")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_unified_capture_page ON unified_analysis_captures(session_id,provider,page_key)")
+        }
+    }
+
+    fun beginOrResumeUnifiedSession(collectorVersion: String): String {
+        val db = writableDatabase
+        val existing = db.rawQuery(
+            "SELECT session_id FROM unified_sessions WHERE status='running' ORDER BY updated_at DESC LIMIT 1",
+            emptyArray()
+        ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        val now = Instant.now().toString()
+        if (!existing.isNullOrBlank()) {
+            val cv = ContentValues().apply {
+                put("collector_version", collectorVersion)
+                put("status", "running")
+                put("updated_at", now)
+            }
+            db.update("unified_sessions", cv, "session_id=?", arrayOf(existing))
+            return existing
+        }
+        val sessionId = UUID.randomUUID().toString()
+        val cv = ContentValues().apply {
+            put("session_id", sessionId)
+            put("collector_version", collectorVersion)
+            put("status", "running")
+            put("phase", "adiga")
+            putNull("adiga_run_id")
+            putNull("jinhak_run_id")
+            putNull("completion_reason")
+            put("started_at", now)
+            put("updated_at", now)
+        }
+        db.insertOrThrow("unified_sessions", null, cv)
+        return sessionId
+    }
+
+    fun latestUnifiedSession(): String? = readableDatabase.rawQuery(
+        "SELECT session_id FROM unified_sessions ORDER BY updated_at DESC LIMIT 1",
+        emptyArray()
+    ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+
+    fun attachUnifiedProviderRun(sessionId: String, provider: String, runId: String) {
+        val column = when (provider) {
+            "adiga" -> "adiga_run_id"
+            "jinhak" -> "jinhak_run_id"
+            else -> return
+        }
+        val cv = ContentValues().apply {
+            put(column, runId)
+            put("updated_at", Instant.now().toString())
+        }
+        writableDatabase.update("unified_sessions", cv, "session_id=?", arrayOf(sessionId))
+    }
+
+    fun updateUnifiedSession(sessionId: String, phase: String, status: String, reason: String?) {
+        val cv = ContentValues().apply {
+            put("phase", phase)
+            put("status", status)
+            if (reason == null) putNull("completion_reason") else put("completion_reason", reason)
+            put("updated_at", Instant.now().toString())
+        }
+        writableDatabase.update("unified_sessions", cv, "session_id=?", arrayOf(sessionId))
+    }
+
+    fun storeUnifiedAnalysisCapture(
+        sessionId: String,
+        provider: String,
+        pageKey: String,
+        pageType: String?,
+        payload: JSONObject
+    ) {
+        if (sessionId.isBlank() || provider.isBlank() || pageKey.isBlank()) return
+        val now = Instant.now().toString()
+        val captureId = RecordUtils.sha256("$sessionId|$provider|$pageKey")
+        val cv = ContentValues().apply {
+            put("session_id", sessionId)
+            put("capture_id", captureId)
+            put("provider", provider)
+            put("page_key", pageKey)
+            put("page_type", pageType)
+            put("payload_json", payload.toString())
+            put("captured_at", now)
+        }
+        writableDatabase.insertWithOnConflict(
+            "unified_analysis_captures", null, cv, SQLiteDatabase.CONFLICT_REPLACE
+        )
+        writableDatabase.execSQL(
+            "UPDATE unified_sessions SET updated_at=? WHERE session_id=?",
+            arrayOf(now, sessionId)
+        )
+    }
+
+    fun unifiedStatus(sessionId: String): JSONObject {
+        val out = JSONObject().put("sessionId", sessionId)
+        var adigaRun: String? = null
+        var jinhakRun: String? = null
+        readableDatabase.rawQuery(
+            "SELECT collector_version,status,phase,adiga_run_id,jinhak_run_id,completion_reason,started_at,updated_at FROM unified_sessions WHERE session_id=? LIMIT 1",
+            arrayOf(sessionId)
+        ).use { c ->
+            if (c.moveToFirst()) {
+                out.put("collectorVersion", c.getString(0))
+                    .put("status", c.getString(1))
+                    .put("phase", c.getString(2))
+                    .put("completionReason", if (c.isNull(5)) JSONObject.NULL else c.getString(5))
+                    .put("startedAt", c.getString(6))
+                    .put("updatedAt", c.getString(7))
+                adigaRun = if (c.isNull(3)) null else c.getString(3)
+                jinhakRun = if (c.isNull(4)) null else c.getString(4)
+            }
+        }
+        out.put("adiga", JSONObject()
+            .put("runId", adigaRun ?: JSONObject.NULL)
+            .put("stats", adigaRun?.let { stats(it) } ?: JSONObject()))
+        out.put("jinhak", JSONObject()
+            .put("runId", jinhakRun ?: JSONObject.NULL)
+            .put("stats", jinhakRun?.let { stats(it) } ?: JSONObject()))
+
+        val pageTypes = JSONObject()
+        var captures = 0
+        readableDatabase.rawQuery(
+            "SELECT COALESCE(page_type,'unknown'),COUNT(*) FROM unified_analysis_captures WHERE session_id=? GROUP BY COALESCE(page_type,'unknown') ORDER BY 1",
+            arrayOf(sessionId)
+        ).use { c ->
+            while (c.moveToNext()) {
+                pageTypes.put(c.getString(0), c.getInt(1))
+                captures += c.getInt(1)
+            }
+        }
+        out.put("jinhakAnalysisCaptures", captures)
+            .put("jinhakPageTypes", pageTypes)
+            .put("sourcePolicy", JSONObject()
+                .put("adiga", "official-current-and-historical-baseline")
+                .put("jinhak", "user-viewed-derived-analysis-and-prediction")
+                .put("predictionIsNotHistoricalActual", true))
+        return out
+    }
+
+    fun buildUnifiedExport(sessionId: String): JSONObject {
+        val status = unifiedStatus(sessionId)
+        val adigaRun = status.optJSONObject("adiga")?.optString("runId")?.takeIf { it.isNotBlank() && it != "null" }
+        val jinhakRun = status.optJSONObject("jinhak")?.optString("runId")?.takeIf { it.isNotBlank() && it != "null" }
+        val analyses = JSONArray()
+        readableDatabase.rawQuery(
+            "SELECT page_type,payload_json,captured_at FROM unified_analysis_captures WHERE session_id=? ORDER BY captured_at",
+            arrayOf(sessionId)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val payload = runCatching { JSONObject(c.getString(1)) }.getOrNull() ?: continue
+                analyses.put(JSONObject()
+                    .put("pageType", if (c.isNull(0)) JSONObject.NULL else c.getString(0))
+                    .put("capturedAt", c.getString(2))
+                    .put("analysis", payload))
+            }
+        }
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("type", "admission-unified-two-provider-export")
+            .put("session", status)
+            .put("combinationPolicy", JSONObject()
+                .put("officialBaseline", "adiga")
+                .put("predictionAnalysis", "jinhak")
+                .put("keepProviderSemanticsSeparate", true)
+                .put("doNotOverwriteHistoricalWithPrediction", true))
+            .put("sources", JSONObject()
+                .put("adiga", JSONObject()
+                    .put("runId", adigaRun ?: JSONObject.NULL)
+                    .put("records", adigaRun?.let { loadRecords(it) } ?: JSONArray()))
+                .put("jinhak", JSONObject()
+                    .put("runId", jinhakRun ?: JSONObject.NULL)
+                    .put("records", jinhakRun?.let { loadRecords(it) } ?: JSONArray())
+                    .put("pageAnalyses", analyses)))
     }
 
     fun beginOrResume(provider: String, collectorVersion: String): String {

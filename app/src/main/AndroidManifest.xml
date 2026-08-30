@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.6.0 Jinhak Full Screen Analyzer"
+        android:label="Admission Collector v0.6.1 Unified Two-Site Collector"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
