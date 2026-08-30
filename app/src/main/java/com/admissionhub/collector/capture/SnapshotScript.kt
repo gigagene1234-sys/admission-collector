@@ -301,10 +301,19 @@ object SnapshotScript {
       var out=[];
       var seen={};
       function add(text,relation,depth,distance,node){
+        text=String(text||'');
         var names=explicitDepartmentNames(text);
-        for(var qi=0;qi<names.length&&out.length<14;qi++){
+        if(names.length===0) return;
+        var unis=explicitUniversityNames(text);
+        var nodeMeta=cleanText((node&&node.tagName||'')+' '+(node&&node.id||'')+' '+(node&&node.className||''));
+        var hasPrimary=primaryRx.test(text);
+        var hasMetric=metricRx.test(text);
+        var headerLike=/title|tit|name|dept|major|header|head/i.test(nodeMeta) && !hasPrimary;
+        var candidateUniversity=unis.length===1?unis[0]:'';
+        var compactLength=cleanText(text).length;
+        for(var qi=0;qi<names.length&&out.length<18;qi++){
           var n=names[qi];
-          var key=n+'|'+relation+'|'+depth+'|'+distance;
+          var key=n+'|'+relation+'|'+depth+'|'+distance+'|'+candidateUniversity+'|'+hasPrimary;
           if(seen[key]) continue;
           seen[key]=true;
           out.push({
@@ -312,23 +321,29 @@ object SnapshotScript {
             relation:relation,
             depth:depth,
             distance:distance,
-            tag:String(node&&node.tagName||'').slice(0,20)
+            tag:String(node&&node.tagName||'').slice(0,20),
+            hasPrimaryPrediction:hasPrimary,
+            hasMetric:hasMetric,
+            headerLike:headerLike,
+            textLength:compactLength,
+            candidateUniversity:candidateUniversity,
+            candidateDepartmentCount:names.length
           });
         }
       }
       add(rootText,'card-root',0,0,el);
       var cur=el;
-      for(var depth=0;cur&&depth<7&&out.length<14;depth++){
+      for(var depth=0;cur&&depth<7&&out.length<18;depth++){
         var attrs=cleanText((cur.getAttribute&&cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute&&cur.getAttribute('title')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-dept-name')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-department-name')||''));
         add(attrs,'ancestor-attribute',depth,0,cur);
 
         var prev=cur.previousElementSibling;
-        for(var pi=1;prev&&pi<=8&&out.length<14;pi++,prev=prev.previousElementSibling){
+        for(var pi=1;prev&&pi<=8&&out.length<18;pi++,prev=prev.previousElementSibling){
           if(!visible(prev)) continue;
           add(structuredCardText(prev,1000),'previous-sibling',depth,pi,prev);
         }
         var next=cur.nextElementSibling;
-        for(var ni=1;next&&ni<=5&&out.length<14;ni++,next=next.nextElementSibling){
+        for(var ni=1;next&&ni<=5&&out.length<18;ni++,next=next.nextElementSibling){
           if(!visible(next)) continue;
           add(structuredCardText(next,1000),'next-sibling',depth,ni,next);
         }
@@ -340,7 +355,7 @@ object SnapshotScript {
         for(var ci=0;ci<children.length;ci++){ if(children[ci]===cur){curIndex=ci;break;} }
         if(curIndex>=0){
           var from=Math.max(0,curIndex-6), to=Math.min(children.length-1,curIndex+6);
-          for(var xi=from;xi<=to&&out.length<14;xi++){
+          for(var xi=from;xi<=to&&out.length<18;xi++){
             if(xi===curIndex) continue;
             var child=children[xi];
             if(!visible(child)) continue;
@@ -349,7 +364,7 @@ object SnapshotScript {
         }
         cur=parent;
       }
-      return out.slice(0,14);
+      return out.slice(0,18);
     }
 
     function universityContextFor(el,rootText){

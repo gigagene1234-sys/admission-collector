@@ -128,8 +128,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.5.7"
-        private const val BUILD_CODE = 10570
+        private const val VERSION = "0.5.8"
+        private const val BUILD_CODE = 10580
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1065,16 +1065,24 @@ class MainActivity : Activity() {
             val card = cards.optJSONObject(cardIndex) ?: continue
             val rawProbe = card.optJSONArray("departmentProbe") ?: JSONArray()
             val safeProbe = JSONArray()
-            for (pi in 0 until minOf(rawProbe.length(), 14)) {
+            for (pi in 0 until minOf(rawProbe.length(), 18)) {
                 val q = rawProbe.optJSONObject(pi) ?: continue
                 val name = q.optString("name").replace(Regex("""\s+"""), " ").trim().take(60)
                 if (name.isBlank() || !Regex("""(?:학과|학부|전공|자율전공)$""").containsMatchIn(name)) continue
+                val candidateUniversity = q.optString("candidateUniversity")
+                    .replace(Regex("""\s+"""), " ").trim().take(60)
                 safeProbe.put(JSONObject()
                     .put("name", name)
                     .put("relation", q.optString("relation").take(32))
                     .put("depth", q.optInt("depth", -1))
                     .put("distance", q.optInt("distance", 0))
-                    .put("tag", q.optString("tag").take(20)))
+                    .put("tag", q.optString("tag").take(20))
+                    .put("hasPrimaryPrediction", q.optBoolean("hasPrimaryPrediction", false))
+                    .put("hasMetric", q.optBoolean("hasMetric", false))
+                    .put("headerLike", q.optBoolean("headerLike", false))
+                    .put("textLength", q.optInt("textLength", -1))
+                    .put("candidateDepartmentCount", q.optInt("candidateDepartmentCount", 0))
+                    .put("candidateUniversity", if (candidateUniversity.isBlank()) JSONObject.NULL else candidateUniversity))
             }
             departmentProbes.put(JSONObject()
                 .put("cardIndex", cardIndex)
@@ -1102,7 +1110,7 @@ class MainActivity : Activity() {
             .put("truncated", records.length() > sanitized.length())
             .put("localStats", localStore.stats(runId))
             .put("records", sanitized)
-            .put("privacy", "structured-admission-metrics-and-short-department-candidates-only-no-dom-no-raw-evidence-no-url-no-cookie-no-credential")
+            .put("privacy", "structured-admission-metrics-and-department-boundary-metadata-only-no-dom-no-raw-evidence-no-url-no-cookie-no-credential")
     }
 
     private fun sendLatestJinhakAnalysisDigest() {
