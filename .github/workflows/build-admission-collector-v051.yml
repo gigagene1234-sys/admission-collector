@@ -42,7 +42,7 @@ jobs:
           grep -q '공과대학' app/src/main/java/com/admissionhub/collector/parser/GenericAdmissionParser.kt
           grep -q 'versionCode = 10510' app/build.gradle.kts
           grep -q 'versionName = "0.5.1"' app/build.gradle.kts
-          grep -q 'android:label="Admission Collector v0.5.1 Jinhak"' app/src/main/AndroidManifest.xml
+          grep -q 'android:label="Admission Collector v0.5.1 Jinhak Analysis"' app/src/main/AndroidManifest.xml
           grep -q 'version: "0.3.9"' cloudflare/src/index.js
 
       - name: Set up JDK 17
@@ -92,7 +92,7 @@ jobs:
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
           grep -q "versionCode='10510'" /tmp/badging.txt
           grep -q "versionName='0.5.1'" /tmp/badging.txt
-          grep -q "application-label:'Admission Collector v0.5.1 Jinhak'" /tmp/badging.txt
+          grep -q "application-label:'Admission Collector v0.5.1 Jinhak Analysis'" /tmp/badging.txt
           sha256sum "$APK" | tee /tmp/apk.sha256
 
       - name: Persist generated v0.5.1 source
