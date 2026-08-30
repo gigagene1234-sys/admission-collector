@@ -1,0 +1,46 @@
+name: Fetch Latest Jinhak Diagnostic
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/fetch-jinhak-diagnostic.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      WORKER_URL: https://admission-collector-offload.gigagene1234.workers.dev
+      INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - name: Fetch latest diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$INGEST_TOKEN"
+          mkdir -p out
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $INGEST_TOKEN" \
+            "$WORKER_URL/v1/runs/latest?provider=jinhak-diagnostic" \
+            -o out/latest.json
+          RUN_ID="$(jq -r '.runId // empty' out/latest.json)"
+          test -n "$RUN_ID"
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $INGEST_TOKEN" \
+            "$WORKER_URL/v1/runs/$RUN_ID/status" \
+            -o out/status.json
+          jq '{run: {run_id: .run.run_id, provider: .run.provider, collector_version: .run.collector_version, status: .run.status, created_at: .run.created_at, updated_at: .run.updated_at, error_count: .run.error_count}, diagnostics: [.recentErrors[] | {error_type, created_at, detail: (.detail_json | fromjson? // .detail_json)}]}' out/status.json > out/jinhak-diagnostic-sanitized.json
+          jq '{provider: .run.provider, collector_version: .run.collector_version, error_count: .run.error_count, diagnostics_count: (.recentErrors|length)}' out/status.json
+
+      - name: Upload sanitized diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-jinhak-diagnostic-sanitized
+          path: out/jinhak-diagnostic-sanitized.json
+          if-no-files-found: error
+          retention-days: 2
