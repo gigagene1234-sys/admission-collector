@@ -58,6 +58,17 @@ object JinhakAdapter : ProviderAdapter {
 
         if (pageType == "jinhak-early-storage") {
             val cards = snapshot.optJSONArray("jinhakCards") ?: JSONArray()
+            var hasRicherPredictionCards = false
+            for (ci in 0 until cards.length()) {
+                val cObj = cards.optJSONObject(ci)
+                val cEvidence = (cObj?.optString("text") ?: cards.optString(ci)).replace(Regex("""\s+"""), " ").trim()
+                if (cEvidence.isBlank()) continue
+                val cMetrics = predictionMetrics(cEvidence)
+                if (listOf("mockCompetition", "predictionProbability", "myRank", "predictedCut", "mockApplicants", "applicants").any { cMetrics.has(it) && !cMetrics.isNull(it) }) {
+                    hasRicherPredictionCards = true
+                    break
+                }
+            }
             val seenLogical = linkedSetOf<String>()
             for (i in 0 until cards.length()) {
                 val cardObj = cards.optJSONObject(i)
@@ -66,12 +77,18 @@ object JinhakAdapter : ProviderAdapter {
                 if (evidence.isBlank()) continue
                 val local = GenericAdmissionParser.inferContext(evidence)
                 val explicitUniversity = cleanStorageUniversity(cardObj?.optString("university"))
-                val university = local.university ?: explicitUniversity
-                val department = cleanStorageDepartment(local.department)
+                val explicitDepartment = cleanStorageDepartment(cardObj?.optString("department"))
+                val university = cleanStorageUniversity(local.university) ?: explicitUniversity
+                val department = cleanStorageDepartment(local.department) ?: explicitDepartment
                 val admission = cleanStorageAdmission(local.admission, evidence)
                 val universityContextSource = cardObj?.optString("universitySource")
                     ?.takeIf { it.isNotBlank() && it != "missing" }
+                val departmentContextSource = cardObj?.optString("departmentSource")
+                    ?.takeIf { it.isNotBlank() && it != "missing" }
                 val cardMetrics = predictionMetrics(evidence)
+                val metricKeys = cardMetrics.keys().asSequence().filter { !cardMetrics.isNull(it) }.toList()
+                val summaryOnly = metricKeys.size == 1 && metricKeys.firstOrNull() == "stabilityBars"
+                if (hasRicherPredictionCards && summaryOnly) continue
                 val hasPrimaryPrediction = listOf(
                     "stabilityBars", "predictionProbability", "predictionLabel", "myRank", "predictedCut"
                 ).any { cardMetrics.has(it) && !cardMetrics.isNull(it) }
@@ -91,9 +108,16 @@ object JinhakAdapter : ProviderAdapter {
                     .put("metrics", cardMetrics)
                     .put("observedAt", observedAt)
                     .put("cardIndex", i)
-                    .put("contextSource", if (local.university == null && explicitUniversity != null) "scored-card-root+explicit-university-context" else "scored-card-root")
+                    .put("contextSource", when {
+                        local.university == null && explicitUniversity != null && local.department == null && explicitDepartment != null -> "scored-card-root+university+department-context"
+                        local.university == null && explicitUniversity != null -> "scored-card-root+explicit-university-context"
+                        local.department == null && explicitDepartment != null -> "scored-card-root+explicit-department-context"
+                        else -> "scored-card-root"
+                    })
                     .put("universityContextSource", universityContextSource ?: JSONObject.NULL)
                     .put("universityContextDepth", cardObj?.optInt("universityDepth", -1) ?: -1)
+                    .put("departmentContextSource", departmentContextSource ?: JSONObject.NULL)
+                    .put("departmentContextDepth", cardObj?.optInt("departmentDepth", -1) ?: -1)
                     .put("cardRootScore", cardObj?.optInt("score", 0) ?: 0)
                     .put("confidence", when {
                         university != null && department != null && admission != null -> "high"
@@ -181,14 +205,17 @@ object JinhakAdapter : ProviderAdapter {
 
     private fun cleanStorageUniversity(value: String?): String? {
         val raw = value?.replace(Regex("""\s+"""), " ")?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        if (raw.length !in 3..48) return null
-        if (Regex("""(등급|경쟁률|합격|예측|지원|전형|모집|학과|학부|전공)""").containsMatchIn(raw)) return null
+        val cleaned = raw
+            .replace(Regex("""^(?:(?:닫기|열기|보기|상세|선택|삭제)\s*)*(?:[0-9]{1,2}\s*칸\s*)?"""), "")
+            .trim()
+        if (cleaned.length !in 3..48) return null
+        if (Regex("""(등급|경쟁률|합격|예측|지원|전형|모집|학과|학부|전공)""").containsMatchIn(cleaned)) return null
         val full = Regex("""^[가-힣A-Za-z0-9·.()\-]{2,35}(?:대학교|교육대학교|과학기술원)(?:\[[^\]]{1,12}\])?$""")
         val short = Regex("""^[가-힣A-Za-z0-9·.()\-]{2,24}대$""")
         val shortNoise = setOf("공대", "의대", "법대", "상대", "교대", "사범대", "간호대", "약대", "치대", "한의대", "철도대")
         return when {
-            full.matches(raw) -> raw
-            short.matches(raw) && raw !in shortNoise -> raw
+            full.matches(cleaned) -> cleaned
+            short.matches(cleaned) && cleaned !in shortNoise -> cleaned
             else -> null
         }
     }

@@ -157,7 +157,7 @@ object SnapshotScript {
   }
 
   var jinhakCards=[];
-  var jinhakCardStats={metricSeeds:0,candidateRoots:0,uniqueRoots:0,universityBoundRoots:0,universityContextRoots:0,universityMissingRoots:0};
+  var jinhakCardStats={metricSeeds:0,candidateRoots:0,uniqueRoots:0,universityBoundRoots:0,universityContextRoots:0,universityMissingRoots:0,departmentBoundRoots:0,departmentContextRoots:0,departmentMissingRoots:0};
   if(/(^|\.)jinhak\.com$/i.test(location.hostname)){
     var metricRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|경쟁률|모의지원|합격예측|지원판정|내\s*순위|모집인원)/i;
     var primaryRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|합격예측|지원판정|내\s*순위|예상\s*(?:합격선|컷))/i;
@@ -239,6 +239,64 @@ object SnapshotScript {
       }
       return names;
     }
+    function cleanDepartmentName(value){
+      var v=cleanText(value);
+      if(!v) return '';
+      v=v.replace(/^(?:(?:닫기|열기|보기|상세|선택|삭제)\s*)+/,'');
+      v=v.replace(/^(?:지역인재교과|지역인재종합|교과일반|교과중심|자기추천|창의인재\(면접형\)|교과면접|학생부교과|학생부종합|지역인재|학교장추천|고른기회)\s*/,'');
+      if(v.length<2||v.length>55) return '';
+      if(/(?:등급|경쟁률|합격|예측|지원판정|모집인원|[0-9]{1,2}\s*칸)/.test(v)) return '';
+      if(!/(?:학과|학부|전공|자율전공)$/.test(v)) return '';
+      return v;
+    }
+    function explicitDepartmentNames(text){
+      text=String(text||'');
+      var names=[];
+      var parts=text.split('|');
+      for(var di=0;di<parts.length;di++){
+        var part=cleanText(parts[di]);
+        var dm=part.match(/([가-힣A-Za-z0-9·.()&・\- ]{2,48}(?:학과|학부|전공|자율전공))/g)||[];
+        for(var dj=0;dj<dm.length;dj++){
+          var dv=cleanDepartmentName(dm[dj]);
+          if(dv&&names.indexOf(dv)<0) names.push(dv);
+        }
+      }
+      return names;
+    }
+    function departmentContextFor(el,rootText){
+      var direct=explicitDepartmentNames(rootText);
+      if(direct.length===1) return {name:direct[0],source:'card-root',depth:0};
+      var cur=el;
+      for(var depth=0;cur&&depth<8;depth++){
+        var attrs=cleanText((cur.getAttribute&&cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute&&cur.getAttribute('title')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-dept-name')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-department-name')||''));
+        var an=explicitDepartmentNames(attrs);
+        if(an.length===1) return {name:an[0],source:'ancestor-attribute',depth:depth};
+
+        var prev=cur.previousElementSibling;
+        for(var pi=0;prev&&pi<5;pi++,prev=prev.previousElementSibling){
+          if(!visible(prev)) continue;
+          var pt=structuredCardText(prev,900);
+          if(primaryRx.test(pt)) break;
+          var pn=explicitDepartmentNames(pt);
+          var pm=cleanText((prev.tagName||'')+' '+(prev.id||'')+' '+(prev.className||''));
+          if(pn.length===1 && (pt.length<=220 || /title|tit|name|dept|major|header|head/i.test(pm))){
+            return {name:pn[0],source:'preceding-sibling',depth:depth};
+          }
+        }
+
+        var parent=cur.parentElement;
+        if(!parent) break;
+        var parentText=structuredCardText(parent,7000);
+        var parentNames=explicitDepartmentNames(parentText);
+        var parentHits=(parentText.match(/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|경쟁률|모의지원|내\s*순위)/ig)||[]).length;
+        if(parentNames.length===1 && parentHits<=8){
+          return {name:parentNames[0],source:'ancestor-unique',depth:depth+1};
+        }
+        cur=parent;
+      }
+      return {name:'',source:'missing',depth:-1};
+    }
+
     function universityContextFor(el,rootText){
       var direct=explicitUniversityNames(rootText);
       if(direct.length===1) return {name:direct[0],source:'card-root',depth:0};
@@ -287,11 +345,18 @@ object SnapshotScript {
       var entry=roots[jr];
       if(!primaryRx.test(entry.text)) continue;
       var universityCtx=universityContextFor(entry.el,entry.text);
+      var departmentCtx=departmentContextFor(entry.el,entry.text);
       if(universityCtx.name){
         jinhakCardStats.universityBoundRoots++;
         if(universityCtx.source!=='card-root') jinhakCardStats.universityContextRoots++;
       }else{
         jinhakCardStats.universityMissingRoots++;
+      }
+      if(departmentCtx.name){
+        jinhakCardStats.departmentBoundRoots++;
+        if(departmentCtx.source!=='card-root') jinhakCardStats.departmentContextRoots++;
+      }else{
+        jinhakCardStats.departmentMissingRoots++;
       }
       jinhakCards.push({
         text:entry.text,
@@ -300,7 +365,10 @@ object SnapshotScript {
         primaryPrediction:true,
         university:universityCtx.name,
         universitySource:universityCtx.source,
-        universityDepth:universityCtx.depth
+        universityDepth:universityCtx.depth,
+        department:departmentCtx.name,
+        departmentSource:departmentCtx.source,
+        departmentDepth:departmentCtx.depth
       });
     }
     jinhakCardStats.uniqueRoots=jinhakCards.length;

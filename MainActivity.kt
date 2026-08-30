@@ -128,8 +128,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.5.5"
-        private const val BUILD_CODE = 10550
+        private const val VERSION = "0.5.6"
+        private const val BUILD_CODE = 10560
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1052,7 +1052,9 @@ class MainActivity : Activity() {
                 .put("cardIndex", if (r.has("cardIndex")) r.optInt("cardIndex") else JSONObject.NULL)
                 .put("contextSource", r.optString("contextSource"))
                 .put("universityContextSource", if (r.isNull("universityContextSource")) JSONObject.NULL else r.optString("universityContextSource"))
-                .put("universityContextDepth", r.optInt("universityContextDepth", -1)))
+                .put("universityContextDepth", r.optInt("universityContextDepth", -1))
+                .put("departmentContextSource", if (r.isNull("departmentContextSource")) JSONObject.NULL else r.optString("departmentContextSource"))
+                .put("departmentContextDepth", r.optInt("departmentContextDepth", -1)))
         }
         return JSONObject()
             .put("schemaVersion", 1)
