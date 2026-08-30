@@ -44,7 +44,6 @@ jobs:
           grep -q 'versionCode = 10430' app/build.gradle.kts
           grep -q 'versionName = "0.4.3"' app/build.gradle.kts
           grep -q 'android:label="Admission Collector v0.4.3 Local"' app/src/main/AndroidManifest.xml
-          # No Worker deployment/version change in this local-first diagnostic patch.
           grep -q 'version: "0.3.9"' cloudflare/src/index.js
 
       - name: Set up JDK 17
@@ -112,6 +111,7 @@ jobs:
             echo "v0.4.3 source already persisted"
           else
             git commit -m "Apply v0.4.3 lightweight diagnostic telemetry [skip ci]"
+            git pull --rebase origin main
             git push origin HEAD:main
           fi
 
