@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-collector-v054.yml"
       - "scripts/apply_v054b.py"
+      - "scripts/fix_v054_kotlin_escapes.py"
   workflow_dispatch:
 
 permissions:
@@ -27,7 +28,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply v0.5.4 patch
-        run: python3 scripts/apply_v054b.py
+        run: |
+          python3 scripts/apply_v054b.py
+          python3 scripts/fix_v054_kotlin_escapes.py
 
       - name: Verify source invariants
         shell: bash
@@ -103,7 +106,7 @@ jobs:
             app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
             app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt \
             app/src/main/java/com/admissionhub/collector/parser/GenericAdmissionParser.kt \
-            scripts/apply_v054b.py
+            scripts/apply_v054b.py scripts/fix_v054_kotlin_escapes.py
           if git diff --cached --quiet; then
             echo "source already persisted"
           else
