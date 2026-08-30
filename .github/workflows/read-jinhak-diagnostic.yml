@@ -1,0 +1,58 @@
+name: Read Jinhak Diagnostic
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/read-jinhak-diagnostic.yml"
+      - ".diagnostics/jinhak-read-request.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  read-jinhak-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      WORKER_URL: https://admission-collector-offload.gigagene1234.workers.dev
+      INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - name: Read latest Jinhak diagnostic only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$INGEST_TOKEN"
+          latest="$(curl -fsS -H "Authorization: Bearer $INGEST_TOKEN" "$WORKER_URL/v1/runs/latest?provider=jinhak-diagnostic")"
+          echo "LATEST_JINHAK_DIAGNOSTIC_RUN=$latest"
+          run_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("runId") or "")' "$latest")"
+          if [ -z "$run_id" ]; then
+            echo "NO_JINHAK_DIAGNOSTIC_RUN"
+            exit 0
+          fi
+          status="$(curl -fsS -H "Authorization: Bearer $INGEST_TOKEN" "$WORKER_URL/v1/runs/$run_id/status")"
+          python3 - "$status" <<'PY'
+          import json, sys
+          payload=json.loads(sys.argv[1])
+          run=payload.get('run') or {}
+          errors=payload.get('recentErrors') or []
+          print('JINHAK_DIAGNOSTIC_RUN_SUMMARY=' + json.dumps({
+              'run_id': run.get('run_id'),
+              'provider': run.get('provider'),
+              'collector_version': run.get('collector_version'),
+              'uploaded_chunks': run.get('uploaded_chunks'),
+              'processed_chunks': run.get('processed_chunks'),
+              'error_count': run.get('error_count'),
+              'updated_at': run.get('updated_at'),
+          }, ensure_ascii=False, separators=(',',':')))
+          for i,e in enumerate(errors):
+              detail=e.get('detail_json')
+              try: detail=json.loads(detail) if isinstance(detail,str) else detail
+              except Exception: pass
+              print(f'JINHAK_DIAGNOSTIC_EVENT_{i}=' + json.dumps({
+                  'error_type': e.get('error_type'),
+                  'created_at': e.get('created_at'),
+                  'detail': detail,
+              }, ensure_ascii=False, separators=(',',':')))
+          PY
