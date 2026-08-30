@@ -2,6 +2,12 @@
 
 이 로드맵의 목표는 **사용자가 기능 제한을 체감하지 않는 완전 자동화**다. 단, 완전 자동화는 사이트 구조와 서비스 허용 범위를 무시한 무차별 crawler를 의미하지 않는다. Hub는 provider별로 허용된 자동화 채널을 사용하고, 최종 UX는 한 번의 실행으로 통일한다.
 
+또한 수집 최적화 과정에서 **현재 파서가 사용하지 않는 정보를 임의로 '불필요'하다고 폐기하지 않는다.** 계산량은 줄여도 되지만 관찰 증거는 별도 계층으로 보존하고, 향후 parser가 재처리할 수 있어야 한다. 특히 진학사는 관찰 시점·로그인 상태·선택 대학/전형·지원 상태·리포트 갱신시점에 따라 같은 경로에서도 다른 정보가 나타날 수 있으므로 observation-first 원칙을 강제한다.
+
+세부 정책:
+
+`OBSERVATION_PRESERVATION_POLICY.md`
+
 ## Target UX
 
 사용자가 하는 일은 최대한 다음 두 가지뿐이다.
@@ -92,6 +98,55 @@ Acceptance:
 - 일반 사용자는 provider별 페이지를 직접 순회할 필요가 없음
 - 앱 process death 후 동일 UnifiedSyncSession에서 자동 재개
 - provider switch가 사용자의 수동 조작을 요구하지 않음
+
+## 1.4 Observation-first preservation
+
+수집 엔진과 parser 사이에 `Observation Evidence` 계층을 둔다.
+
+```text
+Provider Observation
+  -> privacy/safety sanitize
+  -> Observation Evidence
+  -> page/report classifier
+  -> Structured Provider Record
+  -> Canonical Merge
+  -> Derived Analysis
+```
+
+중요 원칙:
+
+- parser가 실패해도 observation은 `unknown-potential-value`로 보존한다.
+- `jinhak-other`라는 이유로 버리지 않는다.
+- URL이 같아도 content/context fingerprint가 다르면 다른 관찰일 수 있다.
+- same-route snapshot history를 허용한다.
+- 새 parser 배포 후 저장된 observation을 재방문 없이 다시 처리할 수 있어야 한다.
+- exact duplicate, 반복 UI chrome, credential/session data, 정책상 저장 불가 데이터만 제거 대상이다.
+- 메모리/CPU 최적화는 streaming, paging, compression, lazy parsing으로 해결하고 미분류 정보 폐기로 해결하지 않는다.
+
+최소 observation metadata:
+
+```text
+observationId
+provider
+observedAt
+safeRouteKey
+providerEntityId if explicit
+effectiveAcademicYear if explicit
+pageTypeGuess + confidence
+authStateClass
+explicit selected context
+contentFingerprint
+captureVersion
+```
+
+진학사에서는 선택 대학/전형/지원상태/리포트 종류/provider update state를 content identity에 반영한다.
+
+Acceptance:
+
+- parser 실패 observation 재처리 가능
+- URL-only dedupe 금지
+- observation/structured/derived 계층 분리
+- `unknown`은 삭제 상태가 아니라 parser coverage 상태로 집계
 
 ---
 
@@ -206,11 +261,14 @@ Prediction은 actual을 overwrite하지 않는다.
 
 를 지원한다.
 
+특히 진학사의 예측·모의지원·추천·성적산출 observation은 최신값 하나로 덮어쓰지 않고 snapshot history를 허용한다.
+
 Acceptance:
 
 - provider 이름이 달라도 동일 모집단위로 안전하게 연결
 - 불확실한 department/admission은 null 유지
 - historical/prediction 혼합 0건
+- 관찰시점이 다른 provider snapshot을 임의 병합하지 않음
 
 ---
 
@@ -261,6 +319,8 @@ CSV/XLSX/JSON 등 공식 export가 있으면 파일 생성/변경을 감지하�
 ### E. User-view capture fallback
 
 위 채널이 없을 때만 현재 WebView current-screen capture를 fallback으로 사용한다. 최종 UX의 주 경로가 아니다.
+
+단, fallback 화면이 현재 parser 대상이 아니라는 이유로 observation을 폐기하지 않는다. 허용 범위 안에서 privacy-sanitized evidence를 로컬에 남기고 향후 parser가 재처리할 수 있게 한다.
 
 ## 4.3 Capability discovery
 
@@ -317,6 +377,7 @@ Acceptance:
 - 인증 후 page-by-page 사용자 조작 0회
 - prediction snapshots가 `observedAt`으로 누적
 - 공식 historical과 의미 혼합 0건
+- 동일 route의 시점/상태별 차이를 observation history로 보존
 
 ---
 
@@ -342,12 +403,16 @@ Acceptance:
 
 PDF/report import를 위한 공통 parser interface도 함께 둔다.
 
+Parser가 이해하지 못한 화면/블록은 `unknown-potential-value` observation으로 남기고, 그 비율을 parser coverage 지표로 사용한다. `unknown`을 자동 폐기 대상으로 해석하지 않는다.
+
 Acceptance:
 
 - 실제 UI/official output fixture 기반 parser tests
 - menu/editorial text가 record로 오인되지 않음
 - cross-card inheritance 없음
 - coverage metrics가 page/report type별로 노출됨
+- 미분류 observation의 재처리 가능
+- parser version 변경 시 기존 evidence를 재방문 없이 재분석 가능
 
 ---
 
@@ -389,6 +454,9 @@ Acceptance:
 각 sync 종료 전 자동 audit:
 
 - provider coverage
+- observation coverage
+- structured coverage
+- unknown/potential-value observation count
 - missing university/department/admission IDs
 - duplicate identity
 - year conflicts
@@ -400,6 +468,8 @@ Acceptance:
 지원 6장 관련 대학은 별도 priority audit한다.
 
 오류가 있어도 전체 Hub 갱신은 가능한 부분까지 진행하고 incomplete badge를 붙인다.
+
+`unknown`이 많을 경우 '불필요한 페이지 과다'가 아니라 classifier/parser coverage 부족으로 보고한다.
 
 ---
 
@@ -430,6 +500,8 @@ provider historical case
 
 사용자에게 source semantics가 명확히 보이도록 한다.
 
+현재 UI에 표시하지 않는 observation도 storage/provenance 계층에는 남을 수 있으며, 이후 기능 확장 시 재활용한다.
+
 ---
 
 # Phase 9 — Background refresh
@@ -446,7 +518,7 @@ background refresh는 authorized connector가 제공하는 조건 안에서만 �
 - export 기반이면 새 output 생성 시 import
 - provider 정책상 manual refresh만 허용하면 Hub의 한 번짜리 `통합 동기화`로 실행
 
-합격예측은 provider 자체 업데이트 주기를 고려해 무의미한 고빈도 갱신을 하지 않는다.
+합격예측은 provider 자체 업데이트 주기를 고려해 무의미한 고빈도 요청은 하지 않는다. 다만 실제 provider 내용이 달라진 snapshot은 정보 가치가 있으므로 동일 URL이라는 이유로 덮어쓰거나 폐기하지 않는다.
 
 ---
 
@@ -460,6 +532,7 @@ background refresh는 authorized connector가 제공하는 조건 안에서만 �
 
 - ProviderCapability model
 - UnifiedSyncSession state machine
+- Observation Evidence store + reprocessing contract
 - Adiga deterministic ID/year planner skeleton
 - Canonical Admissions Graph schema
 - `JinhakAuthorizedConnector` interface
@@ -505,5 +578,6 @@ background refresh는 authorized connector가 제공하는 조건 안에서만 �
 10. process death 후 자동 재개한다.
 11. 완료 후 Hub가 자동 갱신된다.
 12. provider별 페이지를 사용자가 직접 눌러 다닐 필요가 없다.
+13. 현재 parser가 이해하지 못한 관찰 정보를 임의 폐기하지 않고 재처리 가능한 evidence로 보존한다.
 
-이 12개를 모두 통과하기 전에는 '완전 자동화 완료'라고 표시하지 않는다.
+이 13개를 모두 통과하기 전에는 '완전 자동화 완료'라고 표시하지 않는다.
