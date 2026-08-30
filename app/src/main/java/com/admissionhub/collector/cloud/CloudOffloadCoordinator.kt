@@ -242,6 +242,67 @@ class CloudOffloadCoordinator(context: Context) {
         currentClient.getStatus(runId, callback)
     }
 
+
+    /**
+     * Sends only a compact operational diagnostic after local collection.
+     * It uses a separate provider/run and does not change activeRunId or upload admission records.
+     */
+    fun sendDiagnostic(
+        sourceProvider: String,
+        collectorVersion: String,
+        diagnostic: JSONObject,
+        callback: (Result<String>) -> Unit = {}
+    ) {
+        if (!isConfigured()) {
+            callback(Result.failure(IllegalStateException("Diagnostic cloud channel is not configured")))
+            return
+        }
+        val diagnosticProvider = (sourceProvider.take(24) + "-diagnostic").take(40)
+        val currentClient = synchronized(lock) { ensureClientLocked(); client }
+        if (currentClient == null) {
+            callback(Result.failure(IllegalStateException("Diagnostic client unavailable")))
+            return
+        }
+
+        fun upload(runId: String) {
+            val payload = JSONObject(diagnostic.toString())
+                .put("type", "local-diagnostic")
+                .put("sourceProvider", sourceProvider)
+                .put("collectorVersion", collectorVersion)
+            currentClient.uploadChunk(
+                runId = runId,
+                provider = diagnosticProvider,
+                records = JSONArray(),
+                page = null,
+                error = payload
+            ) { result ->
+                if (result.isSuccess) callback(Result.success(runId))
+                else callback(Result.failure(result.exceptionOrNull() ?: IllegalStateException("diagnostic upload failed")))
+            }
+        }
+
+        currentClient.getLatestActiveRun(diagnosticProvider) { lookup ->
+            val existing = lookup.getOrNull()
+            if (!existing.isNullOrBlank()) {
+                upload(existing)
+                return@getLatestActiveRun
+            }
+            currentClient.createRun(
+                provider = diagnosticProvider,
+                collectorVersion = collectorVersion,
+                metadata = JSONObject()
+                    .put("client", "android")
+                    .put("mode", "diagnostic-only")
+                    .put("containsAdmissionRecords", false)
+            ) { created ->
+                val runId = created.getOrNull()
+                if (runId == null) {
+                    callback(Result.failure(created.exceptionOrNull() ?: lookup.exceptionOrNull() ?: IllegalStateException("diagnostic run creation failed")))
+                } else upload(runId)
+            }
+        }
+    }
+
     fun snapshotStatus(): JSONObject = JSONObject()
         .put("configured", isConfigured())
         .put("workerUrl", workerUrl())

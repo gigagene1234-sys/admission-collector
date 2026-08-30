@@ -118,6 +118,11 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         arrayOf(provider)
     ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
 
+    fun latestRun(provider: String): String? = readableDatabase.rawQuery(
+        "SELECT run_id FROM runs WHERE provider=? ORDER BY updated_at DESC LIMIT 1",
+        arrayOf(provider)
+    ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+
     fun markRun(runId: String, status: String, reason: String?) {
         val cv = ContentValues().apply {
             put("status", status)
@@ -262,6 +267,101 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("completedDocuments", scalar("SELECT COUNT(*) FROM documents WHERE run_id=? AND state='completed'"))
             .put("errorDocuments", scalar("SELECT COUNT(*) FROM documents WHERE run_id=? AND state='error'"))
             .put("unresolved", unresolvedCount(runId))
+    }
+
+
+    /** Privacy-safe operational snapshot. No DOM, cookies, credentials, raw records or URLs are included. */
+    fun diagnosticSnapshot(runId: String, maxErrorPages: Int = 200): JSONObject {
+        val db = readableDatabase
+        val run = JSONObject()
+        db.rawQuery(
+            "SELECT provider,collector_version,status,completion_reason,started_at,updated_at FROM runs WHERE run_id=? LIMIT 1",
+            arrayOf(runId)
+        ).use { c ->
+            if (c.moveToFirst()) {
+                run.put("runId", runId)
+                    .put("provider", c.getString(0))
+                    .put("collectorVersion", c.getString(1))
+                    .put("status", c.getString(2))
+                    .put("completionReason", if (c.isNull(3)) JSONObject.NULL else c.getString(3))
+                    .put("startedAt", c.getString(4))
+                    .put("updatedAt", c.getString(5))
+            }
+        }
+
+        val failedPages = JSONArray()
+        db.rawQuery(
+            "SELECT family_key,requested_year,page,total_pages,retry_count,error_type,updated_at " +
+                "FROM pages WHERE run_id=? AND state='error' ORDER BY family_key,requested_year,page LIMIT ?",
+            arrayOf(runId, maxErrorPages.toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                val yr = c.getInt(1)
+                failedPages.put(JSONObject()
+                    .put("familyKey", c.getString(0))
+                    .put("requestedYear", if (yr == -1) JSONObject.NULL else yr)
+                    .put("page", c.getInt(2))
+                    .put("totalPages", c.getInt(3))
+                    .put("retryCount", c.getInt(4))
+                    .put("errorType", if (c.isNull(5)) JSONObject.NULL else c.getString(5))
+                    .put("updatedAt", c.getString(6)))
+            }
+        }
+
+        val familyProgress = JSONArray()
+        db.rawQuery(
+            "SELECT family_key,requested_year,MAX(total_pages),COUNT(*)," +
+                "SUM(CASE WHEN state='completed' THEN 1 ELSE 0 END)," +
+                "SUM(CASE WHEN state='error' THEN 1 ELSE 0 END) " +
+                "FROM pages WHERE run_id=? GROUP BY family_key,requested_year ORDER BY family_key,requested_year",
+            arrayOf(runId)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val yr = c.getInt(1)
+                familyProgress.put(JSONObject()
+                    .put("familyKey", c.getString(0))
+                    .put("requestedYear", if (yr == -1) JSONObject.NULL else yr)
+                    .put("totalPages", c.getInt(2))
+                    .put("knownPageCheckpoints", c.getInt(3))
+                    .put("completed", c.getInt(4))
+                    .put("errors", c.getInt(5)))
+            }
+        }
+
+        val documentErrorsByType = JSONArray()
+        db.rawQuery(
+            "SELECT COALESCE(error_type,'unknown'),COUNT(*) FROM documents WHERE run_id=? AND state='error' GROUP BY error_type ORDER BY COUNT(*) DESC",
+            arrayOf(runId)
+        ).use { c ->
+            while (c.moveToNext()) {
+                documentErrorsByType.put(JSONObject().put("errorType", c.getString(0)).put("count", c.getInt(1)))
+            }
+        }
+
+        val recordBreakdown = JSONArray()
+        db.rawQuery(
+            "SELECT COALESCE(record_type,'unknown'),COALESCE(year,-1),COUNT(*) FROM records WHERE run_id=? GROUP BY record_type,year ORDER BY year,record_type",
+            arrayOf(runId)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val yr = c.getInt(1)
+                recordBreakdown.put(JSONObject()
+                    .put("recordType", c.getString(0))
+                    .put("year", if (yr == -1) JSONObject.NULL else yr)
+                    .put("count", c.getInt(2)))
+            }
+        }
+
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("generatedAt", Instant.now().toString())
+            .put("run", run)
+            .put("stats", stats(runId))
+            .put("failedPages", failedPages)
+            .put("familyProgress", familyProgress)
+            .put("documentErrorsByType", documentErrorsByType)
+            .put("recordBreakdown", recordBreakdown)
+            .put("privacy", "no-dom-no-record-content-no-cookie-no-credential-no-url")
     }
 
     private fun nullableInt(obj: JSONObject, key: String): Int? =

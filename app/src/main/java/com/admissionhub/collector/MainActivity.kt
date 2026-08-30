@@ -126,8 +126,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.4.2"
-        private const val BUILD_CODE = 10420
+        private const val VERSION = "0.4.3"
+        private const val BUILD_CODE = 10430
         private const val LOCAL_FIRST_BETA = true
     }
 
@@ -238,6 +238,16 @@ class MainActivity : Activity() {
         actions2.addView(save, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         actions2.addView(localState, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
+        val actions3 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val diagnostic = Button(this).apply {
+            text = "진단 로그 전송"
+            setOnClickListener { sendLatestLocalDiagnostic(manual = true) }
+        }
+        actions3.addView(diagnostic, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
         status = TextView(this).apply {
             text = "Admission Collector v$VERSION 준비 중"
             setPadding(8, 8, 8, 8)
@@ -276,6 +286,7 @@ class MainActivity : Activity() {
         root.addView(sessionRow)
         root.addView(actions1)
         root.addView(actions2)
+        root.addView(actions3)
         root.addView(status)
         root.addView(browserStack, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f))
         root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 2f))
@@ -1525,6 +1536,39 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun sendLatestLocalDiagnostic(manual: Boolean) {
+        val runId = localRunId ?: localStore.latestRun(provider.wireName)
+        if (runId.isNullOrBlank()) {
+            if (manual) Toast.makeText(this, "전송할 로컬 수집 로그가 없습니다.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val diagnostic = localStore.diagnosticSnapshot(runId)
+            .put("trigger", if (manual) "manual" else "batch-finish")
+            .put("segment", JSONObject()
+                .put("attemptedPages", batchPageCount)
+                .put("successfulSnapshots", batchSnapshots.length())
+                .put("errorEvents", batchErrors.length())
+                .put("paginationActionsCompleted", batchPageActionVisited.size)
+                .put("paginationActionsFailed", batchPageActionFailed.size)
+                .put("paginationRetries", batchPaginationRetries)
+                .put("localPagesScheduled", batchLocalPagesScheduled)
+                .put("localPagesSkipped", batchLocalPagesSkipped)
+                .put("localRecordsPersisted", batchLocalRecordsPersisted))
+        if (manual) status.text = "진단 로그 전송 중… 원본 입시자료는 전송하지 않습니다."
+        cloudOffload.sendDiagnostic(provider.wireName, VERSION, diagnostic) { result ->
+            runOnUiThread {
+                if (result.isSuccess) {
+                    val id = result.getOrNull()?.take(8) ?: "unknown"
+                    status.text = "진단 로그 전송 완료: $id… / 원본 레코드·로그인 정보 미전송"
+                    if (manual) Toast.makeText(this, "진단 로그 전송 완료", Toast.LENGTH_SHORT).show()
+                } else if (manual) {
+                    status.text = "진단 로그 전송 실패: ${result.exceptionOrNull()?.message ?: "unknown"}"
+                    Toast.makeText(this, "진단 로그 전송 실패", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     private fun finishBatch(reason: String) {
         batchRunning = false
         batchPausedForLogin = false
@@ -1546,6 +1590,10 @@ class MainActivity : Activity() {
             localStore.markRun(runId, runState, effectiveReason)
         }
         finalizeBatchJson(effectiveReason)
+        if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
+            // Telemetry is sent only after the crawl has stopped, never per page.
+            sendLatestLocalDiagnostic(manual = false)
+        }
         if (!LOCAL_FIRST_BETA && effectiveReason == "completed" && batchCloudPagesDeferred == 0) {
             cloudOffload.finish(
                 reason = effectiveReason,
