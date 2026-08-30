@@ -147,6 +147,15 @@ object SnapshotScript {
     if(ct.length>=2 && !forbidden.test(ct) && !loginSensitive.test(ct)) context.push(ct);
   }
 
+  var selectionContext=[];
+  var selectedNodes=document.querySelectorAll('select option:checked,[aria-selected=true],.selected,.active,[class*=selected],[class*=active]');
+  for(var si=0;si<selectedNodes.length && selectionContext.length<80;si++){
+    var se=selectedNodes[si];
+    if(se.tagName!=='OPTION' && !visible(se)) continue;
+    var st=safeCloneText(se,500);
+    if(st.length>=2 && admissionTerms.test(st) && !forbidden.test(st) && !loginSensitive.test(st)) selectionContext.push(st);
+  }
+
   var tables=[];
   var captureHiddenDetail=/(^|\.)jinhak\.com$/i.test(location.hostname) || /\/(?:ucp\/uvt\/uni\/univDetailSelection|uct\/acd\/ade\/criteriaAndResultPopup)\.do$/i.test(location.pathname);
   var tableNodes=document.querySelectorAll('table,[role=table]');
@@ -269,6 +278,7 @@ object SnapshotScript {
     listMeta:{totalItems:isNaN(listTotal)?-1:listTotal,visibleDataRows:visibleDataRows},
     discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length},
     context:context,
+    selectionContext:selectionContext,
     tables:tables,
     blocks:blocks,
     navigationLinks:nav,

@@ -128,8 +128,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.5.1"
-        private const val BUILD_CODE = 10510
+        private const val VERSION = "0.5.2"
+        private const val BUILD_CODE = 10520
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }

@@ -54,6 +54,8 @@ object GenericAdmissionParser {
 
     fun inferSnapshotContext(snapshot: JSONObject): InferredContext {
         val priority = mutableListOf<String>()
+        val selected = snapshot.optJSONArray("selectionContext") ?: JSONArray()
+        for (i in 0 until minOf(selected.length(), 80)) selected.optString(i).trim().takeIf { it.isNotBlank() }?.let(priority::add)
         snapshot.optString("title").trim().takeIf { it.isNotBlank() }?.let(priority::add)
         val context = snapshot.optJSONArray("context") ?: JSONArray()
         for (i in 0 until minOf(context.length(), 80)) context.optString(i).trim().takeIf { it.isNotBlank() }?.let(priority::add)
@@ -85,11 +87,12 @@ object GenericAdmissionParser {
             .findAll(text).map { cleanCandidate(it.groupValues[1]) }.filter { it.length in 4..45 }.toList()
         universityMatches.firstOrNull()?.let { return it }
 
-        val excludedCollege = Regex("(공과대학|인문대학|사회과학대학|자연과학대학|의과대학|약학대학|간호대학|경상대학|사범대학|예술대학|디자인대학|IT대학|철도대학|보건대학|융합대학|천안공과대학)$")
-        return Regex("([가-힣A-Za-z0-9·.()\\-]{2,30}대학)")
+        // Bare "대학" is usually a college/faculty or prose fragment on Jinhak pages.
+        // Prefer a missing university over attaching prediction metrics to a false institution.
+        return Regex("([가-힣A-Za-z0-9·.()-]{2,35}(?:교육대학교|과학기술원))")
             .findAll(text)
             .map { cleanCandidate(it.groupValues[1]) }
-            .firstOrNull { it.length in 3..35 && !excludedCollege.containsMatchIn(it) }
+            .firstOrNull { it.length in 4..45 }
     }
 
     private fun bestDepartment(text: String): String? {
@@ -118,7 +121,7 @@ object GenericAdmissionParser {
             known.findAll(segment).forEach { candidates += cleanCandidate(it.groupValues[1]) }
         }
         return candidates.firstOrNull {
-            it.length in 2..40 && !Regex("[①-⑳]|[0-9]+\\)|학생부 반영비율|있는 전형|없는 서류|설명|안내").containsMatchIn(it)
+            it.length in 2..40 && !Regex("[①-⑳]|[0-9]+\\)|학생부 반영비율|있는 전형|없는 서류|설명|안내|^서류\\s*평가\\s*전형$|^서류\\s*전형$|^면접\\s*전형$").containsMatchIn(it)
         }
     }
 
