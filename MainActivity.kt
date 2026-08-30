@@ -128,8 +128,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.5.4"
-        private const val BUILD_CODE = 10540
+        private const val VERSION = "0.5.5"
+        private const val BUILD_CODE = 10550
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1021,6 +1021,20 @@ class MainActivity : Activity() {
 
     private fun buildJinhakDigest(snapshot: JSONObject, records: JSONArray, runId: String, collectedAt: String): JSONObject {
         val sanitized = JSONArray()
+        var universityBound = 0
+        var departmentBound = 0
+        var admissionBound = 0
+        var fullyBound = 0
+        for (i in 0 until records.length()) {
+            val r = records.optJSONObject(i) ?: continue
+            val hasUniversity = !r.isNull("university") && r.optString("university").isNotBlank()
+            val hasDepartment = !r.isNull("department") && r.optString("department").isNotBlank()
+            val hasAdmission = !r.isNull("admission") && r.optString("admission").isNotBlank()
+            if (hasUniversity) universityBound += 1
+            if (hasDepartment) departmentBound += 1
+            if (hasAdmission) admissionBound += 1
+            if (hasUniversity && hasDepartment && hasAdmission) fullyBound += 1
+        }
         val limit = minOf(records.length(), 120)
         for (i in 0 until limit) {
             val r = records.optJSONObject(i) ?: continue
@@ -1036,7 +1050,9 @@ class MainActivity : Activity() {
                 .put("confidence", r.optString("confidence"))
                 .put("observedAt", r.optString("observedAt", collectedAt))
                 .put("cardIndex", if (r.has("cardIndex")) r.optInt("cardIndex") else JSONObject.NULL)
-                .put("contextSource", r.optString("contextSource")))
+                .put("contextSource", r.optString("contextSource"))
+                .put("universityContextSource", if (r.isNull("universityContextSource")) JSONObject.NULL else r.optString("universityContextSource"))
+                .put("universityContextDepth", r.optInt("universityContextDepth", -1)))
         }
         return JSONObject()
             .put("schemaVersion", 1)
@@ -1046,6 +1062,12 @@ class MainActivity : Activity() {
             .put("recordCount", records.length())
             .put("detectedStorageCards", snapshot.optJSONArray("jinhakCards")?.length() ?: 0)
             .put("cardCaptureStats", snapshot.optJSONObject("jinhakCardStats") ?: JSONObject())
+            .put("bindingStats", JSONObject()
+                .put("universityBound", universityBound)
+                .put("departmentBound", departmentBound)
+                .put("admissionBound", admissionBound)
+                .put("fullyBound", fullyBound)
+                .put("totalRecords", records.length()))
             .put("includedRecords", sanitized.length())
             .put("truncated", records.length() > sanitized.length())
             .put("localStats", localStore.stats(runId))

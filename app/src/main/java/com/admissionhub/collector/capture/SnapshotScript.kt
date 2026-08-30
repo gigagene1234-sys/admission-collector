@@ -157,7 +157,7 @@ object SnapshotScript {
   }
 
   var jinhakCards=[];
-  var jinhakCardStats={metricSeeds:0,candidateRoots:0,uniqueRoots:0};
+  var jinhakCardStats={metricSeeds:0,candidateRoots:0,uniqueRoots:0,universityBoundRoots:0,universityContextRoots:0,universityMissingRoots:0};
   if(/(^|\.)jinhak\.com$/i.test(location.hostname)){
     var metricRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|경쟁률|모의지원|합격예측|지원판정|내\s*순위|모집인원)/i;
     var primaryRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|합격예측|지원판정|내\s*순위|예상\s*(?:합격선|컷))/i;
@@ -218,10 +218,90 @@ object SnapshotScript {
       if(overlap>=0){if(bestScore>roots[overlap].score) roots[overlap]={el:bestEl,text:bestText,score:bestScore};}
       else roots.push({el:bestEl,text:bestText,score:bestScore});
     }
+    function explicitUniversityNames(text){
+      text=cleanText(text);
+      var names=[];
+      var full=/([가-힣A-Za-z0-9·.()\-]{2,35}(?:대학교|교육대학교|과학기술원)(?:\[[^\]]{1,12}\])?)/ig;
+      var fm;
+      while((fm=full.exec(text))!==null){
+        var fv=cleanText(fm[1]);
+        if(fv && names.indexOf(fv)<0) names.push(fv);
+      }
+      // Jinhak sometimes renders a university as a short name such as "한밭대".
+      // Accept only a concise, explicit token and reject generic college abbreviations.
+      var short=/(?:^|[\s|])([가-힣A-Za-z0-9·.()\-]{2,24}대)(?=$|[\s|\[\](),·/])/g;
+      var sm;
+      var shortNoise=/^(?:공대|의대|법대|상대|교대|사범대|간호대|약대|치대|한의대|철도대)$/;
+      while((sm=short.exec(text))!==null){
+        var sv=cleanText(sm[1]);
+        if(!sv||shortNoise.test(sv)||/(지원|합격|예측|전형|모집|학부|학과)/.test(sv)) continue;
+        if(names.indexOf(sv)<0) names.push(sv);
+      }
+      return names;
+    }
+    function universityContextFor(el,rootText){
+      var direct=explicitUniversityNames(rootText);
+      if(direct.length===1) return {name:direct[0],source:'card-root',depth:0};
+      var cur=el;
+      for(var depth=0;cur&&depth<9;depth++){
+        var attrs=cleanText((cur.getAttribute&&cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute&&cur.getAttribute('title')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-univ-name')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-university-name')||''));
+        var an=explicitUniversityNames(attrs);
+        if(an.length===1) return {name:an[0],source:'ancestor-attribute',depth:depth};
+
+        var prev=cur.previousElementSibling;
+        for(var pi=0;prev&&pi<6;pi++,prev=prev.previousElementSibling){
+          if(!visible(prev)) continue;
+          var pt=structuredCardText(prev,1000);
+          var pn=explicitUniversityNames(pt);
+          var pm=cleanText((prev.tagName||'')+' '+(prev.id||'')+' '+(prev.className||''));
+          if(pn.length===1 && (pt.length<=260 || /title|tit|name|univ|college|header|head/i.test(pm))){
+            return {name:pn[0],source:'preceding-sibling',depth:depth};
+          }
+          if(depth===0 && primaryRx.test(pt)) break;
+        }
+
+        var next=cur.nextElementSibling;
+        for(var ni=0;next&&ni<3;ni++,next=next.nextElementSibling){
+          if(!visible(next)) continue;
+          var nt=structuredCardText(next,700);
+          if(primaryRx.test(nt)) break;
+          var nn=explicitUniversityNames(nt);
+          var nm=cleanText((next.tagName||'')+' '+(next.id||'')+' '+(next.className||''));
+          if(nn.length===1 && (nt.length<=180 || /title|tit|name|univ|college|header|head/i.test(nm))){
+            return {name:nn[0],source:'following-sibling',depth:depth};
+          }
+        }
+
+        var parent=cur.parentElement;
+        if(!parent) break;
+        var parentText=structuredCardText(parent,10000);
+        var parentNames=explicitUniversityNames(parentText);
+        if(parentNames.length===1){
+          return {name:parentNames[0],source:'ancestor-unique',depth:depth+1};
+        }
+        cur=parent;
+      }
+      return {name:'',source:'missing',depth:-1};
+    }
     for(var jr=0;jr<roots.length&&jinhakCards.length<120;jr++){
       var entry=roots[jr];
       if(!primaryRx.test(entry.text)) continue;
-      jinhakCards.push({text:entry.text,score:entry.score,rootTag:String(entry.el.tagName||'').slice(0,20),primaryPrediction:true});
+      var universityCtx=universityContextFor(entry.el,entry.text);
+      if(universityCtx.name){
+        jinhakCardStats.universityBoundRoots++;
+        if(universityCtx.source!=='card-root') jinhakCardStats.universityContextRoots++;
+      }else{
+        jinhakCardStats.universityMissingRoots++;
+      }
+      jinhakCards.push({
+        text:entry.text,
+        score:entry.score,
+        rootTag:String(entry.el.tagName||'').slice(0,20),
+        primaryPrediction:true,
+        university:universityCtx.name,
+        universitySource:universityCtx.source,
+        universityDepth:universityCtx.depth
+      });
     }
     jinhakCardStats.uniqueRoots=jinhakCards.length;
   }

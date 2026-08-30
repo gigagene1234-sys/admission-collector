@@ -65,9 +65,12 @@ object JinhakAdapter : ProviderAdapter {
                     .replace(Regex("""\s+"""), " ").trim().take(5000)
                 if (evidence.isBlank()) continue
                 val local = GenericAdmissionParser.inferContext(evidence)
-                val university = local.university
+                val explicitUniversity = cleanStorageUniversity(cardObj?.optString("university"))
+                val university = local.university ?: explicitUniversity
                 val department = cleanStorageDepartment(local.department)
                 val admission = cleanStorageAdmission(local.admission, evidence)
+                val universityContextSource = cardObj?.optString("universitySource")
+                    ?.takeIf { it.isNotBlank() && it != "missing" }
                 val cardMetrics = predictionMetrics(evidence)
                 val hasPrimaryPrediction = listOf(
                     "stabilityBars", "predictionProbability", "predictionLabel", "myRank", "predictedCut"
@@ -88,7 +91,9 @@ object JinhakAdapter : ProviderAdapter {
                     .put("metrics", cardMetrics)
                     .put("observedAt", observedAt)
                     .put("cardIndex", i)
-                    .put("contextSource", "scored-card-root")
+                    .put("contextSource", if (local.university == null && explicitUniversity != null) "scored-card-root+explicit-university-context" else "scored-card-root")
+                    .put("universityContextSource", universityContextSource ?: JSONObject.NULL)
+                    .put("universityContextDepth", cardObj?.optInt("universityDepth", -1) ?: -1)
                     .put("cardRootScore", cardObj?.optInt("score", 0) ?: 0)
                     .put("confidence", when {
                         university != null && department != null && admission != null -> "high"
@@ -172,6 +177,20 @@ object JinhakAdapter : ProviderAdapter {
         ).joinToString("|")
         val scope = if (preserveSnapshot) observedAt.substring(0, 16) else "stable"
         return RecordUtils.sha256("jinhak|$scope|$stable")
+    }
+
+    private fun cleanStorageUniversity(value: String?): String? {
+        val raw = value?.replace(Regex("""\s+"""), " ")?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        if (raw.length !in 3..48) return null
+        if (Regex("""(등급|경쟁률|합격|예측|지원|전형|모집|학과|학부|전공)""").containsMatchIn(raw)) return null
+        val full = Regex("""^[가-힣A-Za-z0-9·.()\-]{2,35}(?:대학교|교육대학교|과학기술원)(?:\[[^\]]{1,12}\])?$""")
+        val short = Regex("""^[가-힣A-Za-z0-9·.()\-]{2,24}대$""")
+        val shortNoise = setOf("공대", "의대", "법대", "상대", "교대", "사범대", "간호대", "약대", "치대", "한의대", "철도대")
+        return when {
+            full.matches(raw) -> raw
+            short.matches(raw) && raw !in shortNoise -> raw
+            else -> null
+        }
     }
 
     private fun cleanStorageDepartment(value: String?): String? {
