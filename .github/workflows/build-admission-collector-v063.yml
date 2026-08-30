@@ -1,0 +1,160 @@
+name: Build Admission Collector v0.6.3 Unified Autonomous Explorer
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v063.yml"
+      - "scripts/apply_v063.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip ci]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.6.3 patch
+        run: python3 scripts/apply_v063.py
+
+      - name: Verify v0.6.3 source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp -s MainActivity.kt app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          grep -q 'private const val VERSION = "0.6.3"' MainActivity.kt
+          grep -q 'private const val BUILD_CODE = 10630' MainActivity.kt
+          grep -q 'versionCode = 10630' app/build.gradle.kts
+          grep -q 'versionName = "0.6.3"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.6.3 Unified Autonomous Explorer' app/src/main/AndroidManifest.xml
+          grep -q 'override val supportsBatchCrawl = true' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'rootPage -> "jinhak-home"' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'val headingText = buildString' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'mockReport -> "jinhak-mock-support-report"' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'jinhak-tv|univ-entrance-info|susi-special' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'currentJinhak&&targetJinhak' app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          grep -q 'sameJinhakProvider' app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          grep -q 'handleAdigaBlockingDialog' MainActivity.kt
+          grep -q 'site-blocking-dialog' MainActivity.kt
+          grep -q 'MAX_JINHAK_AUTONAV_PAGES = 420' MainActivity.kt
+          grep -q 'version: "0.3.9"' cloudflare/src/index.js
+
+      - name: Verify safety boundaries
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          a=snap.index('    function departmentContextFor(el,rootText){')
+          b=snap.index('    function universityContextFor(el,rootText){', a)
+          section=snap[a:b]
+          for forbidden in ['previousElementSibling','nextElementSibling','structuredCardText(prev','structuredCardText(next']:
+              if forbidden in section:
+                  raise SystemExit(f'cross-card department inheritance reintroduced: {forbidden}')
+
+          # Cross-origin traversal is permitted only inside the Jinhak domain family.
+          if "currentJinhak&&targetJinhak" not in snap or "sameJinhakProvider" not in snap:
+              raise SystemExit('Jinhak subdomain boundary missing')
+
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          a=m.index('    private fun buildJinhakDigest(')
+          b=m.index('    private fun sendLatestJinhakAnalysisDigest()', a)
+          digest=m[a:b]
+          for forbidden in ['snapshot.optString("url")','rawEvidence','navigationLinks','optJSONObject("session")']:
+              if forbidden in digest:
+                  raise SystemExit(f'forbidden Jinhak network payload source: {forbidden}')
+
+          j=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          if 'pageType == "jinhak-home"' not in j:
+              raise SystemExit('Jinhak home normalization guard missing')
+          for blocked in ['member','spassdata','jinhak-tv','customer']:
+              if blocked not in j:
+                  raise SystemExit(f'blocked Jinhak surface missing: {blocked}')
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -pass env:ANDROID_SIGNING_SECRET \
+            -in signing/admission-upload.keystore.enc \
+            -out "$STORE"
+          keytool -list -keystore "$STORE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build v0.6.3 APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "versionCode='10630'" /tmp/badging.txt
+          grep -q "versionName='0.6.3'" /tmp/badging.txt
+          sha256sum "$APK" | tee /tmp/apk.sha256
+
+      - name: Persist generated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt \
+            app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
+            scripts/apply_v063.py
+          if git diff --cached --quiet; then
+            echo "source already persisted"
+          else
+            git commit -m "Apply v0.6.3 structural Jinhak autonomous explorer [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-v0.6.3-unified-autonomous-explorer-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
