@@ -5,6 +5,10 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.admissionhub.collector.parser.RecordUtils
+import com.admissionhub.collector.observation.ObservationEvidence
+import com.admissionhub.collector.adiga.AdigaPlanTask
+import com.admissionhub.collector.canonical.CanonicalEntity
+import com.admissionhub.collector.canonical.ProviderEntityMapping
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
@@ -21,8 +25,120 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "admission_collector_local_v1.db",
     null,
-    3
+    4
 ) {
+    private fun ensureFoundationSchema(db: SQLiteDatabase) {
+        // Content-aware captures: same route can expose different data at another time/context.
+        runCatching { db.execSQL("ALTER TABLE unified_analysis_captures ADD COLUMN content_fingerprint TEXT") }
+        runCatching { db.execSQL("ALTER TABLE unified_analysis_captures ADD COLUMN context_fingerprint TEXT") }
+        runCatching { db.execSQL("ALTER TABLE unified_sessions ADD COLUMN orchestrator_state TEXT") }
+        runCatching { db.execSQL("ALTER TABLE unified_sessions ADD COLUMN requires_user_action INTEGER NOT NULL DEFAULT 0") }
+        db.execSQL("DROP INDEX IF EXISTS idx_unified_capture_page")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_unified_capture_route ON unified_analysis_captures(session_id,provider,page_key)")
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_unified_capture_identity ON unified_analysis_captures(session_id,provider,page_key,context_fingerprint,content_fingerprint)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS observations(
+              observation_id TEXT PRIMARY KEY,
+              session_id TEXT,
+              run_id TEXT,
+              provider TEXT NOT NULL,
+              safe_route_key TEXT NOT NULL,
+              page_type_guess TEXT,
+              page_type_confidence REAL NOT NULL DEFAULT 0,
+              auth_state_class TEXT,
+              explicit_context_json TEXT NOT NULL,
+              context_fingerprint TEXT NOT NULL,
+              content_fingerprint TEXT NOT NULL,
+              capture_version TEXT NOT NULL,
+              evidence_json TEXT NOT NULL,
+              reprocess_state TEXT NOT NULL DEFAULT 'pending',
+              first_observed_at TEXT NOT NULL,
+              last_observed_at TEXT NOT NULL,
+              seen_count INTEGER NOT NULL DEFAULT 1,
+              updated_at TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_observations_session_provider ON observations(session_id,provider,last_observed_at)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_observations_route ON observations(provider,safe_route_key)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_observations_reprocess ON observations(provider,reprocess_state,last_observed_at)")
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_content_identity ON observations(provider,safe_route_key,context_fingerprint,content_fingerprint)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS provider_capability_evidence(
+              evidence_id TEXT PRIMARY KEY,
+              session_id TEXT,
+              provider TEXT NOT NULL,
+              capability TEXT NOT NULL,
+              status TEXT NOT NULL,
+              safe_route_key TEXT NOT NULL,
+              evidence_json TEXT NOT NULL,
+              observed_at TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_provider_capability ON provider_capability_evidence(provider,capability,observed_at)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS sync_state_events(
+              event_id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              provider TEXT,
+              requires_user_action INTEGER NOT NULL DEFAULT 0,
+              detail_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_sync_state_session ON sync_state_events(session_id,created_at)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS canonical_entities(
+              canonical_id TEXT PRIMARY KEY,
+              entity_type TEXT NOT NULL,
+              academic_year INTEGER,
+              canonical_name TEXT NOT NULL,
+              parent_canonical_id TEXT,
+              metadata_json TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_canonical_entity_type_year ON canonical_entities(entity_type,academic_year,canonical_name)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS provider_entity_mappings(
+              provider TEXT NOT NULL,
+              provider_entity_type TEXT NOT NULL,
+              provider_entity_id TEXT NOT NULL,
+              academic_year INTEGER NOT NULL DEFAULT -1,
+              canonical_entity_id TEXT NOT NULL,
+              raw_label TEXT,
+              confidence REAL NOT NULL DEFAULT 0,
+              evidence_observation_id TEXT,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(provider,provider_entity_type,provider_entity_id,academic_year)
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_provider_mapping_canonical ON provider_entity_mappings(canonical_entity_id,provider)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS adiga_plan_tasks(
+              task_id TEXT PRIMARY KEY,
+              session_id TEXT,
+              academic_year INTEGER NOT NULL,
+              university_code TEXT NOT NULL,
+              task_type TEXT NOT NULL,
+              safe_url TEXT NOT NULL,
+              state TEXT NOT NULL DEFAULT 'planned',
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              error_type TEXT,
+              updated_at TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_adiga_plan_identity ON adiga_plan_tasks(academic_year,university_code,task_type)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_adiga_plan_state ON adiga_plan_tasks(state,updated_at)")
+    }
+
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("""
             CREATE TABLE runs(
@@ -115,6 +231,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         """.trimIndent())
         db.execSQL("CREATE INDEX idx_unified_sessions_status ON unified_sessions(status,updated_at)")
         db.execSQL("CREATE UNIQUE INDEX idx_unified_capture_page ON unified_analysis_captures(session_id,provider,page_key)")
+        ensureFoundationSchema(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -162,6 +279,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             """.trimIndent())
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_unified_sessions_status ON unified_sessions(status,updated_at)")
             db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_unified_capture_page ON unified_analysis_captures(session_id,provider,page_key)")
+        }
+        if (oldVersion < 4) {
+            ensureFoundationSchema(db)
         }
     }
 
@@ -234,13 +354,19 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     ) {
         if (sessionId.isBlank() || provider.isBlank() || pageKey.isBlank()) return
         val now = Instant.now().toString()
-        val captureId = RecordUtils.sha256("$sessionId|$provider|$pageKey")
+        val context = ObservationEvidence.explicitContextFromDigest(payload)
+        val identity = ObservationEvidence.identity(provider, pageKey, context, payload)
+        val captureId = RecordUtils.sha256(
+            "$sessionId|$provider|$pageKey|${identity.contextFingerprint}|${identity.contentFingerprint}"
+        )
         val cv = ContentValues().apply {
             put("session_id", sessionId)
             put("capture_id", captureId)
             put("provider", provider)
             put("page_key", pageKey)
             put("page_type", pageType)
+            put("content_fingerprint", identity.contentFingerprint)
+            put("context_fingerprint", identity.contextFingerprint)
             put("payload_json", payload.toString())
             put("captured_at", now)
         }
@@ -253,12 +379,201 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         )
     }
 
+    fun storeObservationEvidence(
+        sessionId: String?,
+        runId: String?,
+        provider: String,
+        safeRouteKey: String,
+        pageTypeGuess: String?,
+        pageTypeConfidence: Double,
+        authStateClass: String,
+        explicitContext: JSONObject,
+        evidence: JSONObject,
+        captureVersion: String
+    ): String {
+        val route = safeRouteKey.ifBlank { "unknown" }.take(500)
+        val identity = ObservationEvidence.identity(provider, route, explicitContext, evidence)
+        val now = Instant.now().toString()
+        val db = writableDatabase
+        val exists = db.rawQuery(
+            "SELECT observation_id,seen_count,first_observed_at FROM observations WHERE observation_id=? LIMIT 1",
+            arrayOf(identity.observationId)
+        ).use { c ->
+            if (c.moveToFirst()) Triple(c.getString(0), c.getInt(1), c.getString(2)) else null
+        }
+        if (exists == null) {
+            val cv = ContentValues().apply {
+                put("observation_id", identity.observationId)
+                putNullable("session_id", sessionId)
+                putNullable("run_id", runId)
+                put("provider", provider)
+                put("safe_route_key", route)
+                putNullable("page_type_guess", pageTypeGuess)
+                put("page_type_confidence", pageTypeConfidence.coerceIn(0.0, 1.0))
+                put("auth_state_class", authStateClass.take(80))
+                put("explicit_context_json", explicitContext.toString())
+                put("context_fingerprint", identity.contextFingerprint)
+                put("content_fingerprint", identity.contentFingerprint)
+                put("capture_version", captureVersion)
+                put("evidence_json", evidence.toString())
+                put("reprocess_state", "pending")
+                put("first_observed_at", now)
+                put("last_observed_at", now)
+                put("seen_count", 1)
+                put("updated_at", now)
+            }
+            db.insertOrThrow("observations", null, cv)
+        } else {
+            val cv = ContentValues().apply {
+                putNullable("session_id", sessionId)
+                putNullable("run_id", runId)
+                putNullable("page_type_guess", pageTypeGuess)
+                put("page_type_confidence", pageTypeConfidence.coerceIn(0.0, 1.0))
+                put("auth_state_class", authStateClass.take(80))
+                put("capture_version", captureVersion)
+                put("evidence_json", evidence.toString())
+                put("last_observed_at", now)
+                put("seen_count", exists.second + 1)
+                put("updated_at", now)
+            }
+            db.update("observations", cv, "observation_id=?", arrayOf(identity.observationId))
+        }
+        return identity.observationId
+    }
+
+    fun observationStats(sessionId: String?): JSONObject {
+        val args: Array<String> = if (sessionId == null) emptyArray() else arrayOf(sessionId)
+        val totalSql = if (sessionId == null) {
+            "SELECT COUNT(*) FROM observations"
+        } else {
+            "SELECT COUNT(*) FROM observations WHERE session_id=?"
+        }
+        val unknownSql = if (sessionId == null) {
+            "SELECT COUNT(*) FROM observations WHERE page_type_guess IS NULL OR page_type_guess IN ('','jinhak-other')"
+        } else {
+            "SELECT COUNT(*) FROM observations WHERE session_id=? AND (page_type_guess IS NULL OR page_type_guess IN ('','jinhak-other'))"
+        }
+        fun scalar(sql: String): Int = readableDatabase.rawQuery(sql, args).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+        return JSONObject()
+            .put("observations", scalar(totalSql))
+            .put("unknownOrPotential", scalar(unknownSql))
+    }
+
+    fun storeProviderCapabilityEvidence(
+        sessionId: String?,
+        provider: String,
+        capability: String,
+        status: String,
+        safeRouteKey: String,
+        evidence: JSONObject
+    ) {
+        val now = Instant.now().toString()
+        val stable = "$provider|$capability|$status|$safeRouteKey|${evidence.toString()}"
+        val id = RecordUtils.sha256(stable)
+        val cv = ContentValues().apply {
+            put("evidence_id", id)
+            putNullable("session_id", sessionId)
+            put("provider", provider)
+            put("capability", capability)
+            put("status", status)
+            put("safe_route_key", safeRouteKey.take(500))
+            put("evidence_json", evidence.toString())
+            put("observed_at", now)
+        }
+        writableDatabase.insertWithOnConflict("provider_capability_evidence", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun recordSyncState(
+        sessionId: String,
+        state: String,
+        provider: String?,
+        detail: JSONObject,
+        requiresUserAction: Boolean
+    ) {
+        val now = Instant.now().toString()
+        val eventId = RecordUtils.sha256("$sessionId|$state|${provider ?: ""}|$now|${detail.toString()}")
+        val cv = ContentValues().apply {
+            put("event_id", eventId)
+            put("session_id", sessionId)
+            put("state", state)
+            putNullable("provider", provider)
+            put("requires_user_action", if (requiresUserAction) 1 else 0)
+            put("detail_json", detail.toString())
+            put("created_at", now)
+        }
+        writableDatabase.insertOrThrow("sync_state_events", null, cv)
+        val session = ContentValues().apply {
+            put("orchestrator_state", state)
+            put("requires_user_action", if (requiresUserAction) 1 else 0)
+            put("updated_at", now)
+        }
+        writableDatabase.update("unified_sessions", session, "session_id=?", arrayOf(sessionId))
+    }
+
+    fun storeAdigaPlanTasks(sessionId: String?, tasks: List<AdigaPlanTask>): Int {
+        if (tasks.isEmpty()) return 0
+        val db = writableDatabase
+        var count = 0
+        db.beginTransaction()
+        try {
+            for (task in tasks) {
+                val cv = ContentValues().apply {
+                    put("task_id", task.taskId)
+                    putNullable("session_id", sessionId)
+                    put("academic_year", task.academicYear)
+                    put("university_code", task.universityCode)
+                    put("task_type", task.taskType.name)
+                    put("safe_url", task.url)
+                    put("state", "planned")
+                    put("retry_count", 0)
+                    putNull("error_type")
+                    put("updated_at", Instant.now().toString())
+                }
+                if (db.insertWithOnConflict("adiga_plan_tasks", null, cv, SQLiteDatabase.CONFLICT_IGNORE) != -1L) count += 1
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return count
+    }
+
+    fun upsertCanonicalEntity(entity: CanonicalEntity, metadata: JSONObject = JSONObject()) {
+        val now = Instant.now().toString()
+        val cv = ContentValues().apply {
+            put("canonical_id", entity.canonicalId)
+            put("entity_type", entity.entityType.name)
+            if (entity.academicYear == null) putNull("academic_year") else put("academic_year", entity.academicYear)
+            put("canonical_name", entity.canonicalName)
+            putNullable("parent_canonical_id", entity.parentCanonicalId)
+            put("metadata_json", metadata.toString())
+            put("created_at", now)
+            put("updated_at", now)
+        }
+        writableDatabase.insertWithOnConflict("canonical_entities", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun upsertProviderEntityMapping(mapping: ProviderEntityMapping) {
+        val cv = ContentValues().apply {
+            put("provider", mapping.provider)
+            put("provider_entity_type", mapping.providerEntityType)
+            put("provider_entity_id", mapping.providerEntityId)
+            put("academic_year", mapping.academicYear ?: -1)
+            put("canonical_entity_id", mapping.canonicalEntityId)
+            putNullable("raw_label", mapping.rawLabel)
+            put("confidence", mapping.confidence.coerceIn(0.0, 1.0))
+            putNullable("evidence_observation_id", mapping.evidenceObservationId)
+            put("updated_at", Instant.now().toString())
+        }
+        writableDatabase.insertWithOnConflict("provider_entity_mappings", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
     fun unifiedStatus(sessionId: String): JSONObject {
         val out = JSONObject().put("sessionId", sessionId)
         var adigaRun: String? = null
         var jinhakRun: String? = null
         readableDatabase.rawQuery(
-            "SELECT collector_version,status,phase,adiga_run_id,jinhak_run_id,completion_reason,started_at,updated_at FROM unified_sessions WHERE session_id=? LIMIT 1",
+            "SELECT collector_version,status,phase,adiga_run_id,jinhak_run_id,completion_reason,started_at,updated_at,orchestrator_state,requires_user_action FROM unified_sessions WHERE session_id=? LIMIT 1",
             arrayOf(sessionId)
         ).use { c ->
             if (c.moveToFirst()) {
@@ -268,6 +583,8 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                     .put("completionReason", if (c.isNull(5)) JSONObject.NULL else c.getString(5))
                     .put("startedAt", c.getString(6))
                     .put("updatedAt", c.getString(7))
+                    .put("orchestratorState", if (c.isNull(8)) JSONObject.NULL else c.getString(8))
+                    .put("requiresUserAction", !c.isNull(9) && c.getInt(9) != 0)
                 adigaRun = if (c.isNull(3)) null else c.getString(3)
                 jinhakRun = if (c.isNull(4)) null else c.getString(4)
             }
@@ -296,6 +613,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                 .put("adiga", "official-current-and-historical-baseline")
                 .put("jinhak", "user-viewed-derived-analysis-and-prediction")
                 .put("predictionIsNotHistoricalActual", true))
+            .put("observationStore", observationStats(sessionId))
         return out
     }
 
@@ -381,8 +699,48 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             }
             writer.write("]")
         }
+        fun writeObservations() {
+            writer.write("[")
+            var first = true
+            readableDatabase.rawQuery(
+                "SELECT observation_id,provider,safe_route_key,page_type_guess,page_type_confidence,auth_state_class,explicit_context_json,content_fingerprint,context_fingerprint,capture_version,evidence_json,reprocess_state,first_observed_at,last_observed_at,seen_count FROM observations WHERE session_id=? ORDER BY last_observed_at,observation_id",
+                arrayOf(sessionId)
+            ).use { c ->
+                while (c.moveToNext()) {
+                    if (!first) writer.write(",")
+                    first = false
+                    writer.write("{\"observationId\":")
+                    writeNullableString(c.getString(0))
+                    writer.write(",\"provider\":")
+                    writeNullableString(c.getString(1))
+                    writer.write(",\"safeRouteKey\":")
+                    writeNullableString(c.getString(2))
+                    writer.write(",\"pageTypeGuess\":")
+                    writeNullableString(if (c.isNull(3)) null else c.getString(3))
+                    writer.write(",\"pageTypeConfidence\":${c.getDouble(4)}")
+                    writer.write(",\"authStateClass\":")
+                    writeNullableString(if (c.isNull(5)) null else c.getString(5))
+                    writer.write(",\"explicitContext\":${c.getString(6)}")
+                    writer.write(",\"contentFingerprint\":")
+                    writeNullableString(c.getString(7))
+                    writer.write(",\"contextFingerprint\":")
+                    writeNullableString(c.getString(8))
+                    writer.write(",\"captureVersion\":")
+                    writeNullableString(c.getString(9))
+                    writer.write(",\"evidence\":${c.getString(10)}")
+                    writer.write(",\"reprocessState\":")
+                    writeNullableString(c.getString(11))
+                    writer.write(",\"firstObservedAt\":")
+                    writeNullableString(c.getString(12))
+                    writer.write(",\"lastObservedAt\":")
+                    writeNullableString(c.getString(13))
+                    writer.write(",\"seenCount\":${c.getInt(14)}}")
+                }
+            }
+            writer.write("]")
+        }
 
-        writer.write("{\"schemaVersion\":2,\"type\":\"admission-unified-two-provider-export\",\"session\":")
+        writer.write("{\"schemaVersion\":3,\"type\":\"admission-unified-two-provider-export\",\"session\":")
         writer.write(status.toString())
         writer.write(",\"combinationPolicy\":{\"officialBaseline\":\"adiga\",\"predictionAnalysis\":\"jinhak\",\"keepProviderSemanticsSeparate\":true,\"doNotOverwriteHistoricalWithPrediction\":true},\"sources\":{\"adiga\":{\"runId\":")
         writeNullableString(adigaRun)
@@ -394,7 +752,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         writeRecords(jinhakRun)
         writer.write(",\"pageAnalyses\":")
         writeAnalyses()
-        writer.write("}}}")
+        writer.write("}},\"observationEvidence\":")
+        writeObservations()
+        writer.write("}")
         writer.flush()
     }
 

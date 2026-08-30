@@ -31,6 +31,11 @@ import org.json.JSONTokener
 import com.admissionhub.collector.capture.SnapshotScript
 import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.local.LocalCollectorStore
+import com.admissionhub.collector.observation.ObservationEvidence
+import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
+import com.admissionhub.collector.provider.ProviderCapabilities
+import com.admissionhub.collector.provider.ProviderCapability
+import com.admissionhub.collector.sync.UnifiedSyncState
 import com.admissionhub.collector.parser.RecordUtils
 import com.admissionhub.collector.provider.PaginationPlan
 import com.admissionhub.collector.provider.ProviderAdapter
@@ -156,8 +161,8 @@ class MainActivity : Activity() {
         private const val JINHAK_ABSOLUTE_TARGET_MS = 35_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.6.7"
-        private const val BUILD_CODE = 10670
+        private const val VERSION = "0.7.0"
+        private const val BUILD_CODE = 10700
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -564,7 +569,12 @@ class MainActivity : Activity() {
         localRunId = localStore.latestResumableRun(which.wireName)
         CookieManager.getInstance().flush()
         sessionState.text = "세션 상태 확인 중"
-        status.text = if (which == ProviderId.JINHAK) "진학사 분석 모드: 로그인 후 원하는 리포트/대학 화면을 여세요." else "어디가 복구 보류: 진학사 분석 이후 한밭대 381쪽부터 재시도 예정"
+        val capabilities = ProviderCapabilities.profile(which)
+        status.text = if (which == ProviderId.JINHAK) {
+            "진학사 observation-first 모드 · active ${capabilities.active.size} / discoverable ${capabilities.discoverable.size} · 분류 여부와 무관하게 증거 보존"
+        } else {
+            "어디가 공식정보 모드 · active ${capabilities.active.size} · deterministic ID/year planner 기반 전환 준비"
+        }
         batchButton.text = when (which) {
             ProviderId.JINHAK -> "현재 진학사 화면 전체 분석·누적"
             ProviderId.ADIGA -> "어디가 복구 보류"
@@ -820,6 +830,8 @@ class MainActivity : Activity() {
         unifiedAutoCaptureScheduled = false
         unifiedButton.text = "통합 수집 종료"
         localStore.updateUnifiedSession(sessionId, "adiga", "running", "user-start")
+        localStore.recordSyncState(sessionId, UnifiedSyncState.PRECHECK.name, null, JSONObject().put("collectorVersion", VERSION), false)
+        localStore.recordSyncState(sessionId, UnifiedSyncState.ADIGA_PUBLIC_SYNC.name, ProviderId.ADIGA.wireName, JSONObject().put("mode", "legacy-local-first-until-deterministic-planner-activation"), false)
         persistRuntimeCheckpoint(forceResume = true)
 
         provider = ProviderId.ADIGA
@@ -853,6 +865,8 @@ class MainActivity : Activity() {
         localRunId = localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
         localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId) }
         localStore.updateUnifiedSession(sessionId, "jinhak", "running", "adiga:$adigaReason")
+        localStore.recordSyncState(sessionId, UnifiedSyncState.JINHAK_CAPABILITY_DISCOVERY.name, ProviderId.JINHAK.wireName, JSONObject().put("authorizedConnectorActive", false), false)
+        localStore.recordSyncState(sessionId, UnifiedSyncState.JINHAK_USER_VIEW_FALLBACK.name, ProviderId.JINHAK.wireName, JSONObject().put("observationFirst", true), false)
         persistRuntimeCheckpoint(forceResume = true)
         CookieManager.getInstance().flush()
         sessionState.text = "세션 상태 확인 중"
@@ -868,8 +882,6 @@ class MainActivity : Activity() {
         if (unifiedAutoCaptureScheduled) return
         val canonical = canonicalizeBatchUrl(url)
         if (canonical.isBlank()) return
-        val pageKey = RecordUtils.sha256(canonical)
-        if (unifiedJinhakCapturedPages.contains(pageKey)) return
         unifiedAutoCaptureScheduled = true
         handler.postDelayed({
             unifiedAutoCaptureScheduled = false
@@ -879,7 +891,6 @@ class MainActivity : Activity() {
                     status.text = "통합 수집 2/2 · 진학사 로그인 후 페이지를 열면 자동 수집을 재개합니다."
                     return@checkSessionState
                 }
-                if (!unifiedJinhakCapturedPages.add(pageKey)) return@checkSessionState
                 collectCurrentPage(autoUnified = true)
             }
         }, 900L)
@@ -1601,7 +1612,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun isJinhakAutoCaptureRelevant(pageType: String): Boolean = pageType in setOf(
+    private fun isJinhakKnownStructuredPageType(pageType: String): Boolean = pageType in setOf(
         "jinhak-early-storage",
         "jinhak-prediction-report",
         "jinhak-mock-support-report",
@@ -1619,12 +1630,11 @@ class MainActivity : Activity() {
         collectSnapshot { snapshot ->
             if (snapshot == null) return@collectSnapshot
             val pageType = snapshot.optString("providerPageType")
-            if (provider == ProviderId.JINHAK && autoUnified && !isJinhakAutoCaptureRelevant(pageType)) {
-                recordRuntimeEvent("jinhak-nonadmission-page-skipped", JSONObject()
+            val knownStructuredType = provider != ProviderId.JINHAK || isJinhakKnownStructuredPageType(pageType)
+            if (provider == ProviderId.JINHAK && autoUnified && !knownStructuredType) {
+                recordRuntimeEvent("jinhak-unclassified-observation-preserved", JSONObject()
                     .put("pageType", pageType.take(80))
                     .put("safePath", runtimeSafePath(snapshot.optString("url"))))
-                status.text = "진학사 자동 분석 제외: 입시 데이터 화면이 아닌 ${pageType.ifBlank { "unclassified" }} 페이지입니다. 원하는 리포트/대학정보 화면을 여세요."
-                return@collectSnapshot
             }
             val records = normalizeSnapshot(snapshot)
             val collectedAt = Instant.now().toString()
@@ -1655,6 +1665,28 @@ class MainActivity : Activity() {
                 localStore.markDocument(runId, canonicalizeBatchUrl(snapshot.optString("url")), "completed")
                 localStats = localStore.stats(runId)
                 lastJinhakDigest = buildJinhakDigest(snapshot, records, runId, collectedAt)
+                val safeRouteKey = runtimeSafePath(snapshot.optString("url"))
+                val explicitContext = ObservationEvidence.explicitContextFromDigest(lastJinhakDigest)
+                val sessionObj = snapshot.optJSONObject("session") ?: JSONObject()
+                val authStateClass = when {
+                    sessionObj.optBoolean("needsLogin", false) -> "auth-required"
+                    sessionObj.optBoolean("authenticated", false) -> "authenticated"
+                    else -> "unknown"
+                }
+                val observationId = localStore.storeObservationEvidence(
+                    sessionId = unifiedSessionId,
+                    runId = runId,
+                    provider = ProviderId.JINHAK.wireName,
+                    safeRouteKey = safeRouteKey,
+                    pageTypeGuess = pageType,
+                    pageTypeConfidence = if (knownStructuredType) 0.95 else 0.45,
+                    authStateClass = authStateClass,
+                    explicitContext = explicitContext,
+                    evidence = lastJinhakDigest,
+                    captureVersion = VERSION
+                )
+                lastJinhakDigest.put("observationId", observationId)
+                probeJinhakOfficialCapabilities(unifiedSessionId, pageType, safeRouteKey)
                 if (unifiedRunning && unifiedPhase == "jinhak") {
                     unifiedSessionId?.let { sessionId ->
                         localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId)
@@ -1697,6 +1729,48 @@ class MainActivity : Activity() {
             } else {
                 "현재 페이지 수집 완료: 구조화 레코드 ${records.length()}개"
             }
+        }
+    }
+
+    private fun probeJinhakOfficialCapabilities(sessionId: String?, pageType: String, safeRouteKey: String) {
+        if (provider != ProviderId.JINHAK || !::webView.isInitialized) return
+        webView.evaluateJavascript(JinhakCapabilityProbe.javascript()) { encoded ->
+            val raw = runCatching { decodeJsString(encoded) }.getOrNull() ?: return@evaluateJavascript
+            val snapshot = runCatching { JinhakCapabilityProbe.parse(raw) }.getOrNull() ?: return@evaluateJavascript
+            if (snapshot.capabilities.isEmpty()) return@evaluateJavascript
+
+            val grouped = snapshot.capabilities.groupBy { capability ->
+                when (capability.kind) {
+                    "structured-export" -> ProviderCapability.AUTHORIZED_EXPORT_IMPORT.name
+                    "report-output", "download", "email-report" -> ProviderCapability.AUTHORIZED_REPORT_IMPORT.name
+                    else -> "VISIBLE_OFFICIAL_OUTPUT"
+                }
+            }
+            for ((capability, items) in grouped) {
+                val evidence = JSONArray()
+                items.forEach { item ->
+                    evidence.put(JSONObject()
+                        .put("kind", item.kind)
+                        .put("label", item.label)
+                        .put("evidenceClass", item.evidenceClass))
+                }
+                localStore.storeProviderCapabilityEvidence(
+                    sessionId = sessionId,
+                    provider = ProviderId.JINHAK.wireName,
+                    capability = capability,
+                    status = "candidate-visible-official-ui",
+                    safeRouteKey = safeRouteKey,
+                    evidence = JSONObject()
+                        .put("pageType", pageType)
+                        .put("controls", evidence)
+                )
+            }
+            recordRuntimeEvent("jinhak-official-output-capability-observed", JSONObject()
+                .put("pageType", pageType.take(80))
+                .put("safePath", safeRouteKey.take(300))
+                .put("controls", snapshot.capabilities.size)
+                .put("structuredExportSignal", snapshot.hasStructuredExportSignal)
+                .put("reportOutputSignal", snapshot.hasReportOutputSignal))
         }
     }
 
@@ -1876,7 +1950,7 @@ class MainActivity : Activity() {
             .put("schemaVersion", 2)
             .put("type", "jinhak-full-screen-analysis")
             .put("pageType", snapshot.optString("providerPageType"))
-            .put("analysisRelevance", if (isJinhakAutoCaptureRelevant(snapshot.optString("providerPageType"))) "admission-relevant" else "reference-or-editorial")
+            .put("analysisRelevance", if (isJinhakKnownStructuredPageType(snapshot.optString("providerPageType"))) "known-structured-type" else "unclassified-potential-value")
             .put("collectedAt", collectedAt)
             .put("recordCount", records.length())
             .put("detectedStorageCards", cards.length())
