@@ -58,28 +58,42 @@ object JinhakAdapter : ProviderAdapter {
 
         if (pageType == "jinhak-early-storage") {
             val cards = snapshot.optJSONArray("jinhakCards") ?: JSONArray()
+            val seenLogical = linkedSetOf<String>()
             for (i in 0 until cards.length()) {
-                val evidence = cards.optString(i).replace(Regex("\\s+"), " ").trim().take(5000)
+                val cardObj = cards.optJSONObject(i)
+                val evidence = (cardObj?.optString("text") ?: cards.optString(i))
+                    .replace(Regex("""\s+"""), " ").trim().take(5000)
                 if (evidence.isBlank()) continue
                 val local = GenericAdmissionParser.inferContext(evidence)
+                val university = local.university
+                val department = cleanStorageDepartment(local.department)
+                val admission = cleanStorageAdmission(local.admission, evidence)
                 val cardMetrics = predictionMetrics(evidence)
-                if (!cardMetrics.keys().asSequence().any { !cardMetrics.isNull(it) }) continue
+                val hasPrimaryPrediction = listOf(
+                    "stabilityBars", "predictionProbability", "predictionLabel", "myRank", "predictedCut"
+                ).any { cardMetrics.has(it) && !cardMetrics.isNull(it) }
+                if (!hasPrimaryPrediction) continue
+                val logical = RecordUtils.sha256(listOf(
+                    university ?: "", department ?: "", admission ?: "", cardMetrics.toString()
+                ).joinToString("|"))
+                if (!seenLogical.add(logical)) continue
                 val record = JSONObject()
                     .put("recordType", "jinhak-saved-application-prediction")
                     .put("providerPageType", pageType)
                     .put("dataScope", "current-prediction")
                     .put("year", local.year ?: TARGET_YEAR)
-                    .put("university", local.university ?: JSONObject.NULL)
-                    .put("department", local.department ?: JSONObject.NULL)
-                    .put("admission", local.admission ?: JSONObject.NULL)
+                    .put("university", university ?: JSONObject.NULL)
+                    .put("department", department ?: JSONObject.NULL)
+                    .put("admission", admission ?: JSONObject.NULL)
                     .put("metrics", cardMetrics)
                     .put("observedAt", observedAt)
                     .put("cardIndex", i)
-                    .put("contextSource", "card-local")
+                    .put("contextSource", "scored-card-root")
+                    .put("cardRootScore", cardObj?.optInt("score", 0) ?: 0)
                     .put("confidence", when {
-                        local.university != null && local.department != null && local.admission != null -> "high"
-                        local.university != null && local.department != null -> "medium"
-                        local.department != null -> "low"
+                        university != null && department != null && admission != null -> "high"
+                        university != null && department != null -> "medium"
+                        department != null -> "low"
                         else -> "raw"
                     })
                     .put("sourcePage", safePath(snapshot.optString("url")))
@@ -158,6 +172,23 @@ object JinhakAdapter : ProviderAdapter {
         ).joinToString("|")
         val scope = if (preserveSnapshot) observedAt.substring(0, 16) else "stable"
         return RecordUtils.sha256("jinhak|$scope|$stable")
+    }
+
+    private fun cleanStorageDepartment(value: String?): String? {
+        val raw = value?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val cleaned = raw.replace(
+            Regex("""^(?:지역인재교과|지역인재종합|교과일반|교과중심|자기추천|창의인재\(면접형\)|교과면접|학생부교과|학생부종합|지역인재|학교장추천|고른기회)"""),
+            ""
+        ).trim()
+        return cleaned.takeIf { it.length >= 2 } ?: raw
+    }
+
+    private fun cleanStorageAdmission(value: String?, evidence: String): String? {
+        val polluted = Regex("""(등급|경쟁률|전년도|점수|[0-9]{1,2}\s*칸|합격률|합격확률)""")
+        value?.trim()?.takeIf { it.isNotBlank() && it.length <= 40 && !polluted.containsMatchIn(it) }?.let { return it }
+        val token = Regex("""(지역인재교과|지역인재종합|교과일반|교과중심|자기추천|창의인재\(면접형\)|교과면접|학생부교과|학생부종합|지역인재|학교장추천|고른기회)""")
+            .find(evidence)?.groupValues?.getOrNull(1)
+        return token?.trim()?.takeIf { it.isNotBlank() }
     }
 
     private fun predictionMetrics(text: String): JSONObject {

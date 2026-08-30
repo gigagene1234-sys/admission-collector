@@ -121,7 +121,7 @@ object GenericAdmissionParser {
             known.findAll(segment).forEach { candidates += cleanCandidate(it.groupValues[1]) }
         }
         return candidates.firstOrNull {
-            it.length in 2..40 && !Regex("[①-⑳]|[0-9]+\\)|학생부 반영비율|있는 전형|없는 서류|설명|안내|^서류\\s*평가\\s*전형$|^서류\\s*전형$|^면접\\s*전형$").containsMatchIn(it)
+            it.length in 2..40 && !Regex("[①-⑳]|[0-9]+\\)|학생부 반영비율|있는 전형|없는 서류|설명|안내|등급|경쟁률|전년도|점수|칸|합격률|^서류\\s*평가\\s*전형$|^서류\\s*전형$|^면접\\s*전형$").containsMatchIn(it)
         }
     }
 

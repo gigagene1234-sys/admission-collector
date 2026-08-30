@@ -157,34 +157,73 @@ object SnapshotScript {
   }
 
   var jinhakCards=[];
+  var jinhakCardStats={metricSeeds:0,candidateRoots:0,uniqueRoots:0};
   if(/(^|\.)jinhak\.com$/i.test(location.hostname)){
     var metricRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|경쟁률|모의지원|합격예측|지원판정|내\s*순위|모집인원)/i;
-    var localContextRx=/(?:대학교|교육대|과학기술원|학과|학부|전공|모집단위|전형)/i;
+    var primaryRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|합격예측|지원판정|내\s*순위|예상\s*(?:합격선|컷))/i;
+    var exactUniRx=/(?:[가-힣A-Za-z0-9·.()\-]{2,35}(?:대학교|교육대학교|과학기술원))/i;
+    var deptRx=/(?:학과|학부|전공|모집단위|자율전공)/i;
+    var admissionRx=/(?:지역인재|학생부교과|학생부종합|교과|종합|면접|자기추천|창의인재|학교장추천|고른기회)/i;
+    var semanticRx=/(?:^|\s)(?:card|item|result|apply|support|save|univ|college|row)(?:\s|$)/i;
     var metricNodes=document.querySelectorAll('span,em,strong,b,p,td,th,li,div');
-    var seenJinhakCard={};
-    for(var ji=0;ji<metricNodes.length && jinhakCards.length<120;ji++){
+    var roots=[];
+    function structuredCardText(el,maxLen){
+      if(!el) return '';
+      var clone=el.cloneNode(true);
+      var rm=clone.querySelectorAll('script,style,noscript,template,input,textarea,select,option,form,[type=hidden],[hidden],[aria-hidden=true]');
+      for(var ri=0;ri<rm.length;ri++) rm[ri].remove();
+      var raw=String(clone.innerText||clone.textContent||'');
+      var lines=raw.split(/\n+/).map(function(v){return cleanText(v);}).filter(function(v){return v.length>0;});
+      var t=lines.join(' | ').replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig,'[redacted-email]');
+      return t.slice(0,maxLen||5000);
+    }
+    function rootScore(el,text){
+      var hits=(text.match(/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|경쟁률|모의지원|합격예측|지원판정|내\s*순위|모집인원)/ig)||[]).length;
+      var meta=cleanText((el.tagName||'')+' '+(el.id||'')+' '+(el.className||''));
+      var score=0;
+      if(exactUniRx.test(text)) score+=20;
+      if(deptRx.test(text)) score+=12;
+      if(admissionRx.test(text)) score+=4;
+      if(primaryRx.test(text)) score+=8;
+      if(/^(TR|LI|ARTICLE)$/i.test(el.tagName||'')||semanticRx.test(meta)) score+=8;
+      if(hits<=4) score+=6; else score-=(hits-4)*7;
+      score-=Math.floor(text.length/700);
+      return score;
+    }
+    function overlapIndex(el){
+      for(var oi=0;oi<roots.length;oi++){
+        var other=roots[oi].el;
+        if(other===el||other.contains(el)||el.contains(other)) return oi;
+      }
+      return -1;
+    }
+    for(var ji=0;ji<metricNodes.length&&roots.length<120;ji++){
       var mn=metricNodes[ji];
       if(!visible(mn)) continue;
-      var seed=safeCloneText(mn,350);
+      var seed=structuredCardText(mn,420);
       if(!metricRx.test(seed)) continue;
-      var cur=mn;
-      var best='';
-      for(var depth=0;cur && depth<7;depth++,cur=cur.parentElement){
+      jinhakCardStats.metricSeeds++;
+      var cur=mn,bestEl=null,bestText='',bestScore=-9999;
+      for(var depth=0;cur&&depth<12;depth++,cur=cur.parentElement){
         if(!visible(cur)) continue;
-        var candidate=safeCloneText(cur,2800);
-        if(candidate.length<18 || candidate.length>2600) continue;
-        if(metricRx.test(candidate) && localContextRx.test(candidate)){
-          best=candidate;
-          break;
-        }
+        var candidate=structuredCardText(cur,5000);
+        if(candidate.length<18||candidate.length>4800||!metricRx.test(candidate)) continue;
+        if(!(exactUniRx.test(candidate)||deptRx.test(candidate)||admissionRx.test(candidate))) continue;
+        var score=rootScore(cur,candidate);
+        if(score>bestScore){bestScore=score;bestEl=cur;bestText=candidate;}
       }
-      if(!best) continue;
-      var key=best.replace(/\s+/g,' ').trim();
-      if(!seenJinhakCard[key]){
-        seenJinhakCard[key]=1;
-        jinhakCards.push(key);
-      }
+      if(!bestEl||bestScore<2) continue;
+      jinhakCardStats.candidateRoots++;
+      var overlap=overlapIndex(bestEl);
+      if(overlap>=0){if(bestScore>roots[overlap].score) roots[overlap]={el:bestEl,text:bestText,score:bestScore};}
+      else roots.push({el:bestEl,text:bestText,score:bestScore});
     }
+    for(var jr=0;jr<roots.length&&jinhakCards.length<120;jr++){
+      var entry=roots[jr];
+      if(!primaryRx.test(entry.text)) continue;
+      jinhakCards.push({text:entry.text,score:entry.score,rootTag:String(entry.el.tagName||'').slice(0,20),primaryPrediction:true});
+    }
+    jinhakCardStats.uniqueRoots=jinhakCards.length;
   }
 
   var tables=[];
@@ -311,6 +350,7 @@ object SnapshotScript {
     context:context,
     selectionContext:selectionContext,
     jinhakCards:jinhakCards,
+    jinhakCardStats:jinhakCardStats,
     tables:tables,
     blocks:blocks,
     navigationLinks:nav,
