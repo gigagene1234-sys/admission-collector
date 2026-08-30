@@ -48,3 +48,5 @@ jobs:
           path: out/runtime-diagnostic-sanitized.json
           if-no-files-found: error
           retention-days: 2
+
+# manual refresh 2026-08-30T23:22+09:00
