@@ -1,1 +1,1 @@
-2026-08-30T16:26:00+09:00 v0.5.3 validation request
+2026-08-30 v0.5.4 card-boundary validation request
