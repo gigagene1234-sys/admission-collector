@@ -8,6 +8,7 @@ import com.admissionhub.collector.parser.RecordUtils
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
+import java.io.Writer
 import java.util.UUID
 
 data class LocalResumePlan(
@@ -332,6 +333,69 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                     .put("runId", jinhakRun ?: JSONObject.NULL)
                     .put("records", jinhakRun?.let { loadRecords(it) } ?: JSONArray())
                     .put("pageAnalyses", analyses)))
+    }
+
+    fun writeUnifiedExport(sessionId: String, writer: Writer) {
+        val status = unifiedStatus(sessionId)
+        val adigaRun = status.optJSONObject("adiga")?.optString("runId")?.takeIf { it.isNotBlank() && it != "null" }
+        val jinhakRun = status.optJSONObject("jinhak")?.optString("runId")?.takeIf { it.isNotBlank() && it != "null" }
+
+        fun writeNullableString(value: String?) {
+            if (value == null) writer.write("null") else writer.write(JSONObject.quote(value))
+        }
+        fun writeRecords(runId: String?) {
+            writer.write("[")
+            var first = true
+            if (runId != null) {
+                readableDatabase.rawQuery(
+                    "SELECT json FROM records WHERE run_id=? ORDER BY updated_at,fingerprint",
+                    arrayOf(runId)
+                ).use { c ->
+                    while (c.moveToNext()) {
+                        if (!first) writer.write(",")
+                        first = false
+                        writer.write(c.getString(0))
+                    }
+                }
+            }
+            writer.write("]")
+        }
+        fun writeAnalyses() {
+            writer.write("[")
+            var first = true
+            readableDatabase.rawQuery(
+                "SELECT page_type,payload_json,captured_at FROM unified_analysis_captures WHERE session_id=? ORDER BY captured_at",
+                arrayOf(sessionId)
+            ).use { c ->
+                while (c.moveToNext()) {
+                    if (!first) writer.write(",")
+                    first = false
+                    writer.write("{\"pageType\":")
+                    writeNullableString(if (c.isNull(0)) null else c.getString(0))
+                    writer.write(",\"capturedAt\":")
+                    writeNullableString(c.getString(2))
+                    writer.write(",\"analysis\":")
+                    writer.write(c.getString(1))
+                    writer.write("}")
+                }
+            }
+            writer.write("]")
+        }
+
+        writer.write("{\"schemaVersion\":2,\"type\":\"admission-unified-two-provider-export\",\"session\":")
+        writer.write(status.toString())
+        writer.write(",\"combinationPolicy\":{\"officialBaseline\":\"adiga\",\"predictionAnalysis\":\"jinhak\",\"keepProviderSemanticsSeparate\":true,\"doNotOverwriteHistoricalWithPrediction\":true},\"sources\":{\"adiga\":{\"runId\":")
+        writeNullableString(adigaRun)
+        writer.write(",\"records\":")
+        writeRecords(adigaRun)
+        writer.write("},\"jinhak\":{\"runId\":")
+        writeNullableString(jinhakRun)
+        writer.write(",\"records\":")
+        writeRecords(jinhakRun)
+        writer.write(",\"pageAnalyses\":")
+        writeAnalyses()
+        writer.write("}}}")
+        writer.flush()
     }
 
     fun beginOrResume(provider: String, collectorVersion: String): String {

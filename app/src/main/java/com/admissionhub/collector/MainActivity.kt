@@ -138,6 +138,10 @@ class MainActivity : Activity() {
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
     private var jinhakRecoveredStalls = 0
+    private var jinhakAbsoluteTargetKey = ""
+    private var jinhakAbsoluteTargetGeneration = 0
+    private var unifiedFinishInProgress = false
+    private var pendingUnifiedExportSessionId: String? = null
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -149,10 +153,11 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_AUTONAV_PAGES = 420
         private const val JINHAK_SOFT_STALL_MS = 12_000L
         private const val JINHAK_HARD_STALL_MS = 24_000L
+        private const val JINHAK_ABSOLUTE_TARGET_MS = 35_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.6.5"
-        private const val BUILD_CODE = 10650
+        private const val VERSION = "0.6.6"
+        private const val BUILD_CODE = 10660
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -373,6 +378,7 @@ class MainActivity : Activity() {
                 runtimeLastSafePath = runtimeSafePath(url)
                 persistRuntimeCheckpoint()
                 if (batchRunning && !batchPausedForLogin) {
+                    if (provider == ProviderId.JINHAK) armJinhakAbsoluteTargetWatchdog(url)
                     armBatchNavigationWatchdog(url)
                     status.text = "수집 엔진 로딩: ${safeDisplayUrl(url)}"
                     if (::batchCover.isInitialized) {
@@ -878,35 +884,83 @@ class MainActivity : Activity() {
     }
 
     private fun finishUnifiedCollection(reason: String) {
-        val sessionId = unifiedSessionId ?: localStore.latestUnifiedSession()
-        val wasBatchRunning = batchRunning
-        unifiedRunning = false
-        unifiedJinhakAutoCapture = false
-        unifiedPendingAdigaStart = false
-        unifiedPendingJinhakStart = false
-        unifiedAutoCaptureScheduled = false
-        unifiedPhase = "completed"
-        if (wasBatchRunning) stopBatch("unified-$reason")
+        if (unifiedFinishInProgress) return
+        unifiedFinishInProgress = true
+        try {
+            val sessionId = unifiedSessionId ?: localStore.latestUnifiedSession()
+            if (batchRunning) stopBatchForUnifiedFinish("unified-$reason")
 
-        if (sessionId == null) {
+            unifiedRunning = false
+            unifiedJinhakAutoCapture = false
+            unifiedPendingAdigaStart = false
+            unifiedPendingJinhakStart = false
+            unifiedAutoCaptureScheduled = false
+            unifiedPhase = "completed"
+            jinhakAbsoluteTargetKey = ""
+            ++jinhakAbsoluteTargetGeneration
+
+            if (sessionId == null) {
+                unifiedButton.text = "두 사이트 통합 수집 시작"
+                status.text = "종료할 통합 수집 세션이 없습니다."
+                return
+            }
+            localStore.updateUnifiedSession(sessionId, "completed", "completed", reason)
+            getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit().putBoolean("resumeUnified", false).apply()
+
+            val summary = localStore.unifiedStatus(sessionId)
+            lastJson = JSONObject()
+                .put("schemaVersion", 2)
+                .put("type", "admission-unified-session-summary")
+                .put("session", summary)
+                .put("fullExportMaterializedInMemory", false)
+                .put("fullExport", "Use JSON 저장; records are streamed from SQLite to the destination file.")
+                .toString(2)
+            showPreview(lastJson)
             unifiedButton.text = "두 사이트 통합 수집 시작"
-            status.text = "종료할 통합 수집 세션이 없습니다."
-            return
+            pendingUnifiedExportSessionId = sessionId
+            cloudOffload.sendDiagnostic(
+                "unified", VERSION,
+                JSONObject(summary.toString())
+                    .put("trigger", "unified-finish")
+                    .put("containsRawAdmissionRecords", false)
+                    .put("memorySafeFinish", true)
+            ) { }
+            recordRuntimeEvent("unified-finish-memory-safe", JSONObject()
+                .put("reason", reason.take(120))
+                .put("sessionIdPresent", true))
+            status.text = "통합 수집 종료 완료 · 전체 데이터는 SQLite에 보존됨 · JSON 저장 시 메모리에 올리지 않고 스트리밍합니다."
+        } catch (t: Throwable) {
+            recordRuntimeEvent("unified-finish-failure", JSONObject()
+                .put("exceptionClass", t.javaClass.name.take(160)), synchronous = true)
+            status.text = "통합 수집 종료 처리 중 오류가 기록되었습니다. 앱을 다시 열면 체크포인트에서 복구합니다."
+        } finally {
+            unifiedFinishInProgress = false
         }
-        localStore.updateUnifiedSession(sessionId, "completed", "completed", reason)
-        getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit().putBoolean("resumeUnified", false).apply()
-        val export = localStore.buildUnifiedExport(sessionId)
-        lastJson = export.toString(2)
-        showPreview(lastJson)
-        unifiedButton.text = "두 사이트 통합 수집 시작"
-        val summary = localStore.unifiedStatus(sessionId)
-        cloudOffload.sendDiagnostic(
-            "unified", VERSION,
-            JSONObject(summary.toString())
-                .put("trigger", "unified-finish")
-                .put("containsRawAdmissionRecords", false)
-        ) { }
-        status.text = "통합 수집 종료 · 어디가/진학사 데이터가 하나의 세션으로 연결되었습니다. JSON 저장으로 통합 결과를 내보낼 수 있습니다."
+    }
+
+    private fun stopBatchForUnifiedFinish(reason: String) {
+        batchRunning = false
+        batchPausedForLogin = false
+        batchCollecting = false
+        batchNavigationWatchdogRecovery = false
+        batchCloudFinalCheckInProgress = false
+        batchReadinessPolling = false
+        disarmBatchNavigationWatchdog()
+        jinhakAbsoluteTargetKey = ""
+        ++jinhakAbsoluteTargetGeneration
+        runCatching { webView.stopLoading() }
+        hideBatchCover()
+        stopCollectionKeepAlive()
+        batchQueue.clear()
+        batchQueued.clear()
+        batchPageActions.clear()
+        batchPageActionQueued.clear()
+        pendingBatchPageAction = null
+        activeBatchPageAction = null
+        currentBatchTarget = null
+        batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
+        localRunId?.let { localStore.markRun(it, "stopped", reason) }
+        recordRuntimeEvent("batch-lightweight-stop", JSONObject().put("reason", reason.take(120)))
     }
 
     private fun isAdigaBlockingErrorMessage(message: String?): Boolean {
@@ -1026,6 +1080,8 @@ class MainActivity : Activity() {
         batchUniversityDiscoveryPagesScheduled = 0
         batchPersistedPageSignatureOwners.clear()
         batchSkipSnapshotUntilMs = 0L
+        jinhakAbsoluteTargetKey = ""
+        ++jinhakAbsoluteTargetGeneration
         disarmBatchNavigationWatchdog()
         currentBatchTarget = canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
@@ -1234,6 +1290,56 @@ class MainActivity : Activity() {
         }, JINHAK_HARD_STALL_MS)
     }
 
+    private fun armJinhakAbsoluteTargetWatchdog(expectedUrl: String) {
+        if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return
+        val target = canonicalizeBatchUrl(currentBatchTarget ?: expectedUrl)
+        if (target.isBlank()) return
+        val key = RecordUtils.sha256(target)
+        if (key == jinhakAbsoluteTargetKey) return
+        jinhakAbsoluteTargetKey = key
+        val generation = ++jinhakAbsoluteTargetGeneration
+        val startedAt = System.currentTimeMillis()
+        recordRuntimeEvent("jinhak-target-start", JSONObject()
+            .put("targetSafePath", runtimeSafePath(target))
+            .put("currentSafePath", runtimeSafePath(expectedUrl)))
+
+        handler.postDelayed({
+            if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return@postDelayed
+            if (generation != jinhakAbsoluteTargetGeneration || key != jinhakAbsoluteTargetKey) return@postDelayed
+            val activeTarget = canonicalizeBatchUrl(currentBatchTarget ?: target)
+            if (RecordUtils.sha256(activeTarget) != key) return@postDelayed
+
+            val current = canonicalizeBatchUrl(webView.url ?: expectedUrl)
+            recordRuntimeEvent("jinhak-absolute-target-timeout", JSONObject()
+                .put("targetSafePath", runtimeSafePath(target))
+                .put("currentSafePath", runtimeSafePath(current))
+                .put("elapsedMs", System.currentTimeMillis() - startedAt))
+            localRunId?.let { runId ->
+                localStore.markDocument(runId, target, "error", 0, "jinhak-absolute-target-timeout")
+            }
+            batchVisited.add(target)
+            batchQueued.remove(target)
+            batchErrors.put(JSONObject()
+                .put("type", "jinhak-absolute-target-timeout")
+                .put("targetSafePath", runtimeSafePath(target))
+                .put("currentSafePath", runtimeSafePath(current)))
+            batchCollecting = false
+            batchNavigationWatchdogRecovery = false
+            batchReadinessPolling = false
+            pendingBatchPageAction = null
+            activeBatchPageAction = null
+            currentBatchTarget = null
+            ++jinhakStallWatchdogGeneration
+            jinhakAbsoluteTargetKey = ""
+            ++jinhakAbsoluteTargetGeneration
+            runCatching { webView.stopLoading() }
+            status.text = "진학사 절대 대기시간 초과: redirect/로딩 루프 페이지를 격리하고 다음 대상으로 진행합니다."
+            handler.postDelayed({
+                if (batchRunning && !batchPausedForLogin && provider == ProviderId.JINHAK) loadNextBatchPage()
+            }, 320L)
+        }, JINHAK_ABSOLUTE_TARGET_MS)
+    }
+
     private fun showBatchCover() {
         if (!::batchCover.isInitialized) return
         batchCover.text = "입시정보 수집 중\n\n로그인된 브라우저 자체가 수집 엔진으로 동작합니다.\n페이지 이동은 이 화면 뒤에서 처리됩니다."
@@ -1275,6 +1381,8 @@ class MainActivity : Activity() {
         status.text = "일괄 수집 중지: $reason"
         localRunId?.let { localStore.markRun(it, "stopped", reason) }
         if (batchSnapshots.length() > 0 || localRunId != null) finalizeBatchJson("stopped")
+        jinhakAbsoluteTargetKey = ""
+        ++jinhakAbsoluteTargetGeneration
     }
 
     private fun pauseBatchForLogin(autoOpenLogin: Boolean = true) {
@@ -2458,8 +2566,9 @@ class MainActivity : Activity() {
     }
 
     private fun finalizeBatchJson(reason: String) {
-        val persistedRecords = localRunId?.let { localStore.loadRecords(it) } ?: batchRecords
         val localStats = localRunId?.let { localStore.stats(it) } ?: JSONObject()
+        val persistedRecordCount = localStats.optInt("records", batchRecords.length())
+        val persistedRecords = if (LOCAL_FIRST_BETA) JSONArray() else (localRunId?.let { localStore.loadRecords(it) } ?: batchRecords)
         val out = JSONObject()
             .put("collectorVersion", VERSION)
             .put("provider", provider.wireName)
@@ -2470,7 +2579,7 @@ class MainActivity : Activity() {
                 .put("attemptedPages", batchPageCount)
                 .put("successfulPages", batchSnapshots.length())
                 .put("errorPages", batchErrors.length())
-                .put("records", persistedRecords.length())
+                .put("records", persistedRecordCount)
                 .put("resourceLinks", batchResources.length())
                 .put("paginationActionsCompleted", batchPageActionVisited.size)
                 .put("paginationActionsFailed", batchPageActionFailed.size)
@@ -2499,6 +2608,7 @@ class MainActivity : Activity() {
             .put("retryEvents", batchRetryEvents)
             .put("duplicateYearViews", batchDuplicateYearViews)
             .put("cloudOffload", JSONObject().put("mode", "disabled-during-v0.4.0-local-first"))
+            .put("recordsMaterializedInMemory", !LOCAL_FIRST_BETA)
             .put("records", persistedRecords)
             .put("snapshots", batchSnapshots)
             .put("resourceLinks", batchResources)
@@ -2768,14 +2878,22 @@ class MainActivity : Activity() {
     }
 
     private fun saveJson() {
-        if (lastJson.isBlank()) {
+        val candidateSession = unifiedSessionId ?: localStore.latestUnifiedSession()
+        val useUnifiedStream = candidateSession?.let {
+            val s = localStore.unifiedStatus(it)
+            s.optString("status") in setOf("running", "completed")
+        } ?: false
+        pendingUnifiedExportSessionId = if (useUnifiedStream) candidateSession else null
+
+        if (!useUnifiedStream && lastJson.isBlank()) {
             Toast.makeText(this, "먼저 페이지 또는 일괄 수집을 실행하세요.", Toast.LENGTH_SHORT).show()
             return
         }
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/json"
-            putExtra(Intent.EXTRA_TITLE, "admission-${provider.wireName}-v${VERSION}-${System.currentTimeMillis()}.json")
+            val prefix = if (useUnifiedStream) "admission-unified" else "admission-${provider.wireName}"
+            putExtra(Intent.EXTRA_TITLE, "$prefix-v${VERSION}-${System.currentTimeMillis()}.json")
         }
         startActivityForResult(intent, SAVE_JSON_REQUEST)
     }
@@ -2785,8 +2903,24 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == SAVE_JSON_REQUEST && resultCode == RESULT_OK) {
             val uri: Uri = data?.data ?: return
-            contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { it.write(lastJson) }
-            status.text = "JSON 저장 완료"
+            val streamSession = pendingUnifiedExportSessionId
+            pendingUnifiedExportSessionId = null
+            status.text = if (streamSession != null) "통합 JSON 스트리밍 저장 중…" else "JSON 저장 중…"
+            Thread {
+                val result = runCatching {
+                    contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { writer ->
+                        if (streamSession != null) localStore.writeUnifiedExport(streamSession, writer)
+                        else writer.write(lastJson)
+                    } ?: error("output-stream-unavailable")
+                }
+                runOnUiThread {
+                    status.text = if (result.isSuccess) {
+                        if (streamSession != null) "통합 JSON 스트리밍 저장 완료" else "JSON 저장 완료"
+                    } else {
+                        "JSON 저장 실패: ${result.exceptionOrNull()?.javaClass?.simpleName ?: "unknown"}"
+                    }
+                }
+            }.start()
         }
     }
 
