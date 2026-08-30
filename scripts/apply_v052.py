@@ -46,21 +46,21 @@ if needle not in text:
     raise SystemExit('snapshot context priority block missing')
 text = text.replace(needle, replacement)
 
-# Remove the permissive bare-*대학 fallback. It produced false institutions such as "면접(20)대학".
+# Remove permissive bare-*대학 fallback that caused false institutions like "면접(20)대학".
 pattern = re.compile(
     r'''\n        val excludedCollege = Regex\([^\n]+\)\n        return Regex\([^\n]+대학[^\n]+\)\n            \.findAll\(text\)\n            \.map \{ cleanCandidate\(it\.groupValues\[1\]\) \}\n            \.firstOrNull \{ it\.length in 3\.\.35 && !excludedCollege\.containsMatchIn\(it\) \}'''
 )
 new_uni = '''\n        // Bare "대학" is usually a college/faculty or prose fragment on Jinhak pages.\n        // Prefer a missing university over attaching prediction metrics to a false institution.\n        return Regex("([가-힣A-Za-z0-9·.()\\-]{2,35}(?:교육대학교|과학기술원))")\n            .findAll(text)\n            .map { cleanCandidate(it.groupValues[1]) }\n            .firstOrNull { it.length in 4..45 }'''
-text2, count = pattern.subn(new_uni, text, count=1)
+text, count = pattern.subn(new_uni, text, count=1)
 if count != 1:
     raise SystemExit(f'university fallback replace count={count}')
-text = text2
 
-old_noise = '''            it.length in 2..40 && !Regex("[①-⑳]|[0-9]+\\)|학생부 반영비율|있는 전형|없는 서류|설명|안내").containsMatchIn(it)'''
-new_noise = '''            it.length in 2..40 && !Regex("[①-⑳]|[0-9]+\\)|학생부 반영비율|있는 전형|없는 서류|설명|안내|^서류\\s*평가\\s*전형$|^서류\\s*전형$|^면접\\s*전형$").containsMatchIn(it)'''
-if old_noise not in text:
-    raise SystemExit('admission noise filter missing')
-text = text.replace(old_noise, new_noise)
+# Explicitly reject generic explanatory labels as admission names.
+noise_tail = '|설명|안내").containsMatchIn(it)'
+noise_extended = '|설명|안내|^서류\\\\s*평가\\\\s*전형$|^서류\\\\s*전형$|^면접\\\\s*전형$").containsMatchIn(it)'
+if noise_tail not in text:
+    raise SystemExit('admission noise tail missing')
+text = text.replace(noise_tail, noise_extended, 1)
 GENERIC_PATH.write_text(text)
 
 if MAIN_PATHS[0].read_text() != MAIN_PATHS[1].read_text():
