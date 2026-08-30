@@ -29,36 +29,52 @@ object JinhakAdapter : ProviderAdapter {
             val path = (uri.path ?: "/").lowercase()
             val query = (uri.query ?: "").lowercase()
             val full = "$path?$query"
-            if (Regex("(?:logout|signout|member|mypage|my-page|account|payment|pay|coupon|refund|withdraw|profile|userinfo|customer|faq|qna|event|notice|privacy|terms)").containsMatchIn(full)) return false
+            if (Regex("(?:logout|signout|member|mypage|my-page|account|payment|billing|purchase|order|spassdata|coupon|refund|withdraw|profile|userinfo|customer|faq|qna|event|notice|privacy|terms|jinhak-tv|univ-entrance-info|susi-special|story|news|clip)").containsMatchIn(full)) return false
             if (Regex("\\.(?:jpg|jpeg|png|gif|webp|svg|ico|css|js|map|woff2?|ttf|eot|zip|hwp|hwpx|pdf)$", RegexOption.IGNORE_CASE).containsMatchIn(path)) return false
             true
         } catch (_: Exception) { false }
     }
 
     override fun classify(snapshot: JSONObject): String {
-        val url = snapshot.optString("url").lowercase()
-        val text = GenericAdmissionParser.collectText(snapshot)
-        val path = runCatching { URI(snapshot.optString("url")).path?.lowercase() ?: "/" }.getOrDefault("/")
+        val rawUrl = snapshot.optString("url")
+        val url = rawUrl.lowercase()
+        val path = runCatching { URI(rawUrl).path?.lowercase() ?: "/" }.getOrDefault("/")
         val rootPage = path.isBlank() || path == "/" || path.endsWith("/index") || path.endsWith("/index.html")
-        val hasPrediction = text.contains("합격예측") || text.contains("모의지원") || Regex("[0-9]{1,2}\\s*칸").containsMatchIn(text)
-        val hasActual = Regex("(실제합격자\\s*(?:리포트|사례)|합격자\\s*리포트|전년도\\s*입시결과\\s*(?:리포트|상세))").containsMatchIn(text) ||
+        val headingText = buildString {
+            append(snapshot.optString("title"))
+            val headings = snapshot.optJSONArray("context") ?: JSONArray()
+            for (i in 0 until minOf(headings.length(), 16)) {
+                append(' ').append(headings.optString(i))
+            }
+        }.replace(Regex("\\s+"), " ").trim()
+
+        // Global menus contain words such as 합격예측/수시저장소 on almost every page.
+        // Classification therefore uses URL + title/heading context, never whole-page menu text.
+        val mockReport = url.contains("sapplysample") || Regex("모의지원\\s*리포트").containsMatchIn(headingText)
+        val hasActual = Regex("(실제합격자\\s*(?:리포트|사례)|합격자\\s*리포트|전년도\\s*입시결과\\s*(?:리포트|상세))").containsMatchIn(headingText) ||
             Regex("(actual|admitreport|resultreport|passcase)").containsMatchIn(url)
-        val dedicatedMinimum = url.contains("esatminuniv") ||
-            (Regex("(수능최저\\s*(검색|대학|조건)|최저학력기준\\s*(검색|대학))").containsMatchIn(text) && !hasPrediction)
-        val earlyStorage = text.contains("수시저장소") || text.contains("저장대학") || url.contains("storage") || url.contains("save")
+        val dedicatedMinimum = url.contains("esatminuniv") || Regex("(수능최저|최저학력기준)").containsMatchIn(headingText)
+        val scoreReport = Regex("(score|calc)").containsMatchIn(url) || Regex("성적산출\\s*리포트").containsMatchIn(headingText)
+        val earlyStorage = Regex("(storage|save)").containsMatchIn(url) || Regex("(수시|정시)?\\s*저장소|저장대학").containsMatchIn(headingText)
+        val universitySearch = url.contains("four-year-university/search") || Regex("대학검색").containsMatchIn(headingText)
+        val curation = url.contains("/curation") || Regex("큐레이션").containsMatchIn(headingText)
+        val recommended = Regex("추천대학").containsMatchIn(headingText)
+        val hasPrediction = Regex("(predict|prediction|possibility|admission-report|support-report)").containsMatchIn(url) ||
+            Regex("(합격예측\\s*(?:리포트|결과)|[0-9]{1,2}\\s*칸)").containsMatchIn(headingText)
+
         return when {
-            Regex("(login|signin|member/login)").containsMatchIn(url) || text.contains("로그인") && text.contains("비밀번호") -> "jinhak-login"
+            Regex("(login|signin|member/login)").containsMatchIn(url) || Regex("로그인.*비밀번호").containsMatchIn(headingText) -> "jinhak-login"
             rootPage -> "jinhak-home"
-            earlyStorage -> "jinhak-early-storage"
+            mockReport -> "jinhak-mock-support-report"
             hasActual -> "jinhak-actual-admit-report"
-            text.contains("합격예측리포트") || text.contains("합격예측 리포트") || hasPrediction -> "jinhak-prediction-report"
-            url.contains("sapplysample") || text.contains("모의지원 리포트") || text.contains("모의지원리포트") -> "jinhak-mock-support-report"
-            text.contains("성적산출 리포트") || text.contains("성적산출리포트") -> "jinhak-score-calc-report"
             dedicatedMinimum -> "jinhak-sat-minimum"
             url.contains("infoview.aspx") -> "jinhak-student-basic"
-            url.contains("four-year-university/search") || text.contains("대학검색") -> "jinhak-university-search"
-            url.contains("/curation") || text.contains("큐레이션") -> "jinhak-curation"
-            text.contains("추천대학") -> "jinhak-recommended-university"
+            scoreReport -> "jinhak-score-calc-report"
+            earlyStorage -> "jinhak-early-storage"
+            universitySearch -> "jinhak-university-search"
+            curation -> "jinhak-curation"
+            recommended -> "jinhak-recommended-university"
+            hasPrediction -> "jinhak-prediction-report"
             else -> "jinhak-other"
         }
     }

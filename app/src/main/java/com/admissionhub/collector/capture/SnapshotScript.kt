@@ -42,7 +42,11 @@ object SnapshotScript {
     if(unsafePseudoUrl(raw)) return '';
     try{
       var u=new URL(raw,location.href);
-      if(u.origin!==location.origin) return '';
+      var currentHost=String(location.hostname||'').toLowerCase();
+      var targetHost=String(u.hostname||'').toLowerCase();
+      var currentJinhak=(currentHost==='jinhak.com'||/\.jinhak\.com$/.test(currentHost));
+      var targetJinhak=(targetHost==='jinhak.com'||/\.jinhak\.com$/.test(targetHost));
+      if(u.origin!==location.origin && !(currentJinhak&&targetJinhak)) return '';
       var badKey=/token|session|auth|csrf|transkey|captcha|password|passwd|secret|credential|sysReg|sysChg|userId|ipMac/i;
       var filtered=new URLSearchParams();
       u.searchParams.forEach(function(v,k){ if(!badKey.test(k)) filtered.append(k,v); });
@@ -451,7 +455,10 @@ object SnapshotScript {
     if(!route) continue;
     var ru;
     try{ ru=new URL(route,location.href); }catch(e2){ continue; }
-    if(ru.origin!==location.origin) continue;
+    var ch=String(location.hostname||'').toLowerCase();
+    var rh=String(ru.hostname||'').toLowerCase();
+    var sameJinhakProvider=(ch==='jinhak.com'||/\.jinhak\.com$/.test(ch)) && (rh==='jinhak.com'||/\.jinhak\.com$/.test(rh));
+    if(ru.origin!==location.origin && !sameJinhakProvider) continue;
     var sameArea=prefix && ru.pathname.split('/').filter(Boolean).slice(0,2).join('/')===prefix;
     if(!(admissionTerms.test(label+' '+ru.pathname+' '+onclick) || sameArea)) continue;
     if(seenNav[route]) continue;

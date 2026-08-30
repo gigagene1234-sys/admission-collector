@@ -140,8 +140,8 @@ class MainActivity : Activity() {
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
         private const val MAX_JINHAK_AUTONAV_PAGES = 420
-        private const val VERSION = "0.6.2"
-        private const val BUILD_CODE = 10620
+        private const val VERSION = "0.6.3"
+        private const val BUILD_CODE = 10630
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
