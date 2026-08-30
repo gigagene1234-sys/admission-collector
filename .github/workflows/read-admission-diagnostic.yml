@@ -1,0 +1,58 @@
+name: Read Admission Diagnostic
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/read-admission-diagnostic.yml"
+      - ".diagnostics/read-request.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  read-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      WORKER_URL: https://admission-collector-offload.gigagene1234.workers.dev
+      INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - name: Read latest diagnostic only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$INGEST_TOKEN"
+          latest="$(curl -fsS -H "Authorization: Bearer $INGEST_TOKEN" "$WORKER_URL/v1/runs/latest?provider=adiga-diagnostic")"
+          echo "LATEST_DIAGNOSTIC_RUN=$latest"
+          run_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("runId") or "")' "$latest")"
+          if [ -z "$run_id" ]; then
+            echo "NO_DIAGNOSTIC_RUN"
+            exit 0
+          fi
+          status="$(curl -fsS -H "Authorization: Bearer $INGEST_TOKEN" "$WORKER_URL/v1/runs/$run_id/status")"
+          python3 - "$status" <<'PY'
+          import json, sys
+          payload=json.loads(sys.argv[1])
+          run=payload.get('run') or {}
+          errors=payload.get('recentErrors') or []
+          print('DIAGNOSTIC_RUN_SUMMARY=' + json.dumps({
+              'run_id': run.get('run_id'),
+              'provider': run.get('provider'),
+              'collector_version': run.get('collector_version'),
+              'uploaded_chunks': run.get('uploaded_chunks'),
+              'processed_chunks': run.get('processed_chunks'),
+              'error_count': run.get('error_count'),
+              'updated_at': run.get('updated_at'),
+          }, ensure_ascii=False, separators=(',',':')))
+          for i,e in enumerate(errors):
+              detail=e.get('detail_json')
+              try: detail=json.loads(detail) if isinstance(detail,str) else detail
+              except Exception: pass
+              print(f'DIAGNOSTIC_EVENT_{i}=' + json.dumps({
+                  'error_type': e.get('error_type'),
+                  'created_at': e.get('created_at'),
+                  'detail': detail,
+              }, ensure_ascii=False, separators=(',',':')))
+          PY
