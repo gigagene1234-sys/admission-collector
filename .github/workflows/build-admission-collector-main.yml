@@ -30,21 +30,27 @@ jobs:
           set -euo pipefail
           MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
           STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
+          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          SYNC=app/src/main/java/com/admissionhub/collector/sync/UnifiedSyncState.kt
           test ! -f MainActivity.kt
-          grep -q 'private const val VERSION = "0.7.0"' "$MAIN"
-          grep -q 'private const val BUILD_CODE = 10700' "$MAIN"
-          grep -q 'versionCode = 10700' app/build.gradle.kts
-          grep -q 'versionName = "0.7.0"' app/build.gradle.kts
+          grep -q 'private const val VERSION = "0.7.1"' "$MAIN"
+          grep -q 'private const val BUILD_CODE = 10710' "$MAIN"
+          grep -q 'versionCode = 10710' app/build.gradle.kts
+          grep -q 'versionName = "0.7.1"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.7.1 Autonomous Analysis Ready' app/src/main/AndroidManifest.xml
           grep -q 'CREATE TABLE IF NOT EXISTS observations' "$STORE"
           grep -q 'fun storeObservationEvidence' "$STORE"
           grep -q 'fun writeObservations' "$STORE"
           grep -q 'unclassified-potential-value' "$MAIN"
           grep -q 'JinhakCapabilityProbe.javascript' "$MAIN"
-          grep -q 'override val supportsBatchCrawl = false' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'override val supportsBatchCrawl = true' "$ADAPTER"
+          grep -q 'override fun isBatchNavigable' "$ADAPTER"
           grep -q 'PUBLIC_DETERMINISTIC_COLLECTION' app/src/main/java/com/admissionhub/collector/provider/ProviderCapability.kt
-          grep -q 'JINHAK_CAPABILITY_DISCOVERY' app/src/main/java/com/admissionhub/collector/sync/UnifiedSyncState.kt
+          grep -q 'JINHAK_AUTONOMOUS_CRAWL' "$SYNC"
+          grep -q 'assistant-xlsx-dashboard-generation' "$STORE"
+          grep -q 'recommendedWorkbookSheets' "$STORE"
 
-      - name: Verify privacy and observation boundaries
+      - name: Verify safety observation and memory boundaries
         shell: bash
         run: |
           python3 - <<'PY'
@@ -52,6 +58,7 @@ jobs:
           main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
           probe=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAuthorizedConnector.kt').read_text()
           adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          store=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
           if 'jinhak-nonadmission-page-skipped' in main:
               raise SystemExit('unknown Jinhak observations are still discarded')
           if 'unifiedJinhakCapturedPages.contains(pageKey)' in main:
@@ -59,8 +66,16 @@ jobs:
           for token in ['document.cookie','localStorage','sessionStorage','input.value','location.href','fetch(','XMLHttpRequest']:
               if token in probe:
                   raise SystemExit(f'capability probe reads forbidden material: {token}')
-          if 'supportsBatchCrawl = true' in adapter:
-              raise SystemExit('protected Jinhak batch crawler re-enabled')
+          if 'supportsBatchCrawl = false' in adapter:
+              raise SystemExit('Jinhak autonomous crawler rollback is not active')
+          for token in ['payment','billing','purchase','order','refund','withdraw','logout','signout']:
+              if token not in adapter:
+                  raise SystemExit(f'missing crawler safety boundary: {token}')
+          for token in ['JINHAK_ABSOLUTE_TARGET_MS = 35_000L','onRenderProcessGone','installRuntimeCrashGuard','onTrimMemory','localStore.writeUnifiedExport(streamSession, writer)']:
+              if token not in main:
+                  raise SystemExit(f'missing runtime/memory guard: {token}')
+          if 'writeObservations' not in store or 'doNotInferMissingBindings' not in store:
+              raise SystemExit('analysis-ready observation export regression')
           PY
 
       - name: Set up JDK 17
@@ -107,14 +122,15 @@ jobs:
           APK=app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
-          grep -q "versionCode='10700'" /tmp/badging.txt
-          grep -q "versionName='0.7.0'" /tmp/badging.txt
+          grep -q "versionCode='10710'" /tmp/badging.txt
+          grep -q "versionName='0.7.1'" /tmp/badging.txt
+          grep -q "application-label:'Admission Collector v0.7.1 Autonomous Analysis Ready'" /tmp/badging.txt
           sha256sum "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: admission-collector-main-v0.7.0-debug
+          name: admission-collector-main-v0.7.1-debug
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
