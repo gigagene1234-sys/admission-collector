@@ -1,0 +1,38 @@
+name: Export Architecture Analysis Snapshot
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/export-analysis-snapshot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 100
+      - name: Collect analysis snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/src
+          cp -a app/src/main/java/com/admissionhub/collector out/src/collector
+          cp app/src/main/AndroidManifest.xml out/src/AndroidManifest.xml
+          cp app/build.gradle.kts out/src/build.gradle.kts
+          cp JINHAK_COLLECTION_PLAN.md out/JINHAK_COLLECTION_PLAN.md
+          cp cloudflare/src/index.js out/cloudflare-index.js
+          find .github/workflows -maxdepth 1 -type f -name '*.yml' -print | sort > out/workflows.txt
+          git log --date=iso --pretty=format:'%h|%ad|%s' -100 > out/git-log.txt
+          git status --short > out/git-status.txt
+          find app/src/main/java/com/admissionhub/collector -type f -maxdepth 5 | sort > out/source-files.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-analysis-snapshot
+          path: out
+          retention-days: 2
