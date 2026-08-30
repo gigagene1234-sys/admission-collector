@@ -39,6 +39,7 @@ jobs:
           grep -q 'private const val BUILD_CODE = 10710' "$MAIN"
           grep -q 'versionCode = 10710' app/build.gradle.kts
           grep -q 'versionName = "0.7.1"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.7.1 Autonomous Analysis Ready' app/src/main/AndroidManifest.xml
           grep -q 'override val supportsBatchCrawl = true' "$JINHAK"
           grep -q 'override fun isBatchNavigable' "$JINHAK"
           grep -q 'JINHAK_AUTONOMOUS_CRAWL' "$SYNC"
@@ -69,8 +70,6 @@ jobs:
               if token not in a:
                   raise SystemExit(f'missing navigation safety token: {token}')
           main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
-          if 'JSONObject.toString()' in main and 'OutOfMemoryError' in main:
-              pass
           if 'localStore.writeUnifiedExport(streamSession, writer)' not in main:
               raise SystemExit('streaming unified export regression')
           PY
@@ -121,6 +120,7 @@ jobs:
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
           grep -q "versionCode='10710'" /tmp/badging.txt
           grep -q "versionName='0.7.1'" /tmp/badging.txt
+          grep -q "application-label:'Admission Collector v0.7.1 Autonomous Analysis Ready'" /tmp/badging.txt
           sha256sum "$APK" | tee /tmp/apk.sha256
 
       - name: Commit generated v0.7.1 source
@@ -134,14 +134,14 @@ jobs:
             app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt \
             app/src/main/java/com/admissionhub/collector/sync/UnifiedSyncState.kt \
             app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt \
-            app/build.gradle.kts \
-            .github/workflows/build-admission-collector-main.yml
+            app/build.gradle.kts
           if ! git diff --cached --quiet; then
             git commit -m "Apply v0.7.1 autonomous Jinhak rollback and analysis-ready export [skip ci]"
             git push origin HEAD:main
           fi
 
       - name: Upload APK
+        if: always() && steps.build.outcome != 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: admission-collector-v0.7.1-autonomous-analysis-ready-debug
