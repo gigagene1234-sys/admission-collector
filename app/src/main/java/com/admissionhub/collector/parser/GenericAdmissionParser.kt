@@ -13,15 +13,18 @@ object GenericAdmissionParser {
 
     fun normalize(snapshot: JSONObject): JSONArray {
         val result = JSONArray()
-        val inherited = inferContext(collectText(snapshot).take(8000))
+        val inherited = inferContext(collectText(snapshot).take(10000))
         val tables = snapshot.optJSONArray("tables") ?: JSONArray()
         for (ti in 0 until tables.length()) {
-            val rows = tables.optJSONObject(ti)?.optJSONArray("rows") ?: continue
+            val table = tables.optJSONObject(ti) ?: continue
+            val caption = table.optString("caption")
+            val rows = table.optJSONArray("rows") ?: continue
             for (ri in 0 until rows.length()) {
                 val row = rows.optJSONArray(ri) ?: continue
                 val cells = mutableListOf<String>()
                 for (ci in 0 until row.length()) cells.add(row.optString(ci))
-                buildRecord(cells.joinToString(" | "), inherited)?.let { result.put(it) }
+                val evidence = listOf(caption, cells.joinToString(" | ")).filter { it.isNotBlank() }.joinToString(" | ")
+                buildRecord(evidence, inherited)?.let { result.put(it) }
             }
         }
         return RecordUtils.dedupe(result)
@@ -33,18 +36,20 @@ object GenericAdmissionParser {
         val context = snapshot.optJSONArray("context") ?: JSONArray()
         for (i in 0 until context.length()) context.optString(i).trim().takeIf { it.isNotBlank() }?.let(parts::add)
         val blocks = snapshot.optJSONArray("blocks") ?: JSONArray()
-        for (i in 0 until minOf(blocks.length(), 60)) blocks.optString(i).trim().takeIf { it.isNotBlank() }?.let(parts::add)
+        for (i in 0 until minOf(blocks.length(), 120)) blocks.optString(i).trim().takeIf { it.isNotBlank() }?.let(parts::add)
         val tables = snapshot.optJSONArray("tables") ?: JSONArray()
-        for (ti in 0 until minOf(tables.length(), 20)) {
-            val rows = tables.optJSONObject(ti)?.optJSONArray("rows") ?: continue
-            for (ri in 0 until minOf(rows.length(), 80)) {
+        for (ti in 0 until minOf(tables.length(), 120)) {
+            val table = tables.optJSONObject(ti) ?: continue
+            table.optString("caption").trim().takeIf { it.isNotBlank() }?.let(parts::add)
+            val rows = table.optJSONArray("rows") ?: continue
+            for (ri in 0 until minOf(rows.length(), 250)) {
                 val row = rows.optJSONArray(ri) ?: continue
                 val cells = mutableListOf<String>()
-                for (ci in 0 until minOf(row.length(), 30)) cells.add(row.optString(ci))
+                for (ci in 0 until minOf(row.length(), 40)) cells.add(row.optString(ci))
                 if (cells.isNotEmpty()) parts += cells.joinToString(" | ")
             }
         }
-        return parts.joinToString(" \n ").replace(Regex("\\s+"), " ").take(30000)
+        return parts.joinToString(" \n ").replace(Regex("\\s+"), " ").take(60000)
     }
 
     fun inferContext(text: String): InferredContext {
@@ -61,7 +66,7 @@ object GenericAdmissionParser {
     }
 
     private fun buildRecord(evidenceRaw: String, inherited: InferredContext): JSONObject? {
-        val evidence = evidenceRaw.replace(Regex("\\s+"), " ").trim().take(5000)
+        val evidence = evidenceRaw.replace(Regex("\\s+"), " ").trim().take(7000)
         if (evidence.length < 2) return null
 
         val local = inferContext(evidence)
@@ -70,26 +75,25 @@ object GenericAdmissionParser {
         val department = local.department ?: inherited.department
         val admission = local.admission ?: inherited.admission
 
-        val competitionRegex = Regex("(?:경쟁률)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?(?:\\s*[:대]\\s*1)?)")
-        val capacityRegex = Regex("(?:모집인원|모집 인원)\\s*[:：]?\\s*([0-9]+)")
-        val cut50Regex = Regex("(?:50%\\s*(?:컷|cut|등급|점수)|산출점수\\s*50%)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)", RegexOption.IGNORE_CASE)
-        val cut70Regex = Regex("(?:70%\\s*(?:컷|cut|등급|점수)|산출점수\\s*70%)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)", RegexOption.IGNORE_CASE)
-        val myScoreRegex = Regex("(?:내\\s*(?:환산)?점수|나의\\s*(?:환산)?점수|산출점수|환산점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)")
-        val gradeRegex = Regex("(?:등급|반영\\s*평균등급|내\\s*등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)")
-        val barsRegex = Regex("(?:칸수|칸\\s*수)\\s*[:：]?\\s*([0-9]+)")
-        val judgmentRegex = Regex("(?:판정|합격예측|지원판정)\\s*[:：]?\\s*(안정|적정|소신|위험|상향|하향|가능|불안|유리|불리)")
-        val applicantRegex = Regex("(?:지원자수|지원자 수)\\s*[:：]?\\s*([0-9,]+)")
+        fun findNumber(pattern: String): Double? = Regex(pattern, RegexOption.IGNORE_CASE).find(evidence)?.groupValues?.getOrNull(1)?.replace(",", "")?.toDoubleOrNull()
+        fun findInt(pattern: String): Int? = Regex(pattern, RegexOption.IGNORE_CASE).find(evidence)?.groupValues?.getOrNull(1)?.replace(",", "")?.toIntOrNull()
+
+        val competition = Regex("(?:경쟁률)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?(?:\\s*[:대]\\s*1)?)").find(evidence)?.groupValues?.getOrNull(1)
+        val judgment = Regex("(?:판정|합격예측|지원판정)\\s*[:：]?\\s*(안정|적정|소신|위험|상향|하향|가능|불안|유리|불리)").find(evidence)?.groupValues?.getOrNull(1)
 
         val metrics = JSONObject()
-            .put("myScore", myScoreRegex.find(evidence)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: JSONObject.NULL)
-            .put("grade", gradeRegex.find(evidence)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: JSONObject.NULL)
-            .put("cut50", cut50Regex.find(evidence)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: JSONObject.NULL)
-            .put("cut70", cut70Regex.find(evidence)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: JSONObject.NULL)
-            .put("competition", competitionRegex.find(evidence)?.groupValues?.getOrNull(1) ?: JSONObject.NULL)
-            .put("capacity", capacityRegex.find(evidence)?.groupValues?.getOrNull(1)?.replace(",", "")?.toIntOrNull() ?: JSONObject.NULL)
-            .put("applicants", applicantRegex.find(evidence)?.groupValues?.getOrNull(1)?.replace(",", "")?.toIntOrNull() ?: JSONObject.NULL)
-            .put("jinhakBars", barsRegex.find(evidence)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: JSONObject.NULL)
-            .put("jinhakJudgment", judgmentRegex.find(evidence)?.groupValues?.getOrNull(1) ?: JSONObject.NULL)
+            .put("myScore", findNumber("(?:내\\s*(?:환산)?점수|나의\\s*(?:환산)?점수|산출점수|환산점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)") ?: JSONObject.NULL)
+            .put("grade", findNumber("(?:등급|반영\\s*평균등급|내\\s*등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)") ?: JSONObject.NULL)
+            .put("cut50", findNumber("(?:50%\\s*(?:컷|cut|등급|점수)|산출점수\\s*50%)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)") ?: JSONObject.NULL)
+            .put("cut70", findNumber("(?:70%\\s*(?:컷|cut|등급|점수)|산출점수\\s*70%)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)") ?: JSONObject.NULL)
+            .put("averageGrade", findNumber("(?:(?:최종등록자|등록자|합격자)\\s*)?(?:평균등급|평균 등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)") ?: JSONObject.NULL)
+            .put("lowestGrade", findNumber("(?:최저등급|최저 등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)") ?: JSONObject.NULL)
+            .put("competition", competition ?: JSONObject.NULL)
+            .put("capacity", findInt("(?:모집인원|모집 인원)\\s*[:：]?\\s*([0-9,]+)") ?: JSONObject.NULL)
+            .put("applicants", findInt("(?:지원자수|지원자 수|실지원자수|실지원자 수)\\s*[:：]?\\s*([0-9,]+)") ?: JSONObject.NULL)
+            .put("additionalAdmits", findInt("(?:충원합격자수|충원합격자 수|충원인원|충원 인원|추가합격자수)\\s*[:：]?\\s*([0-9,]+)") ?: JSONObject.NULL)
+            .put("jinhakBars", findInt("(?:칸수|칸\\s*수)\\s*[:：]?\\s*([0-9]+)") ?: JSONObject.NULL)
+            .put("jinhakJudgment", judgment ?: JSONObject.NULL)
 
         val hasMetric = metrics.keys().asSequence().any { !metrics.isNull(it) }
         if (!hasMetric) return null

@@ -148,7 +148,7 @@ object SnapshotScript {
   }
 
   var tables=[];
-  var captureHiddenDetail=/\/(?:ucp\/uvt\/uni\/univDetailSelection|uct\/acd\/ade\/criteriaAndResultPopup)\.do$/i.test(location.pathname);
+  var captureHiddenDetail=/(^|\.)jinhak\.com$/i.test(location.hostname) || /\/(?:ucp\/uvt\/uni\/univDetailSelection|uct\/acd\/ade\/criteriaAndResultPopup)\.do$/i.test(location.pathname);
   var tableNodes=document.querySelectorAll('table,[role=table]');
   for(var ti=0;ti<tableNodes.length && tables.length<120;ti++){
     var table=tableNodes[ti];

@@ -43,6 +43,7 @@ class MainActivity : Activity() {
     private lateinit var preview: TextView
     private lateinit var batchButton: Button
     private lateinit var batchCover: TextView
+    private lateinit var diagnosticButton: Button
     private lateinit var cloudOffload: CloudOffloadCoordinator
     private lateinit var localStore: LocalCollectorStore
 
@@ -118,6 +119,7 @@ class MainActivity : Activity() {
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
+    private var lastJinhakDigest = JSONObject()
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -126,9 +128,10 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.4.3"
-        private const val BUILD_CODE = 10430
+        private const val VERSION = "0.5.0"
+        private const val BUILD_CODE = 10500
         private const val LOCAL_FIRST_BETA = true
+        private const val ADIGA_RETRY_SUSPENDED = true
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -137,7 +140,7 @@ class MainActivity : Activity() {
         localStore = LocalCollectorStore(this)
         buildUi()
         configureWebView()
-        openProvider(ProviderId.ADIGA)
+        openProvider(ProviderId.JINHAK)
     }
 
     private fun buildUi() {
@@ -242,11 +245,13 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-        val diagnostic = Button(this).apply {
-            text = "진단 로그 전송"
-            setOnClickListener { sendLatestLocalDiagnostic(manual = true) }
+        diagnosticButton = Button(this).apply {
+            text = "진학사 분석 전송"
+            setOnClickListener {
+                if (provider == ProviderId.JINHAK) sendLatestJinhakAnalysisDigest() else sendLatestLocalDiagnostic(manual = true)
+            }
         }
-        actions3.addView(diagnostic, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        actions3.addView(diagnosticButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
         status = TextView(this).apply {
             text = "Admission Collector v$VERSION 준비 중"
@@ -427,10 +432,15 @@ class MainActivity : Activity() {
     private fun openProvider(which: ProviderId) {
         if (batchRunning) stopBatch("서비스 전환")
         provider = which
+        localRunId = localStore.latestResumableRun(which.wireName)
         CookieManager.getInstance().flush()
         sessionState.text = "세션 상태 확인 중"
-        status.text = "${which.displayName} 열기"
-        batchButton.text = if (currentAdapter().supportsBatchCrawl) "접근 가능 정보 일괄 수집" else "현재 진학사 화면 정리"
+        status.text = if (which == ProviderId.JINHAK) "진학사 분석 모드: 로그인 후 원하는 리포트/대학 화면을 여세요." else "어디가 복구 보류: 진학사 분석 이후 한밭대 381쪽부터 재시도 예정"
+        batchButton.text = when (which) {
+            ProviderId.JINHAK -> "현재 진학사 화면 분석·누적"
+            ProviderId.ADIGA -> "어디가 복구 보류"
+        }
+        diagnosticButton.text = if (which == ProviderId.JINHAK) "진학사 분석 전송" else "어디가 진단 로그 전송"
         webView.loadUrl(which.homeUrl)
     }
 
@@ -543,8 +553,14 @@ class MainActivity : Activity() {
             return
         }
 
+        if (provider == ProviderId.ADIGA && ADIGA_RETRY_SUSPENDED) {
+            status.text = "어디가 복구는 현재 보류 중입니다. 진학사 분석 버전 검증 후 한밭대 381쪽을 우선 재시도합니다."
+            Toast.makeText(this, "어디가 재시도는 진학사 분석 이후 진행합니다.", Toast.LENGTH_LONG).show()
+            return
+        }
+
         if (!currentAdapter().supportsBatchCrawl) {
-            status.text = "진학사는 사이트 전체 순회 대신 현재 화면을 안전하게 구조화합니다."
+            status.text = "진학사 현재 화면을 분석하고 로컬 이력에 누적합니다."
             collectCurrentPage()
             return
         }
@@ -967,22 +983,88 @@ class MainActivity : Activity() {
     }
 
     private fun collectCurrentPage() {
-        status.text = "현재 페이지의 표·헤더·카드·입시정보를 구조적으로 수집 중…"
+        status.text = if (provider == ProviderId.JINHAK) "진학사 화면의 과거입결·예측·성적지표를 분석 중…" else "현재 페이지의 표·헤더·카드·입시정보를 구조적으로 수집 중…"
         collectSnapshot { snapshot ->
             if (snapshot == null) return@collectSnapshot
             val records = normalizeSnapshot(snapshot)
+            val collectedAt = Instant.now().toString()
+            var localStats = JSONObject()
+            var stored = 0
+            if (provider == ProviderId.JINHAK) {
+                val runId = localStore.beginOrResume(provider.wireName, VERSION)
+                localRunId = runId
+                stored = localStore.storeRecords(runId, provider.wireName, records)
+                localStore.markDocument(runId, canonicalizeBatchUrl(snapshot.optString("url")), "completed")
+                localStats = localStore.stats(runId)
+                lastJinhakDigest = buildJinhakDigest(snapshot, records, runId, collectedAt)
+            }
             val out = JSONObject()
                 .put("collectorVersion", VERSION)
                 .put("provider", provider.wireName)
-                .put("collectedAt", Instant.now().toString())
-                .put("mode", "single-page")
+                .put("collectedAt", collectedAt)
+                .put("mode", if (provider == ProviderId.JINHAK) "jinhak-analysis" else "single-page")
                 .put("session", snapshot.optJSONObject("session") ?: JSONObject())
+                .put("localStoredThisCapture", stored)
+                .put("localStats", localStats)
                 .put("records", records)
                 .put("snapshots", JSONArray().put(stripNavigationLinksForExport(snapshot)))
                 .put("resourceLinks", snapshot.optJSONArray("resourceLinks") ?: JSONArray())
             lastJson = out.toString(2)
             showPreview(lastJson)
-            status.text = "현재 페이지 수집 완료: 구조화 레코드 ${records.length()}개"
+            status.text = if (provider == ProviderId.JINHAK) {
+                "진학사 분석·누적 완료: 이번 ${records.length()}개 / 로컬 누적 ${localStats.optInt("records", records.length())}개 / 필요 시 '진학사 분석 전송'"
+            } else {
+                "현재 페이지 수집 완료: 구조화 레코드 ${records.length()}개"
+            }
+        }
+    }
+
+    private fun buildJinhakDigest(snapshot: JSONObject, records: JSONArray, runId: String, collectedAt: String): JSONObject {
+        val sanitized = JSONArray()
+        val limit = minOf(records.length(), 120)
+        for (i in 0 until limit) {
+            val r = records.optJSONObject(i) ?: continue
+            sanitized.put(JSONObject()
+                .put("recordType", r.optString("recordType"))
+                .put("providerPageType", r.optString("providerPageType"))
+                .put("dataScope", r.optString("dataScope"))
+                .put("year", if (r.isNull("year")) JSONObject.NULL else r.optInt("year"))
+                .put("university", if (r.isNull("university")) JSONObject.NULL else r.optString("university"))
+                .put("department", if (r.isNull("department")) JSONObject.NULL else r.optString("department"))
+                .put("admission", if (r.isNull("admission")) JSONObject.NULL else r.optString("admission"))
+                .put("metrics", r.optJSONObject("metrics") ?: JSONObject())
+                .put("confidence", r.optString("confidence"))
+                .put("observedAt", r.optString("observedAt", collectedAt)))
+        }
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("type", "jinhak-analysis-digest")
+            .put("pageType", snapshot.optString("providerPageType"))
+            .put("collectedAt", collectedAt)
+            .put("recordCount", records.length())
+            .put("includedRecords", sanitized.length())
+            .put("truncated", records.length() > sanitized.length())
+            .put("localStats", localStore.stats(runId))
+            .put("records", sanitized)
+            .put("privacy", "structured-admission-metrics-only-no-dom-no-raw-evidence-no-url-no-cookie-no-credential")
+    }
+
+    private fun sendLatestJinhakAnalysisDigest() {
+        if (lastJinhakDigest.length() == 0) {
+            Toast.makeText(this, "먼저 진학사에서 분석할 화면을 열고 '현재 진학사 화면 분석·누적'을 눌러주세요.", Toast.LENGTH_LONG).show()
+            return
+        }
+        status.text = "진학사 구조화 분석 결과 전송 중… DOM·쿠키·로그인 정보는 보내지 않습니다."
+        cloudOffload.sendDiagnostic("jinhak", VERSION, JSONObject(lastJinhakDigest.toString()).put("trigger", "manual-analysis")) { result ->
+            runOnUiThread {
+                if (result.isSuccess) {
+                    status.text = "진학사 분석 전송 완료: ${result.getOrNull()?.take(8) ?: "unknown"}…"
+                    Toast.makeText(this, "진학사 분석 전송 완료", Toast.LENGTH_SHORT).show()
+                } else {
+                    status.text = "진학사 분석 전송 실패: ${result.exceptionOrNull()?.message ?: "unknown"}"
+                    Toast.makeText(this, "진학사 분석 전송 실패", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
