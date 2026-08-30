@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.6.6 Memory-Safe Autonomous Explorer"
+        android:label="Admission Collector v0.6.7 Targeted Jinhak Analyzer"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

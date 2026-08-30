@@ -156,8 +156,8 @@ class MainActivity : Activity() {
         private const val JINHAK_ABSOLUTE_TARGET_MS = 35_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.6.6"
-        private const val BUILD_CODE = 10660
+        private const val VERSION = "0.6.7"
+        private const val BUILD_CODE = 10670
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -400,8 +400,10 @@ class MainActivity : Activity() {
                 }
                 if (unifiedRunning && unifiedPhase == "jinhak" && unifiedPendingJinhakStart && provider == ProviderId.JINHAK && !batchRunning) {
                     unifiedPendingJinhakStart = false
+                    unifiedJinhakAutoCapture = true
+                    status.text = "통합 수집 2/2 · 진학사: 사용자가 직접 여는 입시 데이터 화면만 자동 분석·누적합니다."
                     handler.postDelayed({
-                        if (unifiedRunning && unifiedPhase == "jinhak" && !batchRunning) startBatch()
+                        if (unifiedRunning && unifiedPhase == "jinhak" && !batchRunning) scheduleUnifiedJinhakAutoCapture(url)
                     }, 450L)
                     return
                 }
@@ -796,7 +798,7 @@ class MainActivity : Activity() {
             unifiedPendingAdigaStart = false
             unifiedPendingJinhakStart = true
             unifiedJinhakAutoCapture = true
-            status.text = "이전 튕김/중단 감지: 진학사 완료 체크포인트를 건너뛰며 자동 탐색을 재개합니다."
+            status.text = "이전 중단 감지: 진학사에서 사용자가 직접 여는 입시 화면의 자동 분석·누적을 재개합니다."
             webView.loadUrl(ProviderId.JINHAK.homeUrl)
             true
         }
@@ -854,10 +856,10 @@ class MainActivity : Activity() {
         persistRuntimeCheckpoint(forceResume = true)
         CookieManager.getInstance().flush()
         sessionState.text = "세션 상태 확인 중"
-        batchButton.text = "진학사 자동 탐색 준비"
+        batchButton.text = "현재 진학사 화면 전체 분석·누적"
         diagnosticButton.text = "진학사 전체 분석 전송"
         unifiedButton.text = "통합 수집 종료"
-        status.text = "통합 수집 2/2 · 진학사 안전 자동 탐색 준비: 동일 도메인의 입시정보 링크를 스스로 순회합니다."
+        status.text = "통합 수집 2/2 · 진학사 분석 대기: 원하는 수시저장소·추천대학·대학정보·리포트 화면을 직접 열면 자동 분석합니다."
         webView.loadUrl(ProviderId.JINHAK.homeUrl)
     }
 
@@ -878,7 +880,7 @@ class MainActivity : Activity() {
                     return@checkSessionState
                 }
                 if (!unifiedJinhakCapturedPages.add(pageKey)) return@checkSessionState
-                collectCurrentPage()
+                collectCurrentPage(autoUnified = true)
             }
         }, 900L)
     }
@@ -1599,10 +1601,31 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun collectCurrentPage() {
+    private fun isJinhakAutoCaptureRelevant(pageType: String): Boolean = pageType in setOf(
+        "jinhak-early-storage",
+        "jinhak-prediction-report",
+        "jinhak-mock-support-report",
+        "jinhak-actual-admit-report",
+        "jinhak-score-calc-report",
+        "jinhak-sat-minimum",
+        "jinhak-student-basic",
+        "jinhak-university-search",
+        "jinhak-recommended-university",
+        "jinhak-university-admission-info"
+    )
+
+    private fun collectCurrentPage(autoUnified: Boolean = false) {
         status.text = if (provider == ProviderId.JINHAK) "진학사 현재 화면의 카드·표·세부 설명·예측지표를 전체 분석 중…" else "현재 페이지의 표·헤더·카드·입시정보를 구조적으로 수집 중…"
         collectSnapshot { snapshot ->
             if (snapshot == null) return@collectSnapshot
+            val pageType = snapshot.optString("providerPageType")
+            if (provider == ProviderId.JINHAK && autoUnified && !isJinhakAutoCaptureRelevant(pageType)) {
+                recordRuntimeEvent("jinhak-nonadmission-page-skipped", JSONObject()
+                    .put("pageType", pageType.take(80))
+                    .put("safePath", runtimeSafePath(snapshot.optString("url"))))
+                status.text = "진학사 자동 분석 제외: 입시 데이터 화면이 아닌 ${pageType.ifBlank { "unclassified" }} 페이지입니다. 원하는 리포트/대학정보 화면을 여세요."
+                return@collectSnapshot
+            }
             val records = normalizeSnapshot(snapshot)
             val collectedAt = Instant.now().toString()
             if (provider == ProviderId.JINHAK) {
@@ -1853,6 +1876,7 @@ class MainActivity : Activity() {
             .put("schemaVersion", 2)
             .put("type", "jinhak-full-screen-analysis")
             .put("pageType", snapshot.optString("providerPageType"))
+            .put("analysisRelevance", if (isJinhakAutoCaptureRelevant(snapshot.optString("providerPageType"))) "admission-relevant" else "reference-or-editorial")
             .put("collectedAt", collectedAt)
             .put("recordCount", records.length())
             .put("detectedStorageCards", cards.length())

@@ -10,7 +10,7 @@ import java.time.temporal.ChronoUnit
 
 object JinhakAdapter : ProviderAdapter {
     override val id = ProviderId.JINHAK
-    override val supportsBatchCrawl = true
+    override val supportsBatchCrawl = false
     private const val TARGET_YEAR = 2027
 
     override fun accepts(url: String): Boolean {
@@ -22,18 +22,7 @@ object JinhakAdapter : ProviderAdapter {
 
     override fun seedUrls(): List<String> = listOf("https://www.jinhak.com/")
 
-    override fun isBatchNavigable(url: String): Boolean {
-        if (!accepts(url)) return false
-        return try {
-            val uri = URI(url)
-            val path = (uri.path ?: "/").lowercase()
-            val query = (uri.query ?: "").lowercase()
-            val full = "$path?$query"
-            if (Regex("(?:logout|signout|member|mypage|my-page|account|payment|billing|purchase|order|spassdata|coupon|refund|withdraw|profile|userinfo|customer|faq|qna|event|notice|privacy|terms|jinhak-tv|univ-entrance-info|susi-special|story|news|clip)").containsMatchIn(full)) return false
-            if (Regex("\\.(?:jpg|jpeg|png|gif|webp|svg|ico|css|js|map|woff2?|ttf|eot|zip|hwp|hwpx|pdf)$", RegexOption.IGNORE_CASE).containsMatchIn(path)) return false
-            true
-        } catch (_: Exception) { false }
-    }
+    override fun isBatchNavigable(url: String): Boolean = false
 
     override fun classify(snapshot: JSONObject): String {
         val rawUrl = snapshot.optString("url")
@@ -47,6 +36,10 @@ object JinhakAdapter : ProviderAdapter {
                 append(' ').append(headings.optString(i))
             }
         }.replace(Regex("\\s+"), " ").trim()
+        val pageTitle = snapshot.optString("title").replace(Regex("\\s+"), " ").trim()
+        val navigationError = Regex("^(?:302\\s+Found|404\\s+Not\\s+Found|500(?:\\s+Internal\\s+Server\\s+Error)?)$", RegexOption.IGNORE_CASE).matches(pageTitle)
+        val universityAdmissionInfo = Regex("^.{2,100}에 대한 모든 입시정보\\s*\\|\\s*대학정보\\s*\\|\\s*진학사$").containsMatchIn(pageTitle)
+        val editorialContent = Regex("(학과\\s*심층분석|대학\\s*심층분석|대학학과\\s*심층분석|지도로\\s*보는\\s*대학|대학교\\s*지도|캠퍼스맵)").containsMatchIn(pageTitle)
 
         // Global menus contain words such as 합격예측/수시저장소 on almost every page.
         // Classification therefore uses URL + title/heading context, never whole-page menu text.
@@ -64,6 +57,9 @@ object JinhakAdapter : ProviderAdapter {
 
         return when {
             Regex("(login|signin|member/login)").containsMatchIn(url) || Regex("로그인.*비밀번호").containsMatchIn(headingText) -> "jinhak-login"
+            navigationError -> "jinhak-navigation-error"
+            universityAdmissionInfo -> "jinhak-university-admission-info"
+            editorialContent -> "jinhak-editorial-content"
             rootPage -> "jinhak-home"
             mockReport -> "jinhak-mock-support-report"
             hasActual -> "jinhak-actual-admit-report"
@@ -88,7 +84,11 @@ object JinhakAdapter : ProviderAdapter {
         val inferredYear = context.year ?: if (dataScope == "current-prediction" || dataScope == "current-admission") TARGET_YEAR else null
         val result = JSONArray()
 
-        if (pageType == "jinhak-early-storage") {
+        if (pageType == "jinhak-university-admission-info") {
+            return normalizeUniversityAdmissionInfo(snapshot, observedAt)
+        }
+
+        if (pageType == "jinhak-early-storage" || pageType == "jinhak-recommended-university") {
             val cards = snapshot.optJSONArray("jinhakCards") ?: JSONArray()
             var hasRicherPredictionCards = false
             for (ci in 0 until cards.length()) {
@@ -108,16 +108,24 @@ object JinhakAdapter : ProviderAdapter {
                     .replace(Regex("""\s+"""), " ").trim().take(5000)
                 if (evidence.isBlank()) continue
                 val local = GenericAdmissionParser.inferContext(evidence)
+                val compact = if (pageType == "jinhak-recommended-university") compactRecommendationContext(evidence) else null
+                if (pageType == "jinhak-recommended-university" && compact == null) continue
                 val explicitUniversity = cleanStorageUniversity(cardObj?.optString("university"))
                 val explicitDepartment = cleanStorageDepartment(cardObj?.optString("department"))
-                val university = cleanStorageUniversity(local.university) ?: explicitUniversity
-                val department = cleanStorageDepartment(local.department) ?: explicitDepartment
-                val admission = cleanStorageAdmission(local.admission, evidence)
+                val compactUniversity = cleanStorageUniversity(compact?.optString("university"))
+                val compactDepartment = cleanStorageDepartment(compact?.optString("department"))
+                val compactAdmission = compact?.optString("admission")?.takeIf { it.isNotBlank() }
+                val university = compactUniversity ?: cleanStorageUniversity(local.university) ?: explicitUniversity
+                val department = compactDepartment ?: cleanStorageDepartment(local.department) ?: explicitDepartment
+                val admission = compactAdmission ?: cleanStorageAdmission(local.admission, evidence)
                 val universityContextSource = cardObj?.optString("universitySource")
                     ?.takeIf { it.isNotBlank() && it != "missing" }
                 val departmentContextSource = cardObj?.optString("departmentSource")
                     ?.takeIf { it.isNotBlank() && it != "missing" }
                 val cardMetrics = predictionMetrics(evidence)
+                compact?.optString("admissionCategory")?.takeIf { it.isNotBlank() }?.let { cardMetrics.put("admissionCategory", it) }
+                compact?.optString("combinedAdmissionDepartmentLabel")?.takeIf { it.isNotBlank() }?.let { cardMetrics.put("combinedAdmissionDepartmentLabel", it) }
+                if (evidence.contains("수능최저")) cardMetrics.put("minimumRequirementDisplayed", true)
                 val metricKeys = cardMetrics.keys().asSequence().filter { !cardMetrics.isNull(it) }.toList()
                 val summaryOnly = metricKeys.size == 1 && metricKeys.firstOrNull() == "stabilityBars"
                 if (hasRicherPredictionCards && summaryOnly) continue
@@ -141,6 +149,7 @@ object JinhakAdapter : ProviderAdapter {
                     .put("observedAt", observedAt)
                     .put("cardIndex", i)
                     .put("contextSource", when {
+                        compact != null -> "compact-recommendation-card"
                         local.university == null && explicitUniversity != null && local.department == null && explicitDepartment != null -> "scored-card-root+university+department-context"
                         local.university == null && explicitUniversity != null -> "scored-card-root+explicit-university-context"
                         local.department == null && explicitDepartment != null -> "scored-card-root+explicit-department-context"
@@ -165,7 +174,8 @@ object JinhakAdapter : ProviderAdapter {
             return RecordUtils.dedupe(result)
         }
 
-        if (pageType == "jinhak-home" || pageType == "jinhak-university-search" || pageType == "jinhak-curation" || pageType == "jinhak-other") {
+        if (pageType == "jinhak-home" || pageType == "jinhak-university-search" || pageType == "jinhak-curation" ||
+            pageType == "jinhak-other" || pageType == "jinhak-editorial-content" || pageType == "jinhak-navigation-error") {
             return result
         }
 
@@ -222,7 +232,7 @@ object JinhakAdapter : ProviderAdapter {
     }
 
     private fun dataScope(pageType: String): String = when (pageType) {
-        "jinhak-actual-admit-report" -> "historical-result"
+        "jinhak-actual-admit-report", "jinhak-university-admission-info" -> "historical-result"
         "jinhak-prediction-report", "jinhak-mock-support-report", "jinhak-recommended-university", "jinhak-early-storage" -> "current-prediction"
         "jinhak-sat-minimum" -> "current-admission"
         "jinhak-score-calc-report", "jinhak-student-basic" -> "student-profile"
@@ -248,7 +258,7 @@ object JinhakAdapter : ProviderAdapter {
         if (cleaned.length !in 3..48) return null
         if (Regex("""(등급|경쟁률|합격|예측|지원|전형|모집|학과|학부|전공)""").containsMatchIn(cleaned)) return null
         val full = Regex("""^[가-힣A-Za-z0-9·.()\-]{2,35}(?:대학교|교육대학교|과학기술원)(?:\[[^\]]{1,12}\])?$""")
-        val short = Regex("""^[가-힣A-Za-z0-9·.()\-]{2,24}대$""")
+        val short = Regex("""^[가-힣A-Za-z0-9·.&+\-]{2,24}대(?:\([^)]+\))?$""")
         val shortNoise = setOf("공대", "의대", "법대", "상대", "교대", "사범대", "간호대", "약대", "치대", "한의대", "철도대")
         return when {
             full.matches(cleaned) -> cleaned
@@ -274,14 +284,105 @@ object JinhakAdapter : ProviderAdapter {
         return token?.trim()?.takeIf { it.isNotBlank() }
     }
 
+    private fun compactRecommendationContext(text: String): JSONObject? {
+        val compact = text.replace(Regex("""\s+"""), " ").trim()
+        val universityMatch = Regex("""^(?:[0-9]{1,2}\s*칸\s*)?([가-힣A-Za-z0-9·.&+\-]+(?:\([^)]+\))?)(?=\[)""").find(compact) ?: return null
+        val university = universityMatch.groupValues.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        var tail = compact.substring(universityMatch.range.last + 1)
+        val categoryMatch = Regex("""^\[([^\]]{1,20})\]""").find(tail)
+        val category = categoryMatch?.groupValues?.getOrNull(1)?.trim()
+        if (categoryMatch != null) tail = tail.substring(categoryMatch.range.last + 1)
+
+        val combined = Regex("""^(.+?)(?=[0-9]{1,4}\s*명\s*내\s*점수)""").find(tail)
+            ?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        if (combined.isBlank()) return null
+        val admissionRegex = Regex("""^(지역인재교과|지역인재종합|교과일반|교과우수|교과중심|자기추천|창의인재\(면접형\)|교과면접|학교장추천|고른기회|기회균형|학생부교과|학생부종합|지역인재|자율전공|일반)""")
+        val admissionMatch = admissionRegex.find(combined)
+        val admission = admissionMatch?.groupValues?.getOrNull(1)?.trim()
+        var department = if (admissionMatch != null) combined.substring(admissionMatch.range.last + 1) else combined
+        department = department.replace(Regex("""^(?:\[[^\]]{1,30}\])+"""), "").trim()
+        if (department.isBlank() || department.length > 100) return null
+
+        return JSONObject()
+            .put("university", university)
+            .put("department", department)
+            .put("admission", admission ?: JSONObject.NULL)
+            .put("admissionCategory", category ?: JSONObject.NULL)
+            .put("combinedAdmissionDepartmentLabel", combined)
+    }
+
+    private fun normalizeUniversityAdmissionInfo(snapshot: JSONObject, observedAt: String): JSONArray {
+        val result = JSONArray()
+        val title = snapshot.optString("title").replace(Regex("""\s+"""), " ").trim()
+        val university = Regex("""^(.+?)에 대한 모든 입시정보\s*\|\s*대학정보\s*\|\s*진학사$""")
+            .find(title)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() } ?: return result
+        val tables = snapshot.optJSONArray("tables") ?: return result
+
+        for (ti in 0 until tables.length()) {
+            val rows = tables.optJSONObject(ti)?.optJSONArray("rows") ?: continue
+            if (rows.length() < 2) continue
+            val header = rows.optJSONArray(0) ?: continue
+            if (!header.optString(0).replace(" ", "").contains("전형/모집단위")) continue
+
+            val yearColumns = mutableListOf<Pair<Int, Int>>()
+            for (ci in 1 until header.length()) {
+                val year = Regex("""(20[0-9]{2})\s*학년도""").find(header.optString(ci))
+                    ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: continue
+                yearColumns += ci to year
+            }
+            if (yearColumns.isEmpty()) continue
+
+            for (ri in 1 until rows.length()) {
+                val row = rows.optJSONArray(ri) ?: continue
+                val rowLabel = row.optString(0).replace(Regex("""\s+"""), " ").trim()
+                if (rowLabel.isBlank()) continue
+                val category = Regex("""^\[([^\]]{1,20})\]""").find(rowLabel)?.groupValues?.getOrNull(1)?.trim()
+
+                for ((ci, year) in yearColumns) {
+                    val rawValue = row.optString(ci).replace(Regex("""\s+"""), " ").trim()
+                    if (rawValue.isBlank() || rawValue == "-") continue
+                    val numeric = Regex("""-?[0-9]+(?:\.[0-9]+)?""").find(rawValue)?.value?.toDoubleOrNull()
+                    val metrics = JSONObject()
+                        .put("metricType", "competition")
+                        .put("combinedAdmissionDepartmentLabel", rowLabel)
+                        .put("admissionCategory", category ?: JSONObject.NULL)
+                    if (numeric != null) metrics.put("competition", numeric) else metrics.put("rawValue", rawValue.take(120))
+
+                    val record = JSONObject()
+                        .put("recordType", "jinhak-historical-competition")
+                        .put("providerPageType", "jinhak-university-admission-info")
+                        .put("dataScope", "historical-result")
+                        .put("year", year)
+                        .put("university", university)
+                        .put("department", JSONObject.NULL)
+                        .put("admission", JSONObject.NULL)
+                        .put("metrics", metrics)
+                        .put("observedAt", observedAt)
+                        .put("confidence", "medium")
+                        .put("sourcePage", safePath(snapshot.optString("url")))
+                        .put("rawEvidence", "$rowLabel | $year | $rawValue")
+                    record.put("sourceRowFingerprint", fingerprint(record, observedAt, preserveSnapshot = false))
+                    result.put(record)
+                }
+            }
+        }
+        return RecordUtils.dedupe(result)
+    }
+
     private fun predictionMetrics(text: String): JSONObject {
         val metrics = JSONObject()
         putNumber(metrics, "universityCalculatedScore", Regex("(?:대학별\\s*)?(?:환산점수|산출점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
+        if (!metrics.has("universityCalculatedScore")) {
+            putNumber(metrics, "universityCalculatedScore", Regex("내\\s*점수\\s*([0-9]+(?:\\.[0-9]+)?)\\s*점").find(text)?.groupValues?.getOrNull(1))
+        }
         putNumber(metrics, "convertedGrade", Regex("(?:반영\\s*평균등급|환산등급|내\\s*등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
-        putInt(metrics, "stabilityBars", Regex("(?:합격안정성|칸수|칸\\s*수)?\\s*[:：]?\\s*([0-9]{1,2})\\s*칸").find(text)?.groupValues?.getOrNull(1))
+        putInt(metrics, "stabilityBars", Regex("(?<![0-9.])(?:합격안정성|칸수|칸\\s*수)?\\s*[:：]?\\s*([0-9]{1,2})\\s*칸").find(text)?.groupValues?.getOrNull(1))
         putNumber(metrics, "predictionProbability", Regex("(?:예상\\s*)?(?:합격률|합격확률|합격가능성)\\s*[:：]?\\s*([0-9]{1,3}(?:\\.[0-9]+)?)\\s*%").find(text)?.groupValues?.getOrNull(1))
-        putText(metrics, "predictionLabel", Regex("(?:합격예측|지원판정|지원전략)?\\s*[:：]?\\s*(안정지원|안정|적정지원|적정|소신지원|소신|위험|상향|하향|불안)").find(text)?.groupValues?.getOrNull(1))
+        putText(metrics, "predictionLabel", Regex("(?:합격예측|합격가능성|지원판정|지원전략)?\\s*[:：]?\\s*(안정지원|안정|적정지원|적정|소신지원|소신|위험|상향|하향|불안)").find(text)?.groupValues?.getOrNull(1))
         putInt(metrics, "capacity", Regex("(?:모집인원|모집 인원)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
+        if (!metrics.has("capacity")) {
+            putInt(metrics, "capacity", Regex("([0-9,]+)\\s*명\\s*내\\s*점수").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
+        }
         putInt(metrics, "mockApplicants", Regex("(?:모의지원자수|모의지원자 수|모의지원자)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
         putInt(metrics, "applicants", Regex("(?:현재\\s*)?(?:지원자수|지원자 수|실지원자수|실지원자 수)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
         putNumber(metrics, "mockCompetition", Regex("(?:모의지원\\s*)?경쟁률\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
