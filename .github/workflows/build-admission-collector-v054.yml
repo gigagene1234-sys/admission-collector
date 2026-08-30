@@ -5,7 +5,7 @@ on:
     branches: [ main ]
     paths:
       - ".github/workflows/build-admission-collector-v054.yml"
-      - "scripts/apply_v054.py"
+      - "scripts/apply_v054b.py"
   workflow_dispatch:
 
 permissions:
@@ -27,18 +27,7 @@ jobs:
           fetch-depth: 0
 
       - name: Apply v0.5.4 patch
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('scripts/apply_v054.py')
-          t=p.read_text()
-          old='snap, n = pat.subn(new_block, snap, count=1)'
-          new='snap, n = pat.subn(lambda _m: new_block, snap, count=1)'
-          if old in t:
-              p.write_text(t.replace(old,new,1))
-          PY
-          python3 scripts/apply_v054.py
+        run: python3 scripts/apply_v054b.py
 
       - name: Verify source invariants
         shell: bash
@@ -114,7 +103,7 @@ jobs:
             app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
             app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt \
             app/src/main/java/com/admissionhub/collector/parser/GenericAdmissionParser.kt \
-            scripts/apply_v054.py
+            scripts/apply_v054b.py
           if git diff --cached --quiet; then
             echo "source already persisted"
           else
