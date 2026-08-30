@@ -128,8 +128,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.5.6"
-        private const val BUILD_CODE = 10560
+        private const val VERSION = "0.5.7"
+        private const val BUILD_CODE = 10570
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1021,6 +1021,7 @@ class MainActivity : Activity() {
 
     private fun buildJinhakDigest(snapshot: JSONObject, records: JSONArray, runId: String, collectedAt: String): JSONObject {
         val sanitized = JSONArray()
+        val missingDepartmentCardIndexes = linkedSetOf<Int>()
         var universityBound = 0
         var departmentBound = 0
         var admissionBound = 0
@@ -1032,6 +1033,7 @@ class MainActivity : Activity() {
             val hasAdmission = !r.isNull("admission") && r.optString("admission").isNotBlank()
             if (hasUniversity) universityBound += 1
             if (hasDepartment) departmentBound += 1
+            if (!hasDepartment && r.has("cardIndex")) missingDepartmentCardIndexes += r.optInt("cardIndex")
             if (hasAdmission) admissionBound += 1
             if (hasUniversity && hasDepartment && hasAdmission) fullyBound += 1
         }
@@ -1056,6 +1058,31 @@ class MainActivity : Activity() {
                 .put("departmentContextSource", if (r.isNull("departmentContextSource")) JSONObject.NULL else r.optString("departmentContextSource"))
                 .put("departmentContextDepth", r.optInt("departmentContextDepth", -1)))
         }
+        val departmentProbes = JSONArray()
+        val cards = snapshot.optJSONArray("jinhakCards") ?: JSONArray()
+        for (cardIndex in missingDepartmentCardIndexes) {
+            if (cardIndex < 0 || cardIndex >= cards.length()) continue
+            val card = cards.optJSONObject(cardIndex) ?: continue
+            val rawProbe = card.optJSONArray("departmentProbe") ?: JSONArray()
+            val safeProbe = JSONArray()
+            for (pi in 0 until minOf(rawProbe.length(), 14)) {
+                val q = rawProbe.optJSONObject(pi) ?: continue
+                val name = q.optString("name").replace(Regex("""\s+"""), " ").trim().take(60)
+                if (name.isBlank() || !Regex("""(?:학과|학부|전공|자율전공)$""").containsMatchIn(name)) continue
+                safeProbe.put(JSONObject()
+                    .put("name", name)
+                    .put("relation", q.optString("relation").take(32))
+                    .put("depth", q.optInt("depth", -1))
+                    .put("distance", q.optInt("distance", 0))
+                    .put("tag", q.optString("tag").take(20)))
+            }
+            departmentProbes.put(JSONObject()
+                .put("cardIndex", cardIndex)
+                .put("rootTag", card.optString("rootTag").take(20))
+                .put("rootScore", card.optInt("score", 0))
+                .put("university", card.optString("university").take(60))
+                .put("candidates", safeProbe))
+        }
         return JSONObject()
             .put("schemaVersion", 1)
             .put("type", "jinhak-analysis-digest")
@@ -1070,11 +1097,12 @@ class MainActivity : Activity() {
                 .put("admissionBound", admissionBound)
                 .put("fullyBound", fullyBound)
                 .put("totalRecords", records.length()))
+            .put("departmentStructureProbe", departmentProbes)
             .put("includedRecords", sanitized.length())
             .put("truncated", records.length() > sanitized.length())
             .put("localStats", localStore.stats(runId))
             .put("records", sanitized)
-            .put("privacy", "structured-admission-metrics-only-no-dom-no-raw-evidence-no-url-no-cookie-no-credential")
+            .put("privacy", "structured-admission-metrics-and-short-department-candidates-only-no-dom-no-raw-evidence-no-url-no-cookie-no-credential")
     }
 
     private fun sendLatestJinhakAnalysisDigest() {
