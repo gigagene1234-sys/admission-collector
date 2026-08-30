@@ -13,7 +13,7 @@ object GenericAdmissionParser {
 
     fun normalize(snapshot: JSONObject): JSONArray {
         val result = JSONArray()
-        val inherited = inferContext(collectText(snapshot).take(10000))
+        val inherited = inferSnapshotContext(snapshot)
         val tables = snapshot.optJSONArray("tables") ?: JSONArray()
         for (ti in 0 until tables.length()) {
             val table = tables.optJSONObject(ti) ?: continue
@@ -52,18 +52,80 @@ object GenericAdmissionParser {
         return parts.joinToString(" \n ").replace(Regex("\\s+"), " ").take(60000)
     }
 
-    fun inferContext(text: String): InferredContext {
-        val universityRegex = Regex("([가-힣A-Za-z0-9·.()\\- ]{2,45}(대학교|대학)(?:\\[(?:본교|분교|제\\d+캠퍼스)\\])?)")
-        val deptRegex = Regex("([가-힣A-Za-z0-9·.()\\- ]{2,55}(학과|학부|전공|모집단위))")
-        val admissionRegex = Regex("([가-힣A-Za-z0-9·.()\\- ]{2,70}(전형|학생부교과|학생부종합|교과|종합|추천|면접))")
-        val yearRegex = Regex("(?:^|[^0-9])(20[0-9]{2})(?:학년도|년도|년)?")
+    fun inferSnapshotContext(snapshot: JSONObject): InferredContext {
+        val priority = mutableListOf<String>()
+        snapshot.optString("title").trim().takeIf { it.isNotBlank() }?.let(priority::add)
+        val context = snapshot.optJSONArray("context") ?: JSONArray()
+        for (i in 0 until minOf(context.length(), 80)) context.optString(i).trim().takeIf { it.isNotBlank() }?.let(priority::add)
+        val blocks = snapshot.optJSONArray("blocks") ?: JSONArray()
+        for (i in 0 until minOf(blocks.length(), 30)) blocks.optString(i).trim().takeIf { it.isNotBlank() }?.let(priority::add)
+        val first = inferContext(priority.joinToString(" | "))
+        if (first.university != null && first.department != null) return first
+        val fallback = inferContext(collectText(snapshot).take(12000))
         return InferredContext(
-            universityRegex.find(text)?.groupValues?.getOrNull(1)?.trim(),
-            deptRegex.find(text)?.groupValues?.getOrNull(1)?.trim(),
-            admissionRegex.find(text)?.groupValues?.getOrNull(1)?.trim(),
-            yearRegex.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            first.university ?: fallback.university,
+            first.department ?: fallback.department,
+            first.admission ?: fallback.admission,
+            first.year ?: fallback.year
         )
     }
+
+    fun inferContext(text: String): InferredContext {
+        val normalized = text.replace(Regex("\\s+"), " ").trim()
+        val university = bestUniversity(normalized)
+        val department = bestDepartment(normalized)
+        val admission = bestAdmission(normalized)
+        val year = Regex("(?:^|[^0-9])(20[0-9]{2})(?:학년도|년도|년)?")
+            .find(normalized)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        return InferredContext(university, department, admission, year)
+    }
+
+    private fun bestUniversity(text: String): String? {
+        val universityMatches = Regex("([가-힣A-Za-z0-9·.()\\-]{2,35}대학교(?:\\[[^\\]]{1,12}\\])?)")
+            .findAll(text).map { cleanCandidate(it.groupValues[1]) }.filter { it.length in 4..45 }.toList()
+        universityMatches.firstOrNull()?.let { return it }
+
+        val excludedCollege = Regex("(공과대학|인문대학|사회과학대학|자연과학대학|의과대학|약학대학|간호대학|경상대학|사범대학|예술대학|디자인대학|IT대학|철도대학|보건대학|융합대학|천안공과대학)$")
+        return Regex("([가-힣A-Za-z0-9·.()\\-]{2,30}대학)")
+            .findAll(text)
+            .map { cleanCandidate(it.groupValues[1]) }
+            .firstOrNull { it.length in 3..35 && !excludedCollege.containsMatchIn(it) }
+    }
+
+    private fun bestDepartment(text: String): String? {
+        val noise = Regex("(지원|합격|예측|반영|학생부|전형|대학교|대학검색|모집인원|경쟁률)")
+        val suffix = Regex("(학과|학부|전공|모집단위|자율전공)$")
+        val segments = text.split('|').map { cleanCandidate(it) }.filter { it.isNotBlank() }
+        val candidates = mutableListOf<String>()
+        for (segment in segments) {
+            val labeled = Regex("(?:학과|학부|모집단위|전공)\\s*[:：]\\s*([가-힣A-Za-z0-9·.()&・\\- ]{2,40})").find(segment)?.groupValues?.getOrNull(1)
+            if (!labeled.isNullOrBlank()) candidates += cleanCandidate(labeled)
+            Regex("([가-힣A-Za-z0-9·.()&・\\-]{2,35}(?:학과|학부|전공|모집단위))")
+                .findAll(segment).forEach { candidates += cleanCandidate(it.groupValues[1]) }
+        }
+        return candidates
+            .filter { it.length in 2..40 && suffix.containsMatchIn(it) && !noise.containsMatchIn(it) }
+            .minByOrNull { it.length }
+    }
+
+    private fun bestAdmission(text: String): String? {
+        val segments = text.split('|').map { cleanCandidate(it) }.filter { it.isNotBlank() }
+        val candidates = mutableListOf<String>()
+        val known = Regex("((?:학생부교과|학생부종합|교과|종합|지역인재|학교장추천|일반|면접|교과면접|서류|고른기회|농어촌|기회균형)[가-힣A-Za-z0-9·.()_\\- ]{0,24}전형)")
+        for (segment in segments) {
+            Regex("(?:전형명|전형)\\s*[:：]\\s*([가-힣A-Za-z0-9·.()_\\- ]{2,35}(?:전형)?)")
+                .find(segment)?.groupValues?.getOrNull(1)?.let { candidates += cleanCandidate(it) }
+            known.findAll(segment).forEach { candidates += cleanCandidate(it.groupValues[1]) }
+        }
+        return candidates.firstOrNull {
+            it.length in 2..40 && !Regex("[①-⑳]|[0-9]+\\)|학생부 반영비율|있는 전형|없는 서류|설명|안내").containsMatchIn(it)
+        }
+    }
+
+    private fun cleanCandidate(value: String): String = value
+        .replace(Regex("^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9)\\]]+$"), "")
+        .replace(Regex("\\s+"), " ")
+        .trim()
 
     private fun buildRecord(evidenceRaw: String, inherited: InferredContext): JSONObject? {
         val evidence = evidenceRaw.replace(Regex("\\s+"), " ").trim().take(7000)
@@ -99,7 +161,7 @@ object GenericAdmissionParser {
         if (!hasMetric) return null
 
         val confidence = when {
-            university != null && department != null && admission != null -> "high"
+            university != null && department != null -> "high"
             university != null || department != null || admission != null -> "medium"
             else -> "raw"
         }

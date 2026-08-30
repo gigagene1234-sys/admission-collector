@@ -25,13 +25,18 @@ object JinhakAdapter : ProviderAdapter {
     override fun classify(snapshot: JSONObject): String {
         val url = snapshot.optString("url").lowercase()
         val text = GenericAdmissionParser.collectText(snapshot)
+        val hasPrediction = text.contains("합격예측") || text.contains("모의지원") || Regex("[0-9]{1,2}\\s*칸").containsMatchIn(text)
+        val hasActual = text.contains("실제합격자") ||
+            (text.contains("입시결과") && Regex("(최종등록|합격자|충원|70%|50%)").containsMatchIn(text))
+        val dedicatedMinimum = url.contains("esatminuniv") ||
+            (Regex("(수능최저\\s*(검색|대학|조건)|최저학력기준\\s*(검색|대학))").containsMatchIn(text) && !hasPrediction)
         return when {
             Regex("(login|signin|member/login)").containsMatchIn(url) || text.contains("로그인") && text.contains("비밀번호") -> "jinhak-login"
-            url.contains("esatminuniv") || text.contains("수능최저") -> "jinhak-sat-minimum"
-            text.contains("실제합격자") || text.contains("입시결과") && Regex("(최종등록|합격자|충원|70%|50%)").containsMatchIn(text) -> "jinhak-actual-admit-report"
-            text.contains("합격예측리포트") || text.contains("합격예측 리포트") || text.contains("합격예측") && text.contains("칸") -> "jinhak-prediction-report"
+            hasActual -> "jinhak-actual-admit-report"
+            text.contains("합격예측리포트") || text.contains("합격예측 리포트") || hasPrediction -> "jinhak-prediction-report"
             url.contains("sapplysample") || text.contains("모의지원 리포트") || text.contains("모의지원리포트") -> "jinhak-mock-support-report"
             text.contains("성적산출 리포트") || text.contains("성적산출리포트") -> "jinhak-score-calc-report"
+            dedicatedMinimum -> "jinhak-sat-minimum"
             url.contains("infoview.aspx") -> "jinhak-student-basic"
             url.contains("four-year-university/search") || text.contains("대학검색") -> "jinhak-university-search"
             url.contains("/curation") || text.contains("큐레이션") -> "jinhak-curation"
@@ -44,7 +49,7 @@ object JinhakAdapter : ProviderAdapter {
     override fun normalize(snapshot: JSONObject): JSONArray {
         val text = GenericAdmissionParser.collectText(snapshot)
         val pageType = classify(snapshot)
-        val context = GenericAdmissionParser.inferContext(text)
+        val context = GenericAdmissionParser.inferSnapshotContext(snapshot)
         val observedAt = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
         val dataScope = dataScope(pageType)
         val inferredYear = context.year ?: if (dataScope == "current-prediction" || dataScope == "current-admission") TARGET_YEAR else null
@@ -77,7 +82,11 @@ object JinhakAdapter : ProviderAdapter {
                 .put("admission", context.admission ?: JSONObject.NULL)
                 .put("metrics", metrics)
                 .put("observedAt", observedAt)
-                .put("confidence", if (context.university != null || context.department != null || context.admission != null) "high" else "medium")
+                .put("confidence", when {
+                    context.university != null && context.department != null -> "high"
+                    context.university != null || context.department != null || context.admission != null -> "medium"
+                    else -> "raw"
+                })
                 .put("sourcePage", safePath(snapshot.optString("url")))
                 .put("rawEvidence", text.take(5000))
             summary.put("sourceRowFingerprint", fingerprint(summary, observedAt, preserveSnapshot = dataScope == "current-prediction"))

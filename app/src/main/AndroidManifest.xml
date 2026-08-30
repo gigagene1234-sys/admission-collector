@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.5.0 Jinhak Analysis"
+        android:label="Admission Collector v0.5.1 Jinhak Analysis"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
