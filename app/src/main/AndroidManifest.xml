@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.5.8 Jinhak Department Boundary Probe"
+        android:label="Admission Collector v0.6.0 Jinhak Full Screen Analyzer"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

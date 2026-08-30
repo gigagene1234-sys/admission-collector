@@ -157,7 +157,7 @@ object SnapshotScript {
   }
 
   var jinhakCards=[];
-  var jinhakCardStats={metricSeeds:0,candidateRoots:0,uniqueRoots:0,universityBoundRoots:0,universityContextRoots:0,universityMissingRoots:0,departmentBoundRoots:0,departmentContextRoots:0,departmentMissingRoots:0,departmentProbeCards:0,departmentProbeCandidates:0};
+  var jinhakCardStats={metricSeeds:0,candidateRoots:0,uniqueRoots:0,universityBoundRoots:0,universityContextRoots:0,universityMissingRoots:0,departmentBoundRoots:0,departmentContextRoots:0,departmentMissingRoots:0};
   if(/(^|\.)jinhak\.com$/i.test(location.hostname)){
     var metricRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|경쟁률|모의지원|합격예측|지원판정|내\s*순위|모집인원)/i;
     var primaryRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|합격예측|지원판정|내\s*순위|예상\s*(?:합격선|컷))/i;
@@ -267,104 +267,12 @@ object SnapshotScript {
       var direct=explicitDepartmentNames(rootText);
       if(direct.length===1) return {name:direct[0],source:'card-root',depth:0};
       var cur=el;
-      for(var depth=0;cur&&depth<8;depth++){
+      for(var depth=0;cur&&depth<8;depth++,cur=cur.parentElement){
         var attrs=cleanText((cur.getAttribute&&cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute&&cur.getAttribute('title')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-dept-name')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-department-name')||''));
         var an=explicitDepartmentNames(attrs);
         if(an.length===1) return {name:an[0],source:'ancestor-attribute',depth:depth};
-
-        var prev=cur.previousElementSibling;
-        for(var pi=0;prev&&pi<5;pi++,prev=prev.previousElementSibling){
-          if(!visible(prev)) continue;
-          var pt=structuredCardText(prev,900);
-          if(primaryRx.test(pt)) break;
-          var pn=explicitDepartmentNames(pt);
-          var pm=cleanText((prev.tagName||'')+' '+(prev.id||'')+' '+(prev.className||''));
-          if(pn.length===1 && (pt.length<=220 || /title|tit|name|dept|major|header|head/i.test(pm))){
-            return {name:pn[0],source:'preceding-sibling',depth:depth};
-          }
-        }
-
-        var parent=cur.parentElement;
-        if(!parent) break;
-        var parentText=structuredCardText(parent,7000);
-        var parentNames=explicitDepartmentNames(parentText);
-        var parentHits=(parentText.match(/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|경쟁률|모의지원|내\s*순위)/ig)||[]).length;
-        if(parentNames.length===1 && parentHits<=8){
-          return {name:parentNames[0],source:'ancestor-unique',depth:depth+1};
-        }
-        cur=parent;
       }
       return {name:'',source:'missing',depth:-1};
-    }
-
-    function departmentProbeFor(el,rootText){
-      var out=[];
-      var seen={};
-      function add(text,relation,depth,distance,node){
-        text=String(text||'');
-        var names=explicitDepartmentNames(text);
-        if(names.length===0) return;
-        var unis=explicitUniversityNames(text);
-        var nodeMeta=cleanText((node&&node.tagName||'')+' '+(node&&node.id||'')+' '+(node&&node.className||''));
-        var hasPrimary=primaryRx.test(text);
-        var hasMetric=metricRx.test(text);
-        var headerLike=/title|tit|name|dept|major|header|head/i.test(nodeMeta) && !hasPrimary;
-        var candidateUniversity=unis.length===1?unis[0]:'';
-        var compactLength=cleanText(text).length;
-        for(var qi=0;qi<names.length&&out.length<18;qi++){
-          var n=names[qi];
-          var key=n+'|'+relation+'|'+depth+'|'+distance+'|'+candidateUniversity+'|'+hasPrimary;
-          if(seen[key]) continue;
-          seen[key]=true;
-          out.push({
-            name:n,
-            relation:relation,
-            depth:depth,
-            distance:distance,
-            tag:String(node&&node.tagName||'').slice(0,20),
-            hasPrimaryPrediction:hasPrimary,
-            hasMetric:hasMetric,
-            headerLike:headerLike,
-            textLength:compactLength,
-            candidateUniversity:candidateUniversity,
-            candidateDepartmentCount:names.length
-          });
-        }
-      }
-      add(rootText,'card-root',0,0,el);
-      var cur=el;
-      for(var depth=0;cur&&depth<7&&out.length<18;depth++){
-        var attrs=cleanText((cur.getAttribute&&cur.getAttribute('aria-label')||'')+' '+(cur.getAttribute&&cur.getAttribute('title')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-dept-name')||'')+' '+(cur.getAttribute&&cur.getAttribute('data-department-name')||''));
-        add(attrs,'ancestor-attribute',depth,0,cur);
-
-        var prev=cur.previousElementSibling;
-        for(var pi=1;prev&&pi<=8&&out.length<18;pi++,prev=prev.previousElementSibling){
-          if(!visible(prev)) continue;
-          add(structuredCardText(prev,1000),'previous-sibling',depth,pi,prev);
-        }
-        var next=cur.nextElementSibling;
-        for(var ni=1;next&&ni<=5&&out.length<18;ni++,next=next.nextElementSibling){
-          if(!visible(next)) continue;
-          add(structuredCardText(next,1000),'next-sibling',depth,ni,next);
-        }
-
-        var parent=cur.parentElement;
-        if(!parent) break;
-        var children=parent.children||[];
-        var curIndex=-1;
-        for(var ci=0;ci<children.length;ci++){ if(children[ci]===cur){curIndex=ci;break;} }
-        if(curIndex>=0){
-          var from=Math.max(0,curIndex-6), to=Math.min(children.length-1,curIndex+6);
-          for(var xi=from;xi<=to&&out.length<18;xi++){
-            if(xi===curIndex) continue;
-            var child=children[xi];
-            if(!visible(child)) continue;
-            add(structuredCardText(child,900),'parent-child',depth+1,xi-curIndex,child);
-          }
-        }
-        cur=parent;
-      }
-      return out.slice(0,18);
     }
 
     function universityContextFor(el,rootText){
@@ -416,9 +324,6 @@ object SnapshotScript {
       if(!primaryRx.test(entry.text)) continue;
       var universityCtx=universityContextFor(entry.el,entry.text);
       var departmentCtx=departmentContextFor(entry.el,entry.text);
-      var departmentProbe=departmentProbeFor(entry.el,entry.text);
-      jinhakCardStats.departmentProbeCards++;
-      jinhakCardStats.departmentProbeCandidates+=departmentProbe.length;
       if(universityCtx.name){
         jinhakCardStats.universityBoundRoots++;
         if(universityCtx.source!=='card-root') jinhakCardStats.universityContextRoots++;
@@ -441,8 +346,7 @@ object SnapshotScript {
         universityDepth:universityCtx.depth,
         department:departmentCtx.name,
         departmentSource:departmentCtx.source,
-        departmentDepth:departmentCtx.depth,
-        departmentProbe:departmentProbe
+        departmentDepth:departmentCtx.depth
       });
     }
     jinhakCardStats.uniqueRoots=jinhakCards.length;

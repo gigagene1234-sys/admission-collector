@@ -20,7 +20,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "admission_collector_local_v1.db",
     null,
-    1
+    2
 ) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("""
@@ -69,6 +69,15 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
               university TEXT,
               department TEXT,
               admission TEXT,
+              capture_version TEXT,
+              data_scope TEXT,
+              observed_at TEXT,
+              quality_state TEXT,
+              provider_entity_id TEXT,
+              canonical_university_id TEXT,
+              canonical_department_id TEXT,
+              canonical_admission_id TEXT,
+              application_identity_key TEXT,
               json TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               PRIMARY KEY(run_id, fingerprint)
@@ -80,25 +89,63 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE INDEX idx_records_run_year ON records(run_id,year)")
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            val additions = listOf(
+                "capture_version TEXT",
+                "data_scope TEXT",
+                "observed_at TEXT",
+                "quality_state TEXT",
+                "provider_entity_id TEXT",
+                "canonical_university_id TEXT",
+                "canonical_department_id TEXT",
+                "canonical_admission_id TEXT",
+                "application_identity_key TEXT"
+            )
+            for (column in additions) db.execSQL("ALTER TABLE records ADD COLUMN $column")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_records_run_quality ON records(run_id,quality_state)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_records_application_identity ON records(run_id,application_identity_key)")
+        }
+    }
 
     fun beginOrResume(provider: String, collectorVersion: String): String {
         val db = writableDatabase
-        val existing = db.rawQuery(
-            "SELECT run_id FROM runs WHERE provider=? AND status IN ('collecting','stopped','incomplete') ORDER BY updated_at DESC LIMIT 1",
+        var existingId: String? = null
+        var existingVersion: String? = null
+        db.rawQuery(
+            "SELECT run_id,collector_version FROM runs WHERE provider=? AND status IN ('collecting','stopped','incomplete') ORDER BY updated_at DESC LIMIT 1",
             arrayOf(provider)
-        ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        ).use { c ->
+            if (c.moveToFirst()) {
+                existingId = c.getString(0)
+                existingVersion = c.getString(1)
+            }
+        }
         val now = Instant.now().toString()
-        if (!existing.isNullOrBlank()) {
+
+        // Jinhak parser generations must never silently mix in one beta run.
+        if (provider == "jinhak" && !existingId.isNullOrBlank() && existingVersion != collectorVersion) {
+            val close = ContentValues().apply {
+                put("status", "stopped")
+                put("completion_reason", "parser-version-boundary:${existingVersion ?: "unknown"}->$collectorVersion")
+                put("updated_at", now)
+            }
+            db.update("runs", close, "run_id=?", arrayOf(existingId))
+            existingId = null
+            existingVersion = null
+        }
+
+        if (!existingId.isNullOrBlank()) {
             val cv = ContentValues().apply {
                 put("collector_version", collectorVersion)
                 put("status", "collecting")
                 putNull("completion_reason")
                 put("updated_at", now)
             }
-            db.update("runs", cv, "run_id=?", arrayOf(existing))
-            return existing
+            db.update("runs", cv, "run_id=?", arrayOf(existingId))
+            return existingId!!
         }
+
         val id = UUID.randomUUID().toString()
         val cv = ContentValues().apply {
             put("run_id", id)
@@ -223,6 +270,15 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                     putNullable("university", nullableString(obj, "university"))
                     putNullable("department", nullableString(obj, "department"))
                     putNullable("admission", nullableString(obj, "admission"))
+                    putNullable("capture_version", nullableString(obj, "captureVersion"))
+                    putNullable("data_scope", nullableString(obj, "dataScope"))
+                    putNullable("observed_at", nullableString(obj, "observedAt"))
+                    putNullable("quality_state", nullableString(obj, "qualityState"))
+                    putNullable("provider_entity_id", nullableString(obj, "providerEntityId"))
+                    putNullable("canonical_university_id", nullableString(obj, "canonicalUniversityId"))
+                    putNullable("canonical_department_id", nullableString(obj, "canonicalDepartmentId"))
+                    putNullable("canonical_admission_id", nullableString(obj, "canonicalAdmissionId"))
+                    putNullable("application_identity_key", nullableString(obj, "applicationIdentityKey"))
                     put("json", obj.toString())
                     put("updated_at", Instant.now().toString())
                 }
@@ -262,6 +318,8 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         return JSONObject()
             .put("runId", runId)
             .put("records", scalar("SELECT COUNT(*) FROM records WHERE run_id=?"))
+            .put("acceptedRecords", scalar("SELECT COUNT(*) FROM records WHERE run_id=? AND quality_state='accepted'"))
+            .put("provisionalRecords", scalar("SELECT COUNT(*) FROM records WHERE run_id=? AND quality_state='provisional'"))
             .put("completedPages", scalar("SELECT COUNT(*) FROM pages WHERE run_id=? AND state='completed'"))
             .put("errorPages", scalar("SELECT COUNT(*) FROM pages WHERE run_id=? AND state='error'"))
             .put("completedDocuments", scalar("SELECT COUNT(*) FROM documents WHERE run_id=? AND state='completed'"))

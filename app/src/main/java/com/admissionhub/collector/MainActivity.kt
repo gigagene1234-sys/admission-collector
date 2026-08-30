@@ -128,8 +128,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.5.8"
-        private const val BUILD_CODE = 10580
+        private const val VERSION = "0.6.0"
+        private const val BUILD_CODE = 10600
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -246,7 +246,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         diagnosticButton = Button(this).apply {
-            text = "진학사 분석 전송"
+            text = "진학사 전체 분석 전송"
             setOnClickListener {
                 if (provider == ProviderId.JINHAK) sendLatestJinhakAnalysisDigest() else sendLatestLocalDiagnostic(manual = true)
             }
@@ -437,10 +437,10 @@ class MainActivity : Activity() {
         sessionState.text = "세션 상태 확인 중"
         status.text = if (which == ProviderId.JINHAK) "진학사 분석 모드: 로그인 후 원하는 리포트/대학 화면을 여세요." else "어디가 복구 보류: 진학사 분석 이후 한밭대 381쪽부터 재시도 예정"
         batchButton.text = when (which) {
-            ProviderId.JINHAK -> "현재 진학사 화면 분석·누적"
+            ProviderId.JINHAK -> "현재 진학사 화면 전체 분석·누적"
             ProviderId.ADIGA -> "어디가 복구 보류"
         }
-        diagnosticButton.text = if (which == ProviderId.JINHAK) "진학사 분석 전송" else "어디가 진단 로그 전송"
+        diagnosticButton.text = if (which == ProviderId.JINHAK) "진학사 전체 분석 전송" else "어디가 진단 로그 전송"
         webView.loadUrl(which.homeUrl)
     }
 
@@ -983,11 +983,29 @@ class MainActivity : Activity() {
     }
 
     private fun collectCurrentPage() {
-        status.text = if (provider == ProviderId.JINHAK) "진학사 화면의 과거입결·예측·성적지표를 분석 중…" else "현재 페이지의 표·헤더·카드·입시정보를 구조적으로 수집 중…"
+        status.text = if (provider == ProviderId.JINHAK) "진학사 현재 화면의 카드·표·세부 설명·예측지표를 전체 분석 중…" else "현재 페이지의 표·헤더·카드·입시정보를 구조적으로 수집 중…"
         collectSnapshot { snapshot ->
             if (snapshot == null) return@collectSnapshot
             val records = normalizeSnapshot(snapshot)
             val collectedAt = Instant.now().toString()
+            if (provider == ProviderId.JINHAK) {
+                for (ri in 0 until records.length()) {
+                    val r = records.optJSONObject(ri) ?: continue
+                    val confidence = r.optString("confidence")
+                    r.put("captureVersion", VERSION)
+                        .put("analysisScope", "current-rendered-page-user-triggered")
+                        .put("qualityState", if (confidence == "high") "accepted" else "provisional")
+                    val year = if (r.isNull("year")) "" else r.optInt("year").toString()
+                    val university = if (r.isNull("university")) "" else r.optString("university")
+                    val department = if (r.isNull("department")) "" else r.optString("department")
+                    val admission = if (r.isNull("admission")) "" else r.optString("admission")
+                    if (university.isNotBlank() && department.isNotBlank() && admission.isNotBlank()) {
+                        r.put("applicationIdentityKey", RecordUtils.sha256(listOf(year, university, department, admission).joinToString("|")))
+                    } else {
+                        r.put("applicationIdentityKey", JSONObject.NULL)
+                    }
+                }
+            }
             var localStats = JSONObject()
             var stored = 0
             if (provider == ProviderId.JINHAK) {
@@ -1012,20 +1030,32 @@ class MainActivity : Activity() {
             lastJson = out.toString(2)
             showPreview(lastJson)
             status.text = if (provider == ProviderId.JINHAK) {
-                "진학사 분석·누적 완료: 이번 ${records.length()}개 / 로컬 누적 ${localStats.optInt("records", records.length())}개 / 필요 시 '진학사 분석 전송'"
+                "진학사 전체 분석 준비 완료: 이번 ${records.length()}개 / 로컬 누적 ${localStats.optInt("records", records.length())}개 / 필요 시 '진학사 전체 분석 전송'"
             } else {
                 "현재 페이지 수집 완료: 구조화 레코드 ${records.length()}개"
             }
         }
     }
 
+    private fun sanitizeJinhakAnalysisText(value: String, maxLen: Int): String {
+        if (maxLen <= 0) return ""
+        var text = value.replace(Regex("""\s+"""), " ").trim()
+        if (text.isBlank()) return ""
+        text = text.replace(Regex("""(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"""), "[redacted-email]")
+        text = text.replace(Regex("""(?<!\d)01[016789][-\s]?\d{3,4}[-\s]?\d{4}(?!\d)"""), "[redacted-phone]")
+        text = text.replace(Regex("""(?<!\d)\d{6}[-\s]?[1-4]\d{6}(?!\d)"""), "[redacted-id]")
+        text = text.replace(Regex("""(?i)(?:password|passwd|비밀번호)\s*[:：=]?\s*\S+"""), "[redacted-credential]")
+        text = text.replace(Regex("""(?i)(?:user(?:name|id)?|아이디|회원번호)\s*[:：=]\s*[A-Za-z0-9._@-]{3,}"""), "[redacted-account]")
+        return text.take(maxLen)
+    }
+
     private fun buildJinhakDigest(snapshot: JSONObject, records: JSONArray, runId: String, collectedAt: String): JSONObject {
-        val sanitized = JSONArray()
-        val missingDepartmentCardIndexes = linkedSetOf<Int>()
+        val sanitizedRecords = JSONArray()
         var universityBound = 0
         var departmentBound = 0
         var admissionBound = 0
         var fullyBound = 0
+
         for (i in 0 until records.length()) {
             val r = records.optJSONObject(i) ?: continue
             val hasUniversity = !r.isNull("university") && r.optString("university").isNotBlank()
@@ -1033,14 +1063,14 @@ class MainActivity : Activity() {
             val hasAdmission = !r.isNull("admission") && r.optString("admission").isNotBlank()
             if (hasUniversity) universityBound += 1
             if (hasDepartment) departmentBound += 1
-            if (!hasDepartment && r.has("cardIndex")) missingDepartmentCardIndexes += r.optInt("cardIndex")
             if (hasAdmission) admissionBound += 1
             if (hasUniversity && hasDepartment && hasAdmission) fullyBound += 1
         }
-        val limit = minOf(records.length(), 120)
-        for (i in 0 until limit) {
+
+        val recordLimit = minOf(records.length(), 160)
+        for (i in 0 until recordLimit) {
             val r = records.optJSONObject(i) ?: continue
-            sanitized.put(JSONObject()
+            sanitizedRecords.put(JSONObject()
                 .put("recordType", r.optString("recordType"))
                 .put("providerPageType", r.optString("providerPageType"))
                 .put("dataScope", r.optString("dataScope"))
@@ -1050,6 +1080,10 @@ class MainActivity : Activity() {
                 .put("admission", if (r.isNull("admission")) JSONObject.NULL else r.optString("admission"))
                 .put("metrics", r.optJSONObject("metrics") ?: JSONObject())
                 .put("confidence", r.optString("confidence"))
+                .put("qualityState", r.optString("qualityState", "provisional"))
+                .put("captureVersion", r.optString("captureVersion", VERSION))
+                .put("analysisScope", r.optString("analysisScope", "current-rendered-page-user-triggered"))
+                .put("applicationIdentityKey", if (r.isNull("applicationIdentityKey")) JSONObject.NULL else r.optString("applicationIdentityKey"))
                 .put("observedAt", r.optString("observedAt", collectedAt))
                 .put("cardIndex", if (r.has("cardIndex")) r.optInt("cardIndex") else JSONObject.NULL)
                 .put("contextSource", r.optString("contextSource"))
@@ -1058,46 +1092,126 @@ class MainActivity : Activity() {
                 .put("departmentContextSource", if (r.isNull("departmentContextSource")) JSONObject.NULL else r.optString("departmentContextSource"))
                 .put("departmentContextDepth", r.optInt("departmentContextDepth", -1)))
         }
-        val departmentProbes = JSONArray()
+
+        val textBudgetLimit = 180_000
+        var remainingBudget = textBudgetLimit
+        var capturedTextCharacters = 0
+        fun budgeted(raw: String, maxLen: Int): String {
+            if (remainingBudget <= 0) return ""
+            val clean = sanitizeJinhakAnalysisText(raw, minOf(maxLen, remainingBudget))
+            if (clean.isBlank()) return ""
+            remainingBudget -= clean.length
+            capturedTextCharacters += clean.length
+            return clean
+        }
+
+        val safeContext = JSONArray()
+        val rawContext = snapshot.optJSONArray("context") ?: JSONArray()
+        for (i in 0 until minOf(rawContext.length(), 80)) {
+            val value = budgeted(rawContext.optString(i), 700)
+            if (value.isNotBlank()) safeContext.put(value)
+            if (remainingBudget <= 0) break
+        }
+
+        val safeSelection = JSONArray()
+        val rawSelection = snapshot.optJSONArray("selectionContext") ?: JSONArray()
+        for (i in 0 until minOf(rawSelection.length(), 80)) {
+            val value = budgeted(rawSelection.optString(i), 700)
+            if (value.isNotBlank()) safeSelection.put(value)
+            if (remainingBudget <= 0) break
+        }
+
+        val safeCards = JSONArray()
         val cards = snapshot.optJSONArray("jinhakCards") ?: JSONArray()
-        for (cardIndex in missingDepartmentCardIndexes) {
-            if (cardIndex < 0 || cardIndex >= cards.length()) continue
-            val card = cards.optJSONObject(cardIndex) ?: continue
-            val rawProbe = card.optJSONArray("departmentProbe") ?: JSONArray()
-            val safeProbe = JSONArray()
-            for (pi in 0 until minOf(rawProbe.length(), 18)) {
-                val q = rawProbe.optJSONObject(pi) ?: continue
-                val name = q.optString("name").replace(Regex("""\s+"""), " ").trim().take(60)
-                if (name.isBlank() || !Regex("""(?:학과|학부|전공|자율전공)$""").containsMatchIn(name)) continue
-                val candidateUniversity = q.optString("candidateUniversity")
-                    .replace(Regex("""\s+"""), " ").trim().take(60)
-                safeProbe.put(JSONObject()
-                    .put("name", name)
-                    .put("relation", q.optString("relation").take(32))
-                    .put("depth", q.optInt("depth", -1))
-                    .put("distance", q.optInt("distance", 0))
-                    .put("tag", q.optString("tag").take(20))
-                    .put("hasPrimaryPrediction", q.optBoolean("hasPrimaryPrediction", false))
-                    .put("hasMetric", q.optBoolean("hasMetric", false))
-                    .put("headerLike", q.optBoolean("headerLike", false))
-                    .put("textLength", q.optInt("textLength", -1))
-                    .put("candidateDepartmentCount", q.optInt("candidateDepartmentCount", 0))
-                    .put("candidateUniversity", if (candidateUniversity.isBlank()) JSONObject.NULL else candidateUniversity))
-            }
-            departmentProbes.put(JSONObject()
-                .put("cardIndex", cardIndex)
+        for (i in 0 until minOf(cards.length(), 100)) {
+            if (remainingBudget <= 0) break
+            val card = cards.optJSONObject(i) ?: continue
+            val visibleText = budgeted(card.optString("text"), 2400)
+            if (visibleText.isBlank()) continue
+            safeCards.put(JSONObject()
+                .put("cardIndex", i)
                 .put("rootTag", card.optString("rootTag").take(20))
                 .put("rootScore", card.optInt("score", 0))
-                .put("university", card.optString("university").take(60))
-                .put("candidates", safeProbe))
+                .put("primaryPrediction", card.optBoolean("primaryPrediction", false))
+                .put("university", card.optString("university").take(80).ifBlank { JSONObject.NULL })
+                .put("universitySource", card.optString("universitySource").take(40).ifBlank { JSONObject.NULL })
+                .put("universityDepth", card.optInt("universityDepth", -1))
+                .put("department", card.optString("department").take(80).ifBlank { JSONObject.NULL })
+                .put("departmentSource", card.optString("departmentSource").take(40).ifBlank { JSONObject.NULL })
+                .put("departmentDepth", card.optInt("departmentDepth", -1))
+                .put("visibleText", visibleText))
         }
+
+        val safeTables = JSONArray()
+        val tables = snapshot.optJSONArray("tables") ?: JSONArray()
+        for (ti in 0 until minOf(tables.length(), 24)) {
+            if (remainingBudget <= 0) break
+            val table = tables.optJSONObject(ti) ?: continue
+            val outRows = JSONArray()
+            val rows = table.optJSONArray("rows") ?: JSONArray()
+            for (ri in 0 until minOf(rows.length(), 100)) {
+                if (remainingBudget <= 0) break
+                val row = rows.optJSONArray(ri) ?: continue
+                val outCells = JSONArray()
+                for (ci in 0 until minOf(row.length(), 32)) {
+                    val cell = budgeted(row.optString(ci), 700)
+                    if (cell.isNotBlank()) outCells.put(cell)
+                    if (remainingBudget <= 0) break
+                }
+                if (outCells.length() > 0) outRows.put(outCells)
+            }
+            val caption = budgeted(table.optString("caption"), 700)
+            if (outRows.length() > 0 || caption.isNotBlank()) {
+                safeTables.put(JSONObject()
+                    .put("caption", if (caption.isBlank()) JSONObject.NULL else caption)
+                    .put("rows", outRows))
+            }
+        }
+
+        val safeBlocks = JSONArray()
+        val blocks = snapshot.optJSONArray("blocks") ?: JSONArray()
+        for (i in 0 until minOf(blocks.length(), 160)) {
+            if (remainingBudget <= 0) break
+            val value = budgeted(blocks.optString(i), 1400)
+            if (value.isNotBlank()) safeBlocks.put(value)
+        }
+
+        val resourceLabels = JSONArray()
+        val resources = snapshot.optJSONArray("resourceLinks") ?: JSONArray()
+        for (i in 0 until minOf(resources.length(), 80)) {
+            if (remainingBudget <= 0) break
+            val label = budgeted(resources.optJSONObject(i)?.optString("label") ?: "", 500)
+            if (label.isNotBlank()) resourceLabels.put(label)
+        }
+
+        val analysisBundle = JSONObject()
+            .put("scope", "current-rendered-page-user-triggered")
+            .put("pageType", snapshot.optString("providerPageType"))
+            .put("pageTitle", budgeted(snapshot.optString("title"), 500))
+            .put("context", safeContext)
+            .put("selectionContext", safeSelection)
+            .put("cards", safeCards)
+            .put("tables", safeTables)
+            .put("blocks", safeBlocks)
+            .put("resourceLabels", resourceLabels)
+            .put("coverage", JSONObject()
+                .put("sourceCards", cards.length())
+                .put("capturedCards", safeCards.length())
+                .put("sourceTables", tables.length())
+                .put("capturedTables", safeTables.length())
+                .put("sourceBlocks", blocks.length())
+                .put("capturedBlocks", safeBlocks.length())
+                .put("capturedTextCharacters", capturedTextCharacters)
+                .put("textBudgetLimit", textBudgetLimit)
+                .put("budgetExhausted", remainingBudget <= 0))
+
         return JSONObject()
-            .put("schemaVersion", 1)
-            .put("type", "jinhak-analysis-digest")
+            .put("schemaVersion", 2)
+            .put("type", "jinhak-full-screen-analysis")
             .put("pageType", snapshot.optString("providerPageType"))
             .put("collectedAt", collectedAt)
             .put("recordCount", records.length())
-            .put("detectedStorageCards", snapshot.optJSONArray("jinhakCards")?.length() ?: 0)
+            .put("detectedStorageCards", cards.length())
             .put("cardCaptureStats", snapshot.optJSONObject("jinhakCardStats") ?: JSONObject())
             .put("bindingStats", JSONObject()
                 .put("universityBound", universityBound)
@@ -1105,28 +1219,28 @@ class MainActivity : Activity() {
                 .put("admissionBound", admissionBound)
                 .put("fullyBound", fullyBound)
                 .put("totalRecords", records.length()))
-            .put("departmentStructureProbe", departmentProbes)
-            .put("includedRecords", sanitized.length())
-            .put("truncated", records.length() > sanitized.length())
+            .put("includedRecords", sanitizedRecords.length())
+            .put("recordsTruncated", records.length() > sanitizedRecords.length())
             .put("localStats", localStore.stats(runId))
-            .put("records", sanitized)
-            .put("privacy", "structured-admission-metrics-and-department-boundary-metadata-only-no-dom-no-raw-evidence-no-url-no-cookie-no-credential")
+            .put("records", sanitizedRecords)
+            .put("analysisBundle", analysisBundle)
+            .put("privacy", "sanitized-visible-admission-text-no-dom-no-html-no-url-no-cookie-no-session-token-no-form-values-no-credential")
     }
 
     private fun sendLatestJinhakAnalysisDigest() {
         if (lastJinhakDigest.length() == 0) {
-            Toast.makeText(this, "먼저 진학사에서 분석할 화면을 열고 '현재 진학사 화면 분석·누적'을 눌러주세요.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "먼저 진학사에서 분석할 화면을 열고 '현재 진학사 화면 전체 분석·누적'을 눌러주세요.", Toast.LENGTH_LONG).show()
             return
         }
-        status.text = "진학사 구조화 분석 결과 전송 중… DOM·쿠키·로그인 정보는 보내지 않습니다."
+        status.text = "진학사 전체 분석 번들 전송 중… DOM·URL·쿠키·로그인 자격정보·폼 값은 보내지 않습니다."
         cloudOffload.sendDiagnostic("jinhak", VERSION, JSONObject(lastJinhakDigest.toString()).put("trigger", "manual-analysis")) { result ->
             runOnUiThread {
                 if (result.isSuccess) {
-                    status.text = "진학사 분석 전송 완료: ${result.getOrNull()?.take(8) ?: "unknown"}…"
-                    Toast.makeText(this, "진학사 분석 전송 완료", Toast.LENGTH_SHORT).show()
+                    status.text = "진학사 전체 분석 전송 완료: ${result.getOrNull()?.take(8) ?: "unknown"}…"
+                    Toast.makeText(this, "진학사 전체 분석 전송 완료", Toast.LENGTH_SHORT).show()
                 } else {
-                    status.text = "진학사 분석 전송 실패: ${result.exceptionOrNull()?.message ?: "unknown"}"
-                    Toast.makeText(this, "진학사 분석 전송 실패", Toast.LENGTH_LONG).show()
+                    status.text = "진학사 전체 분석 전송 실패: ${result.exceptionOrNull()?.message ?: "unknown"}"
+                    Toast.makeText(this, "진학사 전체 분석 전송 실패", Toast.LENGTH_LONG).show()
                 }
             }
         }
