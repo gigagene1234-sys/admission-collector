@@ -161,8 +161,8 @@ class MainActivity : Activity() {
         private const val JINHAK_ABSOLUTE_TARGET_MS = 35_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.7.0"
-        private const val BUILD_CODE = 10700
+        private const val VERSION = "0.7.1"
+        private const val BUILD_CODE = 10710
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -405,10 +405,10 @@ class MainActivity : Activity() {
                 }
                 if (unifiedRunning && unifiedPhase == "jinhak" && unifiedPendingJinhakStart && provider == ProviderId.JINHAK && !batchRunning) {
                     unifiedPendingJinhakStart = false
-                    unifiedJinhakAutoCapture = true
-                    status.text = "통합 수집 2/2 · 진학사: 사용자가 직접 여는 입시 데이터 화면만 자동 분석·누적합니다."
+                    unifiedJinhakAutoCapture = false
+                    status.text = "통합 수집 2/2 · 진학사 자동 크롤러 시작: 접근 가능한 진학사 화면을 자율 순회합니다."
                     handler.postDelayed({
-                        if (unifiedRunning && unifiedPhase == "jinhak" && !batchRunning) scheduleUnifiedJinhakAutoCapture(url)
+                        if (unifiedRunning && unifiedPhase == "jinhak" && !batchRunning) startBatch()
                     }, 450L)
                     return
                 }
@@ -807,8 +807,8 @@ class MainActivity : Activity() {
                 ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
             unifiedPendingAdigaStart = false
             unifiedPendingJinhakStart = true
-            unifiedJinhakAutoCapture = true
-            status.text = "이전 중단 감지: 진학사에서 사용자가 직접 여는 입시 화면의 자동 분석·누적을 재개합니다."
+            unifiedJinhakAutoCapture = false
+            status.text = "이전 중단 감지: 진학사 자동 크롤러를 체크포인트에서 재개합니다."
             webView.loadUrl(ProviderId.JINHAK.homeUrl)
             true
         }
@@ -866,14 +866,15 @@ class MainActivity : Activity() {
         localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId) }
         localStore.updateUnifiedSession(sessionId, "jinhak", "running", "adiga:$adigaReason")
         localStore.recordSyncState(sessionId, UnifiedSyncState.JINHAK_CAPABILITY_DISCOVERY.name, ProviderId.JINHAK.wireName, JSONObject().put("authorizedConnectorActive", false), false)
-        localStore.recordSyncState(sessionId, UnifiedSyncState.JINHAK_USER_VIEW_FALLBACK.name, ProviderId.JINHAK.wireName, JSONObject().put("observationFirst", true), false)
+        localStore.recordSyncState(sessionId, UnifiedSyncState.JINHAK_AUTONOMOUS_CRAWL.name, ProviderId.JINHAK.wireName,
+            JSONObject().put("observationFirst", true).put("boundedSameProviderTraversal", true).put("maxPages", MAX_JINHAK_AUTONAV_PAGES), false)
         persistRuntimeCheckpoint(forceResume = true)
         CookieManager.getInstance().flush()
         sessionState.text = "세션 상태 확인 중"
-        batchButton.text = "현재 진학사 화면 전체 분석·누적"
+        batchButton.text = "진학사 자동 탐색 준비"
         diagnosticButton.text = "진학사 전체 분석 전송"
         unifiedButton.text = "통합 수집 종료"
-        status.text = "통합 수집 2/2 · 진학사 분석 대기: 원하는 수시저장소·추천대학·대학정보·리포트 화면을 직접 열면 자동 분석합니다."
+        status.text = "통합 수집 2/2 · 진학사 자동 크롤러 준비: 로그인 세션을 유지한 채 접근 가능한 화면을 자율 순회합니다."
         webView.loadUrl(ProviderId.JINHAK.homeUrl)
     }
 
@@ -2109,6 +2110,25 @@ class MainActivity : Activity() {
                         pageKey = pageKey,
                         pageType = snapshot.optString("providerPageType"),
                         payload = digest
+                    )
+                    val batchPageType = snapshot.optString("providerPageType")
+                    val batchSession = snapshot.optJSONObject("session") ?: JSONObject()
+                    val batchAuthState = when {
+                        batchSession.optBoolean("needsLogin", false) -> "auth-required"
+                        batchSession.optBoolean("authenticated", false) -> "authenticated"
+                        else -> "unknown"
+                    }
+                    localStore.storeObservationEvidence(
+                        sessionId = sessionId,
+                        runId = runId,
+                        provider = ProviderId.JINHAK.wireName,
+                        safeRouteKey = runtimeSafePath(snapshot.optString("url")),
+                        pageTypeGuess = batchPageType,
+                        pageTypeConfidence = if (batchPageType == "jinhak-other") 0.25 else 0.85,
+                        authStateClass = batchAuthState,
+                        explicitContext = ObservationEvidence.explicitContextFromDigest(digest),
+                        evidence = digest,
+                        captureVersion = VERSION
                     )
                     localStore.updateUnifiedSession(sessionId, "jinhak", "running", null)
                 }

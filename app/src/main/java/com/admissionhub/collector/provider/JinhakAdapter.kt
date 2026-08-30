@@ -10,7 +10,7 @@ import java.time.temporal.ChronoUnit
 
 object JinhakAdapter : ProviderAdapter {
     override val id = ProviderId.JINHAK
-    override val supportsBatchCrawl = false
+    override val supportsBatchCrawl = true
     private const val TARGET_YEAR = 2027
 
     override fun accepts(url: String): Boolean {
@@ -22,7 +22,20 @@ object JinhakAdapter : ProviderAdapter {
 
     override fun seedUrls(): List<String> = listOf("https://www.jinhak.com/")
 
-    override fun isBatchNavigable(url: String): Boolean = false
+    override fun isBatchNavigable(url: String): Boolean {
+        if (!accepts(url)) return false
+        return try {
+            val uri = URI(url)
+            val path = (uri.path ?: "/").lowercase()
+            val query = (uri.query ?: "").lowercase()
+            val full = "$path?$query"
+            // Safety/state-changing surfaces are never auto-opened. Information pages are not
+            // discarded merely because the current parser does not understand them yet.
+            if (Regex("(?:logout|signout|member|mypage|my-page|account|profile|userinfo|payment|billing|purchase|order|spassdata|coupon|refund|withdraw|customer|faq|qna|event|notice|privacy|terms)").containsMatchIn(full)) return false
+            if (Regex("\\.(?:jpg|jpeg|png|gif|webp|svg|ico|css|js|map|woff2?|ttf|eot|zip|hwp|hwpx|pdf)$", RegexOption.IGNORE_CASE).containsMatchIn(path)) return false
+            true
+        } catch (_: Exception) { false }
+    }
 
     override fun classify(snapshot: JSONObject): String {
         val rawUrl = snapshot.optString("url")

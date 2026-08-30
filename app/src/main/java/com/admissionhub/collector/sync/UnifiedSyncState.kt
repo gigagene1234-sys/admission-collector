@@ -6,6 +6,7 @@ enum class UnifiedSyncState {
     ADIGA_USER_SCORE_SYNC,
     JINHAK_CAPABILITY_DISCOVERY,
     JINHAK_AUTHORIZED_SYNC,
+    JINHAK_AUTONOMOUS_CRAWL,
     JINHAK_USER_VIEW_FALLBACK,
     CANONICAL_MERGE,
     QUALITY_AUDIT,
@@ -35,11 +36,17 @@ object UnifiedSyncTransitions {
         ),
         UnifiedSyncState.JINHAK_CAPABILITY_DISCOVERY to setOf(
             UnifiedSyncState.JINHAK_AUTHORIZED_SYNC,
+            UnifiedSyncState.JINHAK_AUTONOMOUS_CRAWL,
             UnifiedSyncState.JINHAK_USER_VIEW_FALLBACK,
             UnifiedSyncState.AUTH_REQUIRED,
             UnifiedSyncState.FAILED
         ),
         UnifiedSyncState.JINHAK_AUTHORIZED_SYNC to setOf(
+            UnifiedSyncState.CANONICAL_MERGE,
+            UnifiedSyncState.AUTH_REQUIRED,
+            UnifiedSyncState.FAILED
+        ),
+        UnifiedSyncState.JINHAK_AUTONOMOUS_CRAWL to setOf(
             UnifiedSyncState.CANONICAL_MERGE,
             UnifiedSyncState.AUTH_REQUIRED,
             UnifiedSyncState.FAILED
@@ -66,6 +73,7 @@ object UnifiedSyncTransitions {
             UnifiedSyncState.ADIGA_USER_SCORE_SYNC,
             UnifiedSyncState.JINHAK_CAPABILITY_DISCOVERY,
             UnifiedSyncState.JINHAK_AUTHORIZED_SYNC,
+            UnifiedSyncState.JINHAK_AUTONOMOUS_CRAWL,
             UnifiedSyncState.JINHAK_USER_VIEW_FALLBACK,
             UnifiedSyncState.FAILED
         ),

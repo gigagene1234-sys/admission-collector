@@ -740,9 +740,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             writer.write("]")
         }
 
-        writer.write("{\"schemaVersion\":3,\"type\":\"admission-unified-two-provider-export\",\"session\":")
+        writer.write("{\"schemaVersion\":4,\"type\":\"admission-unified-two-provider-export\",\"session\":")
         writer.write(status.toString())
-        writer.write(",\"combinationPolicy\":{\"officialBaseline\":\"adiga\",\"predictionAnalysis\":\"jinhak\",\"keepProviderSemanticsSeparate\":true,\"doNotOverwriteHistoricalWithPrediction\":true},\"sources\":{\"adiga\":{\"runId\":")
+        writer.write(",\"analysisReady\":{\"contractVersion\":1,\"purpose\":\"assistant-xlsx-dashboard-generation\",\"authoritativeLayers\":[\"sources.adiga.records\",\"sources.jinhak.records\",\"sources.jinhak.pageAnalyses\",\"observationEvidence\"],\"recommendedWorkbookSheets\":[\"Dashboard\",\"UnifiedRecords\",\"JinhakPredictions\",\"HistoricalResults\",\"Observations\",\"Coverage\",\"Errors\"],\"rowKeyFields\":[\"provider\",\"year\",\"university\",\"department\",\"admission\",\"recordType\",\"observedAt\"],\"flattenMetricsForSpreadsheet\":true,\"preserveRawEvidence\":true,\"doNotInferMissingBindings\":true,\"observationFirst\":true},\"combinationPolicy\":{\"officialBaseline\":\"adiga\",\"predictionAnalysis\":\"jinhak\",\"keepProviderSemanticsSeparate\":true,\"doNotOverwriteHistoricalWithPrediction\":true},\"sources\":{\"adiga\":{\"runId\":")
         writeNullableString(adigaRun)
         writer.write(",\"records\":")
         writeRecords(adigaRun)
