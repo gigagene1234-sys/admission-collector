@@ -30,7 +30,7 @@ object AdigaDeterministicPlanner {
             .distinct()
             .sorted()
             .flatMap { code ->
-                AdigaTaskType.entries.asSequence().map { type ->
+                AdigaTaskType.values().asSequence().map { type ->
                     val url = detailUrl(academicYear, code, type)
                     AdigaPlanTask(
                         taskId = RecordUtils.sha256("adiga|$academicYear|$code|${type.name}"),
@@ -46,10 +46,10 @@ object AdigaDeterministicPlanner {
 
     fun detailUrl(academicYear: Int, universityCode: String, taskType: AdigaTaskType): String {
         val menuId = when (taskType) {
-            AdigaTaskType.UNIVERSITY_DETAIL -> "PCUVTINF2000"
-            AdigaTaskType.DEPARTMENTS -> "PCUVTINF2000"
-            AdigaTaskType.ADMISSIONS -> "PCUVTINF2000"
-            AdigaTaskType.CURRENT_CRITERIA -> "PCUVTINF2000"
+            AdigaTaskType.UNIVERSITY_DETAIL,
+            AdigaTaskType.DEPARTMENTS,
+            AdigaTaskType.ADMISSIONS,
+            AdigaTaskType.CURRENT_CRITERIA,
             AdigaTaskType.HISTORICAL_RESULTS -> "PCUVTINF2000"
         }
         return "https://www.adiga.kr$DETAIL_PATH?menuId=$menuId&searchSyr=$academicYear&unvCd=${universityCode.trim()}"
