@@ -5,6 +5,7 @@ enum class ProviderCapability {
     AUTHENTICATED_USER_WORKFLOW,
     AUTHORIZED_API_SYNC,
     AUTHORIZED_EXPORT_IMPORT,
+    AUTHORIZED_REPORT_IMPORT,
     USER_VIEW_CAPTURE_FALLBACK
 }
 
@@ -31,7 +32,8 @@ object ProviderCapabilities {
             ),
             discoverable = setOf(
                 ProviderCapability.AUTHORIZED_API_SYNC,
-                ProviderCapability.AUTHORIZED_EXPORT_IMPORT
+                ProviderCapability.AUTHORIZED_EXPORT_IMPORT,
+                ProviderCapability.AUTHORIZED_REPORT_IMPORT
             )
         )
     }
