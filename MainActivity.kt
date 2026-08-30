@@ -126,8 +126,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.4.1"
-        private const val BUILD_CODE = 10410
+        private const val VERSION = "0.4.2"
+        private const val BUILD_CODE = 10420
         private const val LOCAL_FIRST_BETA = true
     }
 
@@ -1083,7 +1083,7 @@ class MainActivity : Activity() {
                 val duplicateOwner = persistedDuplicatePageOwner(activeAction, pageRecords)
                 if (duplicateOwner != null && duplicateOwner != activeAction.page) {
                     activeBatchPageAction = null
-                    status.text = "페이지 ${activeAction.page} 내용이 기존 ${duplicateOwner}쪽과 동일함: stale 응답으로 판정 후 재시도"
+                    status.text = "페이지 ${activeAction.page} 내용이 기존 ${duplicateOwner}쪽과 동일함: stale 판정 / 최대 ${MAX_PAGE_RETRIES}회만 재시도"
                     schedulePageActionRetry(activeAction, "stale-pagination-content")
                     return@collectSnapshot
                 }
@@ -1377,12 +1377,23 @@ class MainActivity : Activity() {
                     if (batchRunning && !batchPausedForLogin && !batchCollecting && pendingBatchPageAction == null) {
                         scheduleBatchSnapshot()
                     }
-                }, 1100)
+                }, 2200)
             }
         }
     }
 
     private fun schedulePageActionRetry(action: BatchPageAction, reason: String) {
+        // Central retry circuit-breaker. Every caller, including stale-content recovery,
+        // must pass through this guard so one bad page can never pin the whole batch.
+        if (action.retry >= MAX_PAGE_RETRIES) {
+            recordPaginationFailure(action, reason)
+            activeBatchPageAction = null
+            pendingBatchPageAction = null
+            status.text = pageActionStatus(action, "재시도 상한 도달: 오류로 보존 후 다음 페이지 진행")
+            handler.postDelayed({ loadNextBatchPage() }, 250L)
+            return
+        }
+
         val retry = action.copy(retry = action.retry + 1)
         batchPaginationRetries += 1
         batchRetryEvents.put(JSONObject()
@@ -1390,12 +1401,13 @@ class MainActivity : Activity() {
             .put("requestedYear", action.requestedYear ?: JSONObject.NULL)
             .put("page", action.page)
             .put("attempt", retry.retry)
+            .put("maxAttempts", MAX_PAGE_RETRIES)
             .put("reason", reason))
         pendingBatchPageAction = retry
         activeBatchPageAction = null
         currentBatchTarget = retry.baseUrl
-        status.text = pageActionStatus(retry, "서버 오류 후 재시도 대기")
-        val delay = 900L + (retry.retry * 900L)
+        status.text = pageActionStatus(retry, "재시도 대기 ($reason)")
+        val delay = 1200L + (retry.retry * 1000L)
         handler.postDelayed({
             if (batchRunning && !batchPausedForLogin) webView.loadUrl(retry.baseUrl)
         }, delay)
