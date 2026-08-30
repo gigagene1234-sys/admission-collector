@@ -14,8 +14,8 @@ android {
         applicationId = "com.admissionhub.collector"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10520
-        versionName = "0.5.2"
+        versionCode = 10530
+        versionName = "0.5.3"
     }
 
     compileOptions {

@@ -30,8 +30,10 @@ object JinhakAdapter : ProviderAdapter {
             (text.contains("입시결과") && Regex("(최종등록|합격자|충원|70%|50%)").containsMatchIn(text))
         val dedicatedMinimum = url.contains("esatminuniv") ||
             (Regex("(수능최저\\s*(검색|대학|조건)|최저학력기준\\s*(검색|대학))").containsMatchIn(text) && !hasPrediction)
+        val earlyStorage = text.contains("수시저장소") || text.contains("저장대학") || url.contains("storage") || url.contains("save")
         return when {
             Regex("(login|signin|member/login)").containsMatchIn(url) || text.contains("로그인") && text.contains("비밀번호") -> "jinhak-login"
+            earlyStorage -> "jinhak-early-storage"
             hasActual -> "jinhak-actual-admit-report"
             text.contains("합격예측리포트") || text.contains("합격예측 리포트") || hasPrediction -> "jinhak-prediction-report"
             url.contains("sapplysample") || text.contains("모의지원 리포트") || text.contains("모의지원리포트") -> "jinhak-mock-support-report"
@@ -40,7 +42,6 @@ object JinhakAdapter : ProviderAdapter {
             url.contains("infoview.aspx") -> "jinhak-student-basic"
             url.contains("four-year-university/search") || text.contains("대학검색") -> "jinhak-university-search"
             url.contains("/curation") || text.contains("큐레이션") -> "jinhak-curation"
-            text.contains("수시저장소") || text.contains("저장대학") -> "jinhak-early-storage"
             text.contains("추천대학") -> "jinhak-recommended-university"
             else -> "jinhak-other"
         }
@@ -54,6 +55,40 @@ object JinhakAdapter : ProviderAdapter {
         val dataScope = dataScope(pageType)
         val inferredYear = context.year ?: if (dataScope == "current-prediction" || dataScope == "current-admission") TARGET_YEAR else null
         val result = JSONArray()
+
+        if (pageType == "jinhak-early-storage") {
+            val cards = snapshot.optJSONArray("jinhakCards") ?: JSONArray()
+            for (i in 0 until cards.length()) {
+                val evidence = cards.optString(i).replace(Regex("\\s+"), " ").trim().take(5000)
+                if (evidence.isBlank()) continue
+                val local = GenericAdmissionParser.inferContext(evidence)
+                val cardMetrics = predictionMetrics(evidence)
+                if (!cardMetrics.keys().asSequence().any { !cardMetrics.isNull(it) }) continue
+                val record = JSONObject()
+                    .put("recordType", "jinhak-saved-application-prediction")
+                    .put("providerPageType", pageType)
+                    .put("dataScope", "current-prediction")
+                    .put("year", local.year ?: TARGET_YEAR)
+                    .put("university", local.university ?: JSONObject.NULL)
+                    .put("department", local.department ?: JSONObject.NULL)
+                    .put("admission", local.admission ?: JSONObject.NULL)
+                    .put("metrics", cardMetrics)
+                    .put("observedAt", observedAt)
+                    .put("cardIndex", i)
+                    .put("contextSource", "card-local")
+                    .put("confidence", when {
+                        local.university != null && local.department != null && local.admission != null -> "high"
+                        local.university != null && local.department != null -> "medium"
+                        local.department != null -> "low"
+                        else -> "raw"
+                    })
+                    .put("sourcePage", safePath(snapshot.optString("url")))
+                    .put("rawEvidence", evidence)
+                record.put("sourceRowFingerprint", fingerprint(record, observedAt, preserveSnapshot = true))
+                result.put(record)
+            }
+            return RecordUtils.dedupe(result)
+        }
 
         val metrics = JSONObject()
         putNumber(metrics, "universityCalculatedScore", Regex("(?:대학별\\s*)?(?:환산점수|산출점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
@@ -109,7 +144,7 @@ object JinhakAdapter : ProviderAdapter {
 
     private fun dataScope(pageType: String): String = when (pageType) {
         "jinhak-actual-admit-report" -> "historical-result"
-        "jinhak-prediction-report", "jinhak-mock-support-report", "jinhak-recommended-university" -> "current-prediction"
+        "jinhak-prediction-report", "jinhak-mock-support-report", "jinhak-recommended-university", "jinhak-early-storage" -> "current-prediction"
         "jinhak-sat-minimum" -> "current-admission"
         "jinhak-score-calc-report", "jinhak-student-basic" -> "student-profile"
         else -> "reference"
@@ -123,6 +158,23 @@ object JinhakAdapter : ProviderAdapter {
         ).joinToString("|")
         val scope = if (preserveSnapshot) observedAt.substring(0, 16) else "stable"
         return RecordUtils.sha256("jinhak|$scope|$stable")
+    }
+
+    private fun predictionMetrics(text: String): JSONObject {
+        val metrics = JSONObject()
+        putNumber(metrics, "universityCalculatedScore", Regex("(?:대학별\\s*)?(?:환산점수|산출점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
+        putNumber(metrics, "convertedGrade", Regex("(?:반영\\s*평균등급|환산등급|내\\s*등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
+        putInt(metrics, "stabilityBars", Regex("(?:합격안정성|칸수|칸\\s*수)?\\s*[:：]?\\s*([0-9]{1,2})\\s*칸").find(text)?.groupValues?.getOrNull(1))
+        putNumber(metrics, "predictionProbability", Regex("(?:예상\\s*)?(?:합격률|합격확률|합격가능성)\\s*[:：]?\\s*([0-9]{1,3}(?:\\.[0-9]+)?)\\s*%").find(text)?.groupValues?.getOrNull(1))
+        putText(metrics, "predictionLabel", Regex("(?:합격예측|지원판정|지원전략)?\\s*[:：]?\\s*(안정지원|안정|적정지원|적정|소신지원|소신|위험|상향|하향|불안)").find(text)?.groupValues?.getOrNull(1))
+        putInt(metrics, "capacity", Regex("(?:모집인원|모집 인원)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
+        putInt(metrics, "mockApplicants", Regex("(?:모의지원자수|모의지원자 수|모의지원자)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
+        putInt(metrics, "applicants", Regex("(?:현재\\s*)?(?:지원자수|지원자 수|실지원자수|실지원자 수)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
+        putNumber(metrics, "mockCompetition", Regex("(?:모의지원\\s*)?경쟁률\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
+        putInt(metrics, "myRank", Regex("(?:내\\s*순위|나의\\s*순위|현재\\s*순위)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
+        putNumber(metrics, "predictedCut", Regex("(?:예상\\s*합격선|예상\\s*컷|합격예상점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
+        putInt(metrics, "additionalAdmits", Regex("(?:충원합격자수|충원합격자 수|충원인원|충원 인원|추가합격자수)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
+        return metrics
     }
 
     private fun putNumber(obj: JSONObject, key: String, value: String?) {

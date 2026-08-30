@@ -128,8 +128,8 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.5.2"
-        private const val BUILD_CODE = 10520
+        private const val VERSION = "0.5.3"
+        private const val BUILD_CODE = 10530
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1034,7 +1034,9 @@ class MainActivity : Activity() {
                 .put("admission", if (r.isNull("admission")) JSONObject.NULL else r.optString("admission"))
                 .put("metrics", r.optJSONObject("metrics") ?: JSONObject())
                 .put("confidence", r.optString("confidence"))
-                .put("observedAt", r.optString("observedAt", collectedAt)))
+                .put("observedAt", r.optString("observedAt", collectedAt))
+                .put("cardIndex", if (r.has("cardIndex")) r.optInt("cardIndex") else JSONObject.NULL)
+                .put("contextSource", r.optString("contextSource")))
         }
         return JSONObject()
             .put("schemaVersion", 1)
@@ -1042,6 +1044,7 @@ class MainActivity : Activity() {
             .put("pageType", snapshot.optString("providerPageType"))
             .put("collectedAt", collectedAt)
             .put("recordCount", records.length())
+            .put("detectedStorageCards", snapshot.optJSONArray("jinhakCards")?.length() ?: 0)
             .put("includedRecords", sanitized.length())
             .put("truncated", records.length() > sanitized.length())
             .put("localStats", localStore.stats(runId))

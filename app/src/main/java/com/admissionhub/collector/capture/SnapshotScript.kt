@@ -156,6 +156,37 @@ object SnapshotScript {
     if(st.length>=2 && admissionTerms.test(st) && !forbidden.test(st) && !loginSensitive.test(st)) selectionContext.push(st);
   }
 
+  var jinhakCards=[];
+  if(/(^|\.)jinhak\.com$/i.test(location.hostname)){
+    var metricRx=/(?:[0-9]{1,2}\s*칸|합격(?:률|확률|가능성)|경쟁률|모의지원|합격예측|지원판정|내\s*순위|모집인원)/i;
+    var localContextRx=/(?:대학교|교육대|과학기술원|학과|학부|전공|모집단위|전형)/i;
+    var metricNodes=document.querySelectorAll('span,em,strong,b,p,td,th,li,div');
+    var seenJinhakCard={};
+    for(var ji=0;ji<metricNodes.length && jinhakCards.length<120;ji++){
+      var mn=metricNodes[ji];
+      if(!visible(mn)) continue;
+      var seed=safeCloneText(mn,350);
+      if(!metricRx.test(seed)) continue;
+      var cur=mn;
+      var best='';
+      for(var depth=0;cur && depth<7;depth++,cur=cur.parentElement){
+        if(!visible(cur)) continue;
+        var candidate=safeCloneText(cur,2800);
+        if(candidate.length<18 || candidate.length>2600) continue;
+        if(metricRx.test(candidate) && localContextRx.test(candidate)){
+          best=candidate;
+          break;
+        }
+      }
+      if(!best) continue;
+      var key=best.replace(/\s+/g,' ').trim();
+      if(!seenJinhakCard[key]){
+        seenJinhakCard[key]=1;
+        jinhakCards.push(key);
+      }
+    }
+  }
+
   var tables=[];
   var captureHiddenDetail=/(^|\.)jinhak\.com$/i.test(location.hostname) || /\/(?:ucp\/uvt\/uni\/univDetailSelection|uct\/acd\/ade\/criteriaAndResultPopup)\.do$/i.test(location.pathname);
   var tableNodes=document.querySelectorAll('table,[role=table]');
@@ -279,6 +310,7 @@ object SnapshotScript {
     discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length},
     context:context,
     selectionContext:selectionContext,
+    jinhakCards:jinhakCards,
     tables:tables,
     blocks:blocks,
     navigationLinks:nav,
