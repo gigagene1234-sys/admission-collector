@@ -1,0 +1,64 @@
+name: Read Failed Page Candidates
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/read-failed-page-candidates.yml"
+      - ".diagnostics/page-candidate-request.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  read-candidates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      D1_DATABASE_ID: ed2a4417-c427-415b-8414-6b1f06c7194d
+    steps:
+      - name: Query only adjacent/known failed pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          accounts="$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" 'https://api.cloudflare.com/client/v4/accounts?per_page=50')"
+          account_id="$(python3 - "$accounts" <<'PY'
+          import json,sys
+          x=json.loads(sys.argv[1])
+          rows=x.get('result') or []
+          if len(rows)!=1: raise SystemExit(f'expected 1 account, got {len(rows)}')
+          print(rows[0]['id'])
+          PY
+          )"
+          SQL="SELECT source_page_number AS page, university, department, record_type FROM records WHERE provider='adiga' AND year=2027 AND source_page_number IN (297,298,299,300,359,360,361,362,363,364,379,380,381,382,399,400,401,402,494,495,496,497,498,499,500) AND university IS NOT NULL AND TRIM(university)<>'' ORDER BY source_page_number, source_row_ordinal, id;"
+          body="$(python3 - "$SQL" <<'PY'
+          import json,sys
+          print(json.dumps({'sql':sys.argv[1]}))
+          PY
+          )"
+          response="$(curl -fsS -X POST \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data "$body" \
+            "https://api.cloudflare.com/client/v4/accounts/$account_id/d1/database/$D1_DATABASE_ID/query")"
+          python3 - "$response" <<'PY'
+          import json,sys,collections
+          x=json.loads(sys.argv[1])
+          if not x.get('success'): raise SystemExit(json.dumps(x.get('errors') or x))
+          result=(x.get('result') or [{}])[0].get('results') or []
+          by=collections.defaultdict(list)
+          for r in result:
+            k=int(r.get('page') or 0)
+            pair=(r.get('university'), r.get('department'))
+            if pair not in by[k]: by[k].append(pair)
+          for p in sorted(by):
+            unis=[]
+            for u,d in by[p]:
+              if u not in unis: unis.append(u)
+            print('PAGE_%d_UNIVERSITIES='%p + json.dumps(unis,ensure_ascii=False))
+            print('PAGE_%d_ROWS='%p + json.dumps(by[p],ensure_ascii=False))
+          print('ROW_COUNT='+str(len(result)))
+          PY
