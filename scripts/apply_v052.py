@@ -50,7 +50,7 @@ text = text.replace(needle, replacement)
 pattern = re.compile(
     r'''\n        val excludedCollege = Regex\([^\n]+\)\n        return Regex\([^\n]+대학[^\n]+\)\n            \.findAll\(text\)\n            \.map \{ cleanCandidate\(it\.groupValues\[1\]\) \}\n            \.firstOrNull \{ it\.length in 3\.\.35 && !excludedCollege\.containsMatchIn\(it\) \}'''
 )
-new_uni = '''\n        // Bare "대학" is usually a college/faculty or prose fragment on Jinhak pages.\n        // Prefer a missing university over attaching prediction metrics to a false institution.\n        return Regex("([가-힣A-Za-z0-9·.()\\-]{2,35}(?:교육대학교|과학기술원))")\n            .findAll(text)\n            .map { cleanCandidate(it.groupValues[1]) }\n            .firstOrNull { it.length in 4..45 }'''
+new_uni = '''\n        // Bare "대학" is usually a college/faculty or prose fragment on Jinhak pages.\n        // Prefer a missing university over attaching prediction metrics to a false institution.\n        return Regex("([가-힣A-Za-z0-9·.()-]{2,35}(?:교육대학교|과학기술원))")\n            .findAll(text)\n            .map { cleanCandidate(it.groupValues[1]) }\n            .firstOrNull { it.length in 4..45 }'''
 text, count = pattern.subn(new_uni, text, count=1)
 if count != 1:
     raise SystemExit(f'university fallback replace count={count}')
