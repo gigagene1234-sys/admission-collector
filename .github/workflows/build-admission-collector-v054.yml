@@ -27,7 +27,18 @@ jobs:
           fetch-depth: 0
 
       - name: Apply v0.5.4 patch
-        run: python3 scripts/apply_v054.py
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/apply_v054.py')
+          t=p.read_text()
+          old='snap, n = pat.subn(new_block, snap, count=1)'
+          new='snap, n = pat.subn(lambda _m: new_block, snap, count=1)'
+          if old in t:
+              p.write_text(t.replace(old,new,1))
+          PY
+          python3 scripts/apply_v054.py
 
       - name: Verify source invariants
         shell: bash
