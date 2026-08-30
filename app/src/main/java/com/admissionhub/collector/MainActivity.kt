@@ -12,6 +12,7 @@ import android.view.Gravity
 import android.view.View
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
+import android.webkit.JsResult
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -125,9 +126,11 @@ class MainActivity : Activity() {
     private var unifiedRunning = false
     private var unifiedPhase = "idle"
     private var unifiedPendingAdigaStart = false
+    private var unifiedPendingJinhakStart = false
     private var unifiedJinhakAutoCapture = false
     private val unifiedJinhakCapturedPages = linkedSetOf<String>()
     private var unifiedAutoCaptureScheduled = false
+    private var batchSkipSnapshotUntilMs = 0L
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -136,8 +139,9 @@ class MainActivity : Activity() {
         private const val PREVIEW_LIMIT = 16000
         private const val MAX_SESSION_SYNC_RETRIES = 3
         private const val BATCH_NAVIGATION_TIMEOUT_MS = 15_000L
-        private const val VERSION = "0.6.1"
-        private const val BUILD_CODE = 10610
+        private const val MAX_JINHAK_AUTONAV_PAGES = 420
+        private const val VERSION = "0.6.2"
+        private const val BUILD_CODE = 10620
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -356,6 +360,13 @@ class MainActivity : Activity() {
                     }, 350L)
                     return
                 }
+                if (unifiedRunning && unifiedPhase == "jinhak" && unifiedPendingJinhakStart && provider == ProviderId.JINHAK && !batchRunning) {
+                    unifiedPendingJinhakStart = false
+                    handler.postDelayed({
+                        if (unifiedRunning && unifiedPhase == "jinhak" && !batchRunning) startBatch()
+                    }, 450L)
+                    return
+                }
                 if (!batchRunning && unifiedRunning && unifiedPhase == "jinhak" && provider == ProviderId.JINHAK && unifiedJinhakAutoCapture) {
                     scheduleUnifiedJinhakAutoCapture(url)
                 }
@@ -388,6 +399,28 @@ class MainActivity : Activity() {
         }
 
         webView.webChromeClient = object : WebChromeClient() {
+            override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                if (batchRunning && provider == ProviderId.ADIGA) {
+                    result?.confirm()
+                    if (isAdigaBlockingErrorMessage(message)) {
+                        handleAdigaBlockingDialog(message)
+                    } else {
+                        status.text = "어디가 안내창 자동 확인 후 수집 계속"
+                    }
+                    return true
+                }
+                return super.onJsAlert(view, url, message, result)
+            }
+
+            override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                if (batchRunning && provider == ProviderId.ADIGA && isAdigaBlockingErrorMessage(message)) {
+                    result?.confirm()
+                    handleAdigaBlockingDialog(message)
+                    return true
+                }
+                return super.onJsConfirm(view, url, message, result)
+            }
+
             override fun onCreateWindow(
                 view: WebView?,
                 isDialog: Boolean,
@@ -585,6 +618,7 @@ class MainActivity : Activity() {
         unifiedRunning = true
         unifiedPhase = "adiga"
         unifiedPendingAdigaStart = true
+        unifiedPendingJinhakStart = false
         unifiedJinhakAutoCapture = false
         unifiedJinhakCapturedPages.clear()
         unifiedAutoCaptureScheduled = false
@@ -613,7 +647,8 @@ class MainActivity : Activity() {
         val sessionId = unifiedSessionId ?: return
         unifiedPhase = "jinhak"
         unifiedPendingAdigaStart = false
-        unifiedJinhakAutoCapture = true
+        unifiedPendingJinhakStart = true
+        unifiedJinhakAutoCapture = false
         unifiedAutoCaptureScheduled = false
         unifiedJinhakCapturedPages.clear()
 
@@ -623,10 +658,10 @@ class MainActivity : Activity() {
         localStore.updateUnifiedSession(sessionId, "jinhak", "running", "adiga:$adigaReason")
         CookieManager.getInstance().flush()
         sessionState.text = "세션 상태 확인 중"
-        batchButton.text = "현재 진학사 화면 전체 분석·누적"
+        batchButton.text = "진학사 자동 탐색 준비"
         diagnosticButton.text = "진학사 전체 분석 전송"
         unifiedButton.text = "통합 수집 종료"
-        status.text = "통합 수집 2/2 · 진학사 단계: 로그인 후 필요한 화면을 열기만 하면 자동 분석·누적됩니다."
+        status.text = "통합 수집 2/2 · 진학사 안전 자동 탐색 준비: 동일 도메인의 입시정보 링크를 스스로 순회합니다."
         webView.loadUrl(ProviderId.JINHAK.homeUrl)
     }
 
@@ -658,6 +693,7 @@ class MainActivity : Activity() {
         unifiedRunning = false
         unifiedJinhakAutoCapture = false
         unifiedPendingAdigaStart = false
+        unifiedPendingJinhakStart = false
         unifiedAutoCaptureScheduled = false
         unifiedPhase = "completed"
         if (wasBatchRunning) stopBatch("unified-$reason")
@@ -680,6 +716,60 @@ class MainActivity : Activity() {
                 .put("containsRawAdmissionRecords", false)
         ) { }
         status.text = "통합 수집 종료 · 어디가/진학사 데이터가 하나의 세션으로 연결되었습니다. JSON 저장으로 통합 결과를 내보낼 수 있습니다."
+    }
+
+    private fun isAdigaBlockingErrorMessage(message: String?): Boolean {
+        val text = message?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
+        if (text.isBlank()) return false
+        return Regex("(페이지.{0,12}오류|오류.{0,12}발생|일시적.{0,12}오류|처리.{0,12}오류|서버.{0,12}오류|500|server\\s*error|internal\\s*server\\s*error)", RegexOption.IGNORE_CASE)
+            .containsMatchIn(text)
+    }
+
+    private fun handleAdigaBlockingDialog(message: String?) {
+        if (!batchRunning || provider != ProviderId.ADIGA) return
+        val compactMessage = message?.replace(Regex("\\s+"), " ")?.trim()?.take(180).orEmpty()
+        val action = activeBatchPageAction ?: pendingBatchPageAction
+        activeBatchPageAction = null
+        pendingBatchPageAction = null
+        batchSkipSnapshotUntilMs = System.currentTimeMillis() + 1800L
+
+        if (action != null) {
+            val key = pageActionKey(action)
+            batchPageActionQueued.remove(key)
+            batchPageActionFailed.add(key)
+            batchErrors.put(JSONObject()
+                .put("url", action.baseUrl)
+                .put("type", "site-blocking-dialog")
+                .put("page", action.page)
+                .put("totalPages", action.totalPages)
+                .put("familyKey", action.familyKey)
+                .put("requestedYear", action.requestedYear ?: JSONObject.NULL)
+                .put("retryCount", action.retry)
+                .put("message", compactMessage))
+            localRunId?.let { runId ->
+                localStore.markPage(
+                    runId, action.familyKey, action.requestedYear,
+                    action.page, action.totalPages, "error", action.retry, "site-blocking-dialog"
+                )
+                localStore.markDocument(runId, canonicalizeBatchUrl(action.baseUrl), "error", action.retry, "site-blocking-dialog")
+            }
+        } else {
+            val navKey = canonicalizeBatchUrl(webView.url ?: currentBatchTarget.orEmpty())
+            if (navKey.isNotBlank()) {
+                batchVisited.add(navKey)
+                batchErrors.put(JSONObject()
+                    .put("url", navKey)
+                    .put("type", "site-blocking-dialog")
+                    .put("message", compactMessage))
+                localRunId?.let { runId ->
+                    localStore.markDocument(runId, navKey, "error", 0, "site-blocking-dialog")
+                }
+            }
+        }
+        status.text = "어디가 페이지 오류창 자동 차단: 오류를 체크포인트에 남기고 다음 페이지로 진행합니다."
+        handler.postDelayed({
+            if (batchRunning && !batchPausedForLogin) loadNextBatchPage()
+        }, 220L)
     }
 
     private fun startBatch() {
@@ -744,6 +834,7 @@ class MainActivity : Activity() {
         batchAuditPagesScheduled = 0
         batchUniversityDiscoveryPagesScheduled = 0
         batchPersistedPageSignatureOwners.clear()
+        batchSkipSnapshotUntilMs = 0L
         disarmBatchNavigationWatchdog()
         currentBatchTarget = canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
@@ -981,6 +1072,11 @@ class MainActivity : Activity() {
 
     private fun scheduleBatchSnapshot() {
         if (!batchRunning || batchPausedForLogin || batchCollecting) return
+        val skipWait = batchSkipSnapshotUntilMs - System.currentTimeMillis()
+        if (skipWait > 0L) {
+            handler.postDelayed({ scheduleBatchSnapshot() }, skipWait + 80L)
+            return
+        }
 
         // Pagination actions already wait for AJAX after fnSearch(N). Do not run the
         // first-page bootstrap logic here, because the legitimate last page may
@@ -1516,6 +1612,26 @@ class MainActivity : Activity() {
             if (plan != null) registerListFingerprint(plan)
 
             val pageRecords = normalizeSnapshot(snapshot)
+            if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
+                val sessionId = unifiedSessionId
+                val runId = localRunId ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION).also { localRunId = it }
+                if (sessionId != null) {
+                    localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId)
+                    val capturedAt = Instant.now().toString()
+                    val digest = buildJinhakDigest(snapshot, pageRecords, runId, capturedAt)
+                    lastJinhakDigest = digest
+                    val navKey = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
+                    val pageKey = RecordUtils.sha256(navKey)
+                    localStore.storeUnifiedAnalysisCapture(
+                        sessionId = sessionId,
+                        provider = ProviderId.JINHAK.wireName,
+                        pageKey = pageKey,
+                        pageType = snapshot.optString("providerPageType"),
+                        payload = digest
+                    )
+                    localStore.updateUnifiedSession(sessionId, "jinhak", "running", null)
+                }
+            }
             if (activeAction != null && LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
                 val duplicateOwner = persistedDuplicatePageOwner(activeAction, pageRecords)
                 if (duplicateOwner != null && duplicateOwner != activeAction.page) {
@@ -1709,7 +1825,7 @@ class MainActivity : Activity() {
             webView.loadUrl(next)
             return
         }
-        if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) verifyLocalCompletionOrFinish()
+        if (LOCAL_FIRST_BETA && (provider == ProviderId.ADIGA || provider == ProviderId.JINHAK)) verifyLocalCompletionOrFinish()
         else verifyCloudCompletionOrFinish()
     }
 
@@ -2055,6 +2171,14 @@ class MainActivity : Activity() {
             }
             handler.postDelayed({ transitionUnifiedToJinhak(effectiveReason) }, 350L)
         }
+        else if (unifiedRunning && unifiedPhase == "jinhak" && provider == ProviderId.JINHAK) {
+            val sessionId = unifiedSessionId
+            if (sessionId != null) {
+                localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId) }
+                localStore.updateUnifiedSession(sessionId, "jinhak", "running", "jinhak:$effectiveReason")
+            }
+            handler.postDelayed({ finishUnifiedCollection("jinhak:$effectiveReason") }, 350L)
+        }
     }
 
     private fun finalizeBatchJson(reason: String) {
@@ -2161,6 +2285,7 @@ class MainActivity : Activity() {
 
     private fun enqueueDiscoveredUrl(url: String) {
         if (url.isBlank() || !isBatchNavigableProviderUrl(url)) return
+        if (provider == ProviderId.JINHAK && batchQueued.size + batchVisited.size >= MAX_JINHAK_AUTONAV_PAGES) return
         if (batchVisited.contains(url)) return
         val runId = localRunId
         if (runId != null && localStore.isDocumentCompleted(runId, url)) return

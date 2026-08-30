@@ -10,7 +10,7 @@ import java.time.temporal.ChronoUnit
 
 object JinhakAdapter : ProviderAdapter {
     override val id = ProviderId.JINHAK
-    override val supportsBatchCrawl = false
+    override val supportsBatchCrawl = true
     private const val TARGET_YEAR = 2027
 
     override fun accepts(url: String): Boolean {
@@ -20,19 +20,35 @@ object JinhakAdapter : ProviderAdapter {
         } catch (_: Exception) { false }
     }
 
-    override fun isBatchNavigable(url: String): Boolean = false
+    override fun seedUrls(): List<String> = listOf("https://www.jinhak.com/")
+
+    override fun isBatchNavigable(url: String): Boolean {
+        if (!accepts(url)) return false
+        return try {
+            val uri = URI(url)
+            val path = (uri.path ?: "/").lowercase()
+            val query = (uri.query ?: "").lowercase()
+            val full = "$path?$query"
+            if (Regex("(?:logout|signout|member|mypage|my-page|account|payment|pay|coupon|refund|withdraw|profile|userinfo|customer|faq|qna|event|notice|privacy|terms)").containsMatchIn(full)) return false
+            if (Regex("\\.(?:jpg|jpeg|png|gif|webp|svg|ico|css|js|map|woff2?|ttf|eot|zip|hwp|hwpx|pdf)$", RegexOption.IGNORE_CASE).containsMatchIn(path)) return false
+            true
+        } catch (_: Exception) { false }
+    }
 
     override fun classify(snapshot: JSONObject): String {
         val url = snapshot.optString("url").lowercase()
         val text = GenericAdmissionParser.collectText(snapshot)
+        val path = runCatching { URI(snapshot.optString("url")).path?.lowercase() ?: "/" }.getOrDefault("/")
+        val rootPage = path.isBlank() || path == "/" || path.endsWith("/index") || path.endsWith("/index.html")
         val hasPrediction = text.contains("합격예측") || text.contains("모의지원") || Regex("[0-9]{1,2}\\s*칸").containsMatchIn(text)
-        val hasActual = text.contains("실제합격자") ||
-            (text.contains("입시결과") && Regex("(최종등록|합격자|충원|70%|50%)").containsMatchIn(text))
+        val hasActual = Regex("(실제합격자\\s*(?:리포트|사례)|합격자\\s*리포트|전년도\\s*입시결과\\s*(?:리포트|상세))").containsMatchIn(text) ||
+            Regex("(actual|admitreport|resultreport|passcase)").containsMatchIn(url)
         val dedicatedMinimum = url.contains("esatminuniv") ||
             (Regex("(수능최저\\s*(검색|대학|조건)|최저학력기준\\s*(검색|대학))").containsMatchIn(text) && !hasPrediction)
         val earlyStorage = text.contains("수시저장소") || text.contains("저장대학") || url.contains("storage") || url.contains("save")
         return when {
             Regex("(login|signin|member/login)").containsMatchIn(url) || text.contains("로그인") && text.contains("비밀번호") -> "jinhak-login"
+            rootPage -> "jinhak-home"
             earlyStorage -> "jinhak-early-storage"
             hasActual -> "jinhak-actual-admit-report"
             text.contains("합격예측리포트") || text.contains("합격예측 리포트") || hasPrediction -> "jinhak-prediction-report"
@@ -133,6 +149,10 @@ object JinhakAdapter : ProviderAdapter {
             return RecordUtils.dedupe(result)
         }
 
+        if (pageType == "jinhak-home" || pageType == "jinhak-university-search" || pageType == "jinhak-curation" || pageType == "jinhak-other") {
+            return result
+        }
+
         val metrics = JSONObject()
         putNumber(metrics, "universityCalculatedScore", Regex("(?:대학별\\s*)?(?:환산점수|산출점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
         putNumber(metrics, "convertedGrade", Regex("(?:반영\\s*평균등급|환산등급|내\\s*등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
@@ -190,6 +210,7 @@ object JinhakAdapter : ProviderAdapter {
         "jinhak-prediction-report", "jinhak-mock-support-report", "jinhak-recommended-university", "jinhak-early-storage" -> "current-prediction"
         "jinhak-sat-minimum" -> "current-admission"
         "jinhak-score-calc-report", "jinhak-student-basic" -> "student-profile"
+        "jinhak-home", "jinhak-university-search", "jinhak-curation" -> "reference-navigation"
         else -> "reference"
     }
 
