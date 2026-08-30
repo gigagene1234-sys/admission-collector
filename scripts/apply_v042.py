@@ -85,7 +85,7 @@ for path in MAIN_PATHS:
     # Make the live status explicit that stale content is guarded and bounded.
     s = s.replace(
         'status.text = "페이지 ${activeAction.page} 내용이 기존 ${duplicateOwner}쪽과 동일함: stale 응답으로 판정 후 재시도"',
-        'status.text = "페이지 ${activeAction.page} 내용이 기존 ${duplicateOwner}쪽과 동일함: stale 판정 / 최대 $MAX_PAGE_RETRIES회만 재시도"'
+        'status.text = "페이지 ${activeAction.page} 내용이 기존 ${duplicateOwner}쪽과 동일함: stale 판정 / 최대 ${MAX_PAGE_RETRIES}회만 재시도"'
     )
     path.write_text(s)
 
