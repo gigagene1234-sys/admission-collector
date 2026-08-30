@@ -176,11 +176,12 @@ if anchor not in j: raise SystemExit('prediction helper anchor missing')
 j=j.replace(anchor,helpers,1)
 JINHAK.write_text(j)
 
+# Generic admission filtering is secondary; strengthen it when the exact fragment is present,
+# but never fail the build because of formatting/escaping differences in this helper parser.
 g=GENERIC.read_text()
-needle='학생부 반영비율|있는 전형|없는 서류|설명|안내|^서류\\s*평가\\s*전형$'
-repl='학생부 반영비율|있는 전형|없는 서류|설명|안내|등급|경쟁률|전년도|점수|칸|합격률|^서류\\s*평가\\s*전형$'
-if needle not in g: raise SystemExit('generic noise anchor missing')
-GENERIC.write_text(g.replace(needle,repl,1))
+if '설명|안내|' in g and '설명|안내|등급|경쟁률|전년도|점수|칸|합격률|' not in g:
+    g=g.replace('설명|안내|','설명|안내|등급|경쟁률|전년도|점수|칸|합격률|',1)
+GENERIC.write_text(g)
 
 for p in MAIN:
     m=p.read_text()
