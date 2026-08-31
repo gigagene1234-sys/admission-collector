@@ -257,7 +257,10 @@ class JinhakSlowLanePool(
                 return true
             }
         }
-        host.addView(view, FrameLayout.LayoutParams(1, 1))
+        host.addView(view, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
         return slot
     }
 
@@ -365,6 +368,13 @@ class JinhakSlowLanePool(
             if (snapshot == null) {
                 slot.captureInProgress = false
                 scheduleHeartbeat(slot, 1_000L)
+                return@evaluateJavascript
+            }
+            val session = snapshot.optJSONObject("session") ?: JSONObject()
+            val gate = snapshot.optJSONObject("interactionGate") ?: JSONObject()
+            if (session.optBoolean("needsLogin", false) || gate.optBoolean("requiresUserAction", false)) {
+                slot.captureInProgress = false
+                finishFailure(slot, "slow-lane-user-action-required")
                 return@evaluateJavascript
             }
             completedCount += 1

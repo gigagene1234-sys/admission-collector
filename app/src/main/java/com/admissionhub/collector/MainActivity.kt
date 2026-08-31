@@ -36,6 +36,7 @@ import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
 import com.admissionhub.collector.jinhak.JinhakAgentNavigator
 import com.admissionhub.collector.jinhak.JinhakSiteTopology
 import com.admissionhub.collector.jinhak.JinhakApplicationMission
+import com.admissionhub.collector.jinhak.JinhakSlowLanePool
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.provider.ProviderCapabilities
 import com.admissionhub.collector.provider.ProviderCapability
@@ -60,6 +61,8 @@ class MainActivity : Activity() {
     private lateinit var cloudOffload: CloudOffloadCoordinator
     private lateinit var localStore: LocalCollectorStore
     private lateinit var sessionVault: SecureSessionVault
+    private lateinit var slowLaneHost: FrameLayout
+    private lateinit var slowLanePool: JinhakSlowLanePool
 
     private val handler = Handler(Looper.getMainLooper())
     private val sessionKeepAlive = object : Runnable {
@@ -163,6 +166,13 @@ class MainActivity : Activity() {
     private var jinhakMissionBootstrapStartedAtMs = 0L
     private var jinhakFirstPopulatedStorageAtMs = 0L
     private var jinhakUnboundSavedApplicationObservations = 0
+    private var jinhakLastAgentActionLabel = ""
+    private var jinhakLastAgentActionOriginRoute = ""
+    private var jinhakLastAgentActionMissionContext: JinhakApplicationMission.Context? = null
+    private var jinhakSlowLaneEscalated = 0
+    private var jinhakSlowLaneCompleted = 0
+    private var jinhakSlowLaneFailed = 0
+    private var jinhakSlowLaneUserActionRequired = 0
     private val cloudFrontierTaskIds = linkedMapOf<String, String>()
     private var cloudFrontierClaimInProgress = false
     private var cloudFrontierClaimAttempts = 0
@@ -189,7 +199,7 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_AUTONAV_PAGES = 420
         private const val JINHAK_SOFT_STALL_MS = 12_000L
         private const val JINHAK_HARD_STALL_MS = 24_000L
-        private const val JINHAK_ABSOLUTE_TARGET_MS = 35_000L
+        private const val JINHAK_SLOW_ESCALATION_MS = 35_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val MAX_JINHAK_AGENT_ACTIONS = 180
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
@@ -207,6 +217,19 @@ class MainActivity : Activity() {
         localStore = LocalCollectorStore(this)
         sessionVault = SecureSessionVault(this)
         buildUi()
+        slowLanePool = JinhakSlowLanePool(this, slowLaneHost, object : JinhakSlowLanePool.Listener {
+            override fun onSlowLaneCompleted(task: JinhakSlowLanePool.Task, snapshot: JSONObject, stats: JinhakSlowLanePool.ResultStats) {
+                handleJinhakSlowLaneCompleted(task, snapshot, stats)
+            }
+            override fun onSlowLaneFailed(task: JinhakSlowLanePool.Task, reason: String, stats: JinhakSlowLanePool.ResultStats) {
+                handleJinhakSlowLaneFailed(task, reason, stats)
+            }
+            override fun onSlowLaneStatsChanged(stats: JinhakSlowLanePool.Stats) {
+                if (batchRunning && provider == ProviderId.JINHAK && stats.running + stats.queued > 0) {
+                    sessionState.text = "● 로그인 유지 / 병렬 slow ${stats.running} · 대기 ${stats.queued}"
+                }
+            }
+        })
         configureWebView()
         val resumed = resumeInterruptedUnifiedSessionIfNeeded()
         if (!resumed) openProvider(ProviderId.JINHAK)
@@ -218,6 +241,7 @@ class MainActivity : Activity() {
         if (level >= TRIM_MEMORY_RUNNING_LOW) {
             recordRuntimeEvent("memory-trim", JSONObject().put("level", level))
             if (provider == ProviderId.JINHAK) {
+                if (::slowLanePool.isInitialized) slowLanePool.setMaxActiveWorkers(1)
                 // SQLite is authoritative. Do not retain large autonomous-crawl copies in RAM.
                 batchSnapshots = JSONArray()
                 batchRecords = JSONArray()
@@ -362,8 +386,20 @@ class MainActivity : Activity() {
             isClickable = true
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
         }
+        slowLaneHost = FrameLayout(this).apply {
+            alpha = 0.01f
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            translationX = -10000f
+            translationY = -10000f
+        }
         val browserStack = FrameLayout(this).apply {
             addView(webView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ))
+            addView(slowLaneHost, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             ))
@@ -1008,6 +1044,7 @@ class MainActivity : Activity() {
         batchCloudFinalCheckInProgress = false
         batchReadinessPolling = false
         disarmBatchNavigationWatchdog()
+        if (::slowLanePool.isInitialized) slowLanePool.cancelAll("unified-finish")
         jinhakAbsoluteTargetKey = ""
         ++jinhakAbsoluteTargetGeneration
         runCatching { webView.stopLoading() }
@@ -1162,6 +1199,17 @@ class MainActivity : Activity() {
         jinhakMissionBootstrapStartedAtMs = if (provider == ProviderId.JINHAK) System.currentTimeMillis() else 0L
         jinhakFirstPopulatedStorageAtMs = 0L
         jinhakUnboundSavedApplicationObservations = 0
+        jinhakLastAgentActionLabel = ""
+        jinhakLastAgentActionOriginRoute = ""
+        jinhakLastAgentActionMissionContext = null
+        jinhakSlowLaneEscalated = 0
+        jinhakSlowLaneCompleted = 0
+        jinhakSlowLaneFailed = 0
+        jinhakSlowLaneUserActionRequired = 0
+        if (::slowLanePool.isInitialized) {
+            slowLanePool.cancelAll("new-batch-reset")
+            slowLanePool.setMaxActiveWorkers(JinhakSlowLanePool.DEFAULT_MAX_WORKERS)
+        }
         cloudFrontierTaskIds.clear()
         cloudFrontierClaimInProgress = false
         cloudFrontierClaimAttempts = 0
@@ -1407,19 +1455,44 @@ class MainActivity : Activity() {
             if (RecordUtils.sha256(activeTarget) != key) return@postDelayed
 
             val current = canonicalizeBatchUrl(webView.url ?: expectedUrl)
-            recordRuntimeEvent("jinhak-absolute-target-timeout", JSONObject()
-                .put("targetSafePath", runtimeSafePath(target))
-                .put("currentSafePath", runtimeSafePath(current))
-                .put("elapsedMs", System.currentTimeMillis() - startedAt))
-            localRunId?.let { runId ->
-                localStore.markDocument(runId, target, "error", 0, "jinhak-absolute-target-timeout")
+            val mission = jinhakLastAgentActionMissionContext ?: jinhakMissionContext
+            val actionLabel = jinhakLastAgentActionLabel.takeIf { it.isNotBlank() }
+            val actionOrigin = jinhakLastAgentActionOriginRoute.takeIf { it.isNotBlank() } ?: target
+            val laneHint = jinhakSlowLaneHint(target, actionLabel)
+            val priority = jinhakSlowLanePriority(laneHint, target)
+            val task = JinhakSlowLanePool.Task(
+                id = RecordUtils.sha256(listOf(target, actionOrigin, actionLabel ?: "", mission?.identityKey ?: "", startedAt.toString()).joinToString("|")),
+                targetUrl = target,
+                originUrl = actionOrigin,
+                actionLabel = actionLabel,
+                missionContext = mission?.toJson(),
+                laneHint = laneHint,
+                priority = priority,
+                reason = "foreground-35s-slow-escalation"
+            )
+            val accepted = ::slowLanePool.isInitialized && slowLanePool.enqueue(task)
+            if (accepted) {
+                jinhakSlowLaneEscalated += 1
+                recordRuntimeEvent("jinhak-slow-lane-escalated", JSONObject()
+                    .put("targetSafePath", runtimeSafePath(target))
+                    .put("currentSafePath", runtimeSafePath(current))
+                    .put("elapsedMs", System.currentTimeMillis() - startedAt)
+                    .put("laneHint", laneHint)
+                    .put("priority", priority)
+                    .put("missionBound", mission?.identityKey != null))
+                localRunId?.let { runId -> localStore.markDocument(runId, target, "slow-lane", 0, null) }
+            } else {
+                jinhakSlowLaneFailed += 1
+                batchErrors.put(JSONObject()
+                    .put("type", "jinhak-slow-lane-queue-full")
+                    .put("targetSafePath", runtimeSafePath(target))
+                    .put("currentSafePath", runtimeSafePath(current)))
+                localRunId?.let { runId -> localStore.markDocument(runId, target, "error", 0, "jinhak-slow-lane-queue-full") }
             }
+
+            // The main browser is now free to continue. A slow worker owns the deferred target.
             batchVisited.add(target)
             batchQueued.remove(target)
-            batchErrors.put(JSONObject()
-                .put("type", "jinhak-absolute-target-timeout")
-                .put("targetSafePath", runtimeSafePath(target))
-                .put("currentSafePath", runtimeSafePath(current)))
             batchCollecting = false
             batchNavigationWatchdogRecovery = false
             batchReadinessPolling = false
@@ -1430,11 +1503,150 @@ class MainActivity : Activity() {
             jinhakAbsoluteTargetKey = ""
             ++jinhakAbsoluteTargetGeneration
             runCatching { webView.stopLoading() }
-            status.text = "진학사 절대 대기시간 초과: redirect/로딩 루프 페이지를 격리하고 다음 대상으로 진행합니다."
+            status.text = if (accepted) {
+                "35초 경과: 느린 페이지를 병렬 slow worker로 넘기고 메인 탐색은 계속합니다."
+            } else {
+                "35초 경과: slow worker 대기열이 가득 차 해당 페이지를 오류로 기록하고 계속합니다."
+            }
             handler.postDelayed({
                 if (batchRunning && !batchPausedForLogin && provider == ProviderId.JINHAK) loadNextBatchPage()
-            }, 320L)
-        }, JINHAK_ABSOLUTE_TARGET_MS)
+            }, 220L)
+        }, JINHAK_SLOW_ESCALATION_MS)
+    }
+
+    private fun jinhakSlowLaneHint(target: String, actionLabel: String?): String {
+        val material = (target + " " + (actionLabel ?: "")).lowercase()
+        return when {
+            Regex("실제\\s*합격자|actual|passdata").containsMatchIn(material) -> "actual-admit"
+            Regex("모의\\s*지원|mock").containsMatchIn(material) -> "mock-support"
+            Regex("합격\\s*예측|predict").containsMatchIn(material) -> "current-prediction"
+            Regex("성적|환산|score|minimum|최저").containsMatchIn(material) -> "score-analysis"
+            Regex("입시\\s*결과|univ-major|univ-info|경쟁률").containsMatchIn(material) -> "university-result"
+            Regex("입시\\s*전략|strategy|knowledge").containsMatchIn(material) -> "strategy"
+            else -> "reference"
+        }
+    }
+
+    private fun jinhakSlowLanePriority(lane: String, target: String): Int = when (lane) {
+        "actual-admit" -> 120
+        "mock-support" -> 116
+        "current-prediction" -> 112
+        "score-analysis" -> 106
+        "university-result" -> 100
+        "strategy" -> 70
+        else -> if (JinhakSiteTopology.isCoreMissionRoute(target)) 92 else 40
+    }
+
+    private fun handleJinhakSlowLaneCompleted(
+        task: JinhakSlowLanePool.Task,
+        snapshot: JSONObject,
+        stats: JinhakSlowLanePool.ResultStats
+    ) {
+        if (provider != ProviderId.JINHAK) return
+        val session = snapshot.optJSONObject("session") ?: JSONObject()
+        val gate = snapshot.optJSONObject("interactionGate") ?: JSONObject()
+        if (session.optBoolean("needsLogin", false) || gate.optBoolean("requiresUserAction", false)) {
+            jinhakSlowLaneUserActionRequired += 1
+            handleJinhakSlowLaneFailed(task, "slow-lane-user-action-required", stats)
+            return
+        }
+        runCatching {
+            val adapter = ProviderRegistry.adapter(ProviderId.JINHAK)
+            snapshot.put("providerPageType", adapter.classify(snapshot))
+            task.missionContext?.let { snapshot.put("missionApplicationContext", JSONObject(it.toString())) }
+            snapshot.put("collectionTransport", "concurrent-slow-lane")
+            snapshot.put("slowLane", JSONObject()
+                .put("workerId", stats.workerId)
+                .put("elapsedMs", stats.elapsedMs)
+                .put("progressEvents", stats.progressEvents)
+                .put("replayUsed", stats.replayUsed)
+                .put("laneHint", task.laneHint)
+                .put("laneSatisfied", stats.laneSatisfied))
+
+            val records = adapter.normalize(snapshot)
+            val runId = localRunId ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION).also { localRunId = it }
+            val stored = localStore.storeRecords(runId, ProviderId.JINHAK.wireName, records)
+            batchLocalRecordsPersisted += stored
+            val navKey = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url", task.targetUrl)))
+            localStore.markDocument(runId, task.targetUrl, "completed")
+            if (navKey.isNotBlank()) localStore.markDocument(runId, navKey, "completed")
+            cloudFrontierTaskIds.remove(task.targetUrl)?.let { taskId -> cloudOffload.completeFrontier(taskId, "completed", null) }
+
+            val mission = JinhakApplicationMission.fromJson(task.missionContext)
+            val missionKey = mission?.identityKey
+            val pageType = snapshot.optString("providerPageType")
+            val resolvedLane = JinhakApplicationMission.laneForPageType(pageType).takeIf { it != "reference" } ?: task.laneHint
+            if (missionKey != null && resolvedLane != "reference") {
+                jinhakMissionCoverage.getOrPut(missionKey) { linkedSetOf() }.add(resolvedLane)
+            }
+
+            val capturedAt = Instant.now().toString()
+            val digest = buildJinhakDigest(snapshot, records, runId, capturedAt)
+            lastJinhakDigest = digest
+            unifiedSessionId?.takeIf { unifiedRunning && unifiedPhase == "jinhak" }?.let { sessionId ->
+                localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId)
+                val safeRoute = runtimeSafePath(snapshot.optString("url", task.targetUrl))
+                val explicitContext = ObservationEvidence.explicitContextFromDigest(digest)
+                localStore.storeUnifiedAnalysisCapture(
+                    sessionId = sessionId,
+                    provider = ProviderId.JINHAK.wireName,
+                    pageKey = RecordUtils.sha256(listOf(task.id, navKey, missionKey ?: "").joinToString("|")),
+                    pageType = pageType,
+                    payload = digest
+                )
+                localStore.storeObservationEvidence(
+                    sessionId = sessionId,
+                    runId = runId,
+                    provider = ProviderId.JINHAK.wireName,
+                    safeRouteKey = safeRoute,
+                    pageTypeGuess = pageType,
+                    pageTypeConfidence = if (pageType == "jinhak-other") 0.25 else 0.90,
+                    authStateClass = "authenticated",
+                    explicitContext = explicitContext,
+                    evidence = digest,
+                    captureVersion = VERSION
+                )
+                localStore.updateUnifiedSession(sessionId, "jinhak", "running", null)
+            }
+            batchSnapshots.put(snapshotForLocalExport(snapshot))
+            batchPageCount += 1
+            jinhakSlowLaneCompleted += 1
+            recordRuntimeEvent("jinhak-slow-lane-completed", JSONObject()
+                .put("targetSafePath", runtimeSafePath(task.targetUrl))
+                .put("pageType", pageType)
+                .put("lane", resolvedLane)
+                .put("elapsedMs", stats.elapsedMs)
+                .put("progressEvents", stats.progressEvents)
+                .put("records", records.length())
+                .put("missionBound", missionKey != null))
+        }.onFailure { error ->
+            handleJinhakSlowLaneFailed(task, "slow-lane-persist-failure:${error.javaClass.simpleName}", stats)
+            return
+        }
+        if (batchRunning && !batchPausedForLogin) handler.postDelayed({ loadNextBatchPage() }, 80L)
+    }
+
+    private fun handleJinhakSlowLaneFailed(
+        task: JinhakSlowLanePool.Task,
+        reason: String,
+        stats: JinhakSlowLanePool.ResultStats
+    ) {
+        jinhakSlowLaneFailed += 1
+        batchErrors.put(JSONObject()
+            .put("type", reason.take(120))
+            .put("targetSafePath", runtimeSafePath(task.targetUrl))
+            .put("source", "concurrent-slow-lane")
+            .put("laneHint", task.laneHint)
+            .put("elapsedMs", stats.elapsedMs)
+            .put("progressEvents", stats.progressEvents))
+        localRunId?.let { runId -> localStore.markDocument(runId, task.targetUrl, "error", 0, reason.take(120)) }
+        cloudFrontierTaskIds.remove(task.targetUrl)?.let { taskId -> cloudOffload.completeFrontier(taskId, "error", reason.take(120)) }
+        recordRuntimeEvent("jinhak-slow-lane-failed", JSONObject()
+            .put("targetSafePath", runtimeSafePath(task.targetUrl))
+            .put("reason", reason.take(120))
+            .put("elapsedMs", stats.elapsedMs)
+            .put("progressEvents", stats.progressEvents))
+        if (batchRunning && !batchPausedForLogin) handler.postDelayed({ loadNextBatchPage() }, 80L)
     }
 
     private fun showBatchCover() {
@@ -1464,6 +1676,7 @@ class MainActivity : Activity() {
         batchNavigationWatchdogRecovery = false
         batchCloudFinalCheckInProgress = false
         disarmBatchNavigationWatchdog()
+        if (::slowLanePool.isInitialized) slowLanePool.cancelAll("batch-stopped")
         webView.stopLoading()
         hideBatchCover()
         stopCollectionKeepAlive()
@@ -2545,6 +2758,9 @@ class MainActivity : Activity() {
             jinhakMissionNeedsReturn = true
         }
 
+        jinhakLastAgentActionLabel = candidate.label
+        jinhakLastAgentActionOriginRoute = route
+        jinhakLastAgentActionMissionContext = actionMission ?: jinhakMissionContext
         jinhakAgentActionInFlight = true
         jinhakAgentActionsExecuted += 1
         if (candidate.kind == "mission-link-navigation") jinhakMissionAnchorActionsExecuted += 1
@@ -2630,6 +2846,9 @@ class MainActivity : Activity() {
             jinhakMissionContext = null
             jinhakMissionOriginRoute = ""
             jinhakMissionNeedsReturn = false
+            jinhakLastAgentActionLabel = ""
+            jinhakLastAgentActionOriginRoute = ""
+            jinhakLastAgentActionMissionContext = null
             currentBatchTarget = next
             status.text = "다음 입시정보 페이지 탐색: ${safeDisplayUrl(next)}"
             webView.loadUrl(next)
@@ -2665,6 +2884,12 @@ class MainActivity : Activity() {
                     }
                 }
             }
+            return
+        }
+        if (provider == ProviderId.JINHAK && ::slowLanePool.isInitialized && slowLanePool.hasWork()) {
+            val slow = slowLanePool.stats()
+            status.text = "메인 탐색 완료 · slow worker ${slow.running}개 처리 / ${slow.queued}개 대기: 병렬 작업 종료 후 최종 저장합니다."
+            handler.postDelayed({ if (batchRunning && !batchPausedForLogin) loadNextBatchPage() }, 900L)
             return
         }
         if (LOCAL_FIRST_BETA && (provider == ProviderId.ADIGA || provider == ProviderId.JINHAK)) verifyLocalCompletionOrFinish()
@@ -3039,6 +3264,14 @@ class MainActivity : Activity() {
                         .put("consentGatesEncountered", jinhakConsentGatesEncountered)
                         .put("consentGatesResolved", jinhakConsentGatesResolved)
                         .put("unboundSavedApplicationObservations", jinhakUnboundSavedApplicationObservations)
+                        .put("slowLaneEscalated", jinhakSlowLaneEscalated)
+                        .put("slowLaneCompleted", jinhakSlowLaneCompleted)
+                        .put("slowLaneFailed", jinhakSlowLaneFailed)
+                        .put("slowLaneUserActionRequired", jinhakSlowLaneUserActionRequired)
+                        .put("slowLaneProgressExtensions", if (::slowLanePool.isInitialized) slowLanePool.stats().progressExtensions else 0)
+                        .put("slowLaneReplayAttempts", if (::slowLanePool.isInitialized) slowLanePool.stats().replayAttempts else 0)
+                        .put("slowLaneReplaySuccesses", if (::slowLanePool.isInitialized) slowLanePool.stats().replaySuccesses else 0)
+                        .put("slowLaneMaxActiveWorkers", if (::slowLanePool.isInitialized) slowLanePool.stats().maxActiveWorkers else 0)
                         .put("applicationMissionCoverage", JSONObject().apply {
                             val lanes = listOf("saved-application", "current-prediction", "mock-support", "actual-admit", "university-result", "score-analysis", "strategy")
                             for (lane in lanes) put(lane, jinhakMissionCoverage.values.count { it.contains(lane) })
@@ -3097,6 +3330,14 @@ class MainActivity : Activity() {
                 .put("jinhakConsentGatesEncountered", jinhakConsentGatesEncountered)
                 .put("jinhakConsentGatesResolved", jinhakConsentGatesResolved)
                 .put("jinhakUnboundSavedApplicationObservations", jinhakUnboundSavedApplicationObservations)
+                .put("jinhakSlowLaneEscalated", jinhakSlowLaneEscalated)
+                .put("jinhakSlowLaneCompleted", jinhakSlowLaneCompleted)
+                .put("jinhakSlowLaneFailed", jinhakSlowLaneFailed)
+                .put("jinhakSlowLaneUserActionRequired", jinhakSlowLaneUserActionRequired)
+                .put("jinhakSlowLaneProgressExtensions", if (::slowLanePool.isInitialized) slowLanePool.stats().progressExtensions else 0)
+                .put("jinhakSlowLaneReplayAttempts", if (::slowLanePool.isInitialized) slowLanePool.stats().replayAttempts else 0)
+                .put("jinhakSlowLaneReplaySuccesses", if (::slowLanePool.isInitialized) slowLanePool.stats().replaySuccesses else 0)
+                .put("jinhakSlowLaneMaxActiveWorkers", if (::slowLanePool.isInitialized) slowLanePool.stats().maxActiveWorkers else 0)
                 .put("jinhakSecondsToFirstPopulatedStorage", if (jinhakMissionBootstrapStartedAtMs > 0L && jinhakFirstPopulatedStorageAtMs > 0L) (jinhakFirstPopulatedStorageAtMs - jinhakMissionBootstrapStartedAtMs) / 1000.0 else JSONObject.NULL)
                 .put("jinhakUniqueNavigationStates", jinhakUniqueNavigationStates)
                 .put("jinhakRepeatedNavigationStateSkips", jinhakRepeatedNavigationStateSkips)
@@ -3468,6 +3709,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        if (::slowLanePool.isInitialized) slowLanePool.destroy()
         handler.removeCallbacksAndMessages(null)
         CookieManager.getInstance().flush()
         stopCollectionKeepAlive()
