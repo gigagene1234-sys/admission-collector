@@ -740,9 +740,87 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             writer.write("]")
         }
 
+        fun safeNavigationEvidence(raw: String?): String? {
+            if (raw.isNullOrBlank()) return null
+            return try {
+                val uri = java.net.URI(raw)
+                val host = uri.host.orEmpty().lowercase()
+                val path = uri.path.orEmpty().ifBlank { "/" }
+                if (host.isBlank()) path.substringBefore('?').take(500) else "$host$path".take(500)
+            } catch (_: Exception) { raw.substringBefore('?').substringBefore('#').take(500) }
+        }
+        fun writeErrors(runId: String?) {
+            writer.write("{\"documents\":[")
+            var firstDocument = true
+            if (runId != null) {
+                readableDatabase.rawQuery(
+                    "SELECT navigation_key,state,error_type,retry_count,updated_at FROM documents WHERE run_id=? AND (state!='completed' OR error_type IS NOT NULL) ORDER BY updated_at,navigation_key",
+                    arrayOf(runId)
+                ).use { c ->
+                    while (c.moveToNext()) {
+                        if (!firstDocument) writer.write(",")
+                        firstDocument = false
+                        writer.write("{\"safePath\":")
+                        writeNullableString(safeNavigationEvidence(c.getString(0)))
+                        writer.write(",\"state\":")
+                        writeNullableString(c.getString(1))
+                        writer.write(",\"errorType\":")
+                        writeNullableString(if (c.isNull(2)) null else c.getString(2))
+                        writer.write(",\"retryCount\":${c.getInt(3)},\"updatedAt\":")
+                        writeNullableString(c.getString(4))
+                        writer.write("}")
+                    }
+                }
+            }
+            writer.write("],\"pages\":[")
+            var firstPage = true
+            if (runId != null) {
+                readableDatabase.rawQuery(
+                    "SELECT family_key,requested_year,page,total_pages,state,error_type,retry_count,updated_at FROM pages WHERE run_id=? AND (state!='completed' OR error_type IS NOT NULL) ORDER BY updated_at,family_key,page",
+                    arrayOf(runId)
+                ).use { c ->
+                    while (c.moveToNext()) {
+                        if (!firstPage) writer.write(",")
+                        firstPage = false
+                        writer.write("{\"familyKey\":")
+                        writeNullableString(safeNavigationEvidence(c.getString(0)))
+                        writer.write(",\"requestedYear\":${c.getInt(1)},\"page\":${c.getInt(2)},\"totalPages\":${c.getInt(3)},\"state\":")
+                        writeNullableString(c.getString(4))
+                        writer.write(",\"errorType\":")
+                        writeNullableString(if (c.isNull(5)) null else c.getString(5))
+                        writer.write(",\"retryCount\":${c.getInt(6)},\"updatedAt\":")
+                        writeNullableString(c.getString(7))
+                        writer.write("}")
+                    }
+                }
+            }
+            writer.write("]}")
+        }
+        fun writeSyncDiagnostics() {
+            writer.write("[")
+            var first = true
+            readableDatabase.rawQuery(
+                "SELECT state,provider,requires_user_action,detail_json,created_at FROM sync_state_events WHERE session_id=? ORDER BY created_at,event_id",
+                arrayOf(sessionId)
+            ).use { c ->
+                while (c.moveToNext()) {
+                    if (!first) writer.write(",")
+                    first = false
+                    writer.write("{\"state\":")
+                    writeNullableString(c.getString(0))
+                    writer.write(",\"provider\":")
+                    writeNullableString(if (c.isNull(1)) null else c.getString(1))
+                    writer.write(",\"requiresUserAction\":${c.getInt(2) != 0},\"detail\":${c.getString(3)},\"createdAt\":")
+                    writeNullableString(c.getString(4))
+                    writer.write("}")
+                }
+            }
+            writer.write("]")
+        }
+
         writer.write("{\"schemaVersion\":4,\"type\":\"admission-unified-two-provider-export\",\"session\":")
         writer.write(status.toString())
-        writer.write(",\"analysisReady\":{\"contractVersion\":1,\"purpose\":\"assistant-xlsx-dashboard-generation\",\"authoritativeLayers\":[\"sources.adiga.records\",\"sources.jinhak.records\",\"sources.jinhak.pageAnalyses\",\"observationEvidence\"],\"recommendedWorkbookSheets\":[\"Dashboard\",\"UnifiedRecords\",\"JinhakPredictions\",\"HistoricalResults\",\"Observations\",\"Coverage\",\"Errors\"],\"rowKeyFields\":[\"provider\",\"year\",\"university\",\"department\",\"admission\",\"recordType\",\"observedAt\"],\"flattenMetricsForSpreadsheet\":true,\"preserveRawEvidence\":true,\"doNotInferMissingBindings\":true,\"observationFirst\":true},\"combinationPolicy\":{\"officialBaseline\":\"adiga\",\"predictionAnalysis\":\"jinhak\",\"keepProviderSemanticsSeparate\":true,\"doNotOverwriteHistoricalWithPrediction\":true},\"sources\":{\"adiga\":{\"runId\":")
+        writer.write(",\"analysisReady\":{\"contractVersion\":2,\"purpose\":\"assistant-xlsx-dashboard-generation\",\"authoritativeLayers\":[\"sources.adiga.records\",\"sources.jinhak.records\",\"sources.jinhak.pageAnalyses\",\"observationEvidence\",\"errorEvidence\",\"syncDiagnostics\"],\"recommendedWorkbookSheets\":[\"Dashboard\",\"UnifiedRecords\",\"JinhakPredictions\",\"HistoricalResults\",\"Observations\",\"Coverage\",\"Errors\"],\"rowKeyFields\":[\"provider\",\"year\",\"university\",\"department\",\"admission\",\"recordType\",\"observedAt\"],\"flattenMetricsForSpreadsheet\":true,\"preserveRawEvidence\":true,\"doNotInferMissingBindings\":true,\"observationFirst\":true},\"combinationPolicy\":{\"officialBaseline\":\"adiga\",\"predictionAnalysis\":\"jinhak\",\"keepProviderSemanticsSeparate\":true,\"doNotOverwriteHistoricalWithPrediction\":true},\"sources\":{\"adiga\":{\"runId\":")
         writeNullableString(adigaRun)
         writer.write(",\"records\":")
         writeRecords(adigaRun)
@@ -754,6 +832,12 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         writeAnalyses()
         writer.write("}},\"observationEvidence\":")
         writeObservations()
+        writer.write(",\"errorEvidence\":{\"adiga\":")
+        writeErrors(adigaRun)
+        writer.write(",\"jinhak\":")
+        writeErrors(jinhakRun)
+        writer.write("},\"syncDiagnostics\":")
+        writeSyncDiagnostics()
         writer.write("}")
         writer.flush()
     }

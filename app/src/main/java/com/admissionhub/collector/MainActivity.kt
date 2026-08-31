@@ -141,6 +141,9 @@ class MainActivity : Activity() {
     private val unifiedJinhakCapturedPages = linkedSetOf<String>()
     private var unifiedAutoCaptureScheduled = false
     private val jinhakAgentActionSeen = linkedSetOf<String>()
+    private val jinhakExpandedNavigationStates = linkedSetOf<String>()
+    private var jinhakRepeatedNavigationStateSkips = 0
+    private var jinhakUniqueNavigationStates = 0
     private var jinhakAgentActionInFlight = false
     private var jinhakAgentActionsExecuted = 0
     private val cloudFrontierTaskIds = linkedMapOf<String, String>()
@@ -1122,6 +1125,9 @@ class MainActivity : Activity() {
         batchUniversityDiscoveryPagesScheduled = 0
         batchPersistedPageSignatureOwners.clear()
         jinhakAgentActionSeen.clear()
+        jinhakExpandedNavigationStates.clear()
+        jinhakRepeatedNavigationStateSkips = 0
+        jinhakUniqueNavigationStates = 0
         jinhakAgentActionInFlight = false
         jinhakAgentActionsExecuted = 0
         cloudFrontierTaskIds.clear()
@@ -2137,6 +2143,8 @@ class MainActivity : Activity() {
 
             val pageRecords = normalizeSnapshot(snapshot)
             if (provider == ProviderId.JINHAK) jinhakConsecutiveStalls = 0
+            var jinhakExpansionStateKey: String? = null
+            var jinhakExpandOutgoingLinks = true
             if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
                 val sessionId = unifiedSessionId
                 val runId = localRunId ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION).also { localRunId = it }
@@ -2147,6 +2155,21 @@ class MainActivity : Activity() {
                     lastJinhakDigest = digest
                     val navKey = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
                     val pageKey = RecordUtils.sha256(navKey)
+                    val safeRoute = runtimeSafePath(snapshot.optString("url"))
+                    val explicitContext = ObservationEvidence.explicitContextFromDigest(digest)
+                    val expansionIdentity = ObservationEvidence.identity(
+                        ProviderId.JINHAK.wireName, safeRoute, explicitContext, digest
+                    )
+                    jinhakExpansionStateKey = expansionIdentity.observationId
+                    jinhakExpandOutgoingLinks = jinhakExpandedNavigationStates.add(expansionIdentity.observationId)
+                    if (jinhakExpandOutgoingLinks) {
+                        jinhakUniqueNavigationStates += 1
+                    } else {
+                        jinhakRepeatedNavigationStateSkips += 1
+                        recordRuntimeEvent("jinhak-repeat-state-expansion-skip", JSONObject()
+                            .put("safePath", safeRoute)
+                            .put("pageType", snapshot.optString("providerPageType")))
+                    }
                     localStore.storeUnifiedAnalysisCapture(
                         sessionId = sessionId,
                         provider = ProviderId.JINHAK.wireName,
@@ -2220,7 +2243,9 @@ class MainActivity : Activity() {
             // so collect detail URLs from every university-list page as well.
             val pageType = snapshot.optString("providerPageType")
             if (activeAction == null || pageType == "adiga-university-list") {
-                enqueueDiscoveredLinks(snapshot.optJSONArray("navigationLinks") ?: JSONArray())
+                if (provider != ProviderId.JINHAK || jinhakExpandOutgoingLinks) {
+                    enqueueDiscoveredLinks(snapshot.optJSONArray("navigationLinks") ?: JSONArray())
+                }
             }
             if (activeAction == null) {
                 if (plan != null) enqueueCalculatedPageActions(snapshot, plan)
@@ -2229,7 +2254,7 @@ class MainActivity : Activity() {
                 activeBatchPageAction = null
             }
 
-            if (provider == ProviderId.JINHAK && activeAction == null && maybeExecuteJinhakAgentAction(snapshot)) {
+            if (provider == ProviderId.JINHAK && activeAction == null && maybeExecuteJinhakAgentAction(snapshot, jinhakExpansionStateKey)) {
                 return@collectSnapshot
             }
 
@@ -2341,14 +2366,17 @@ class MainActivity : Activity() {
     }
 
 
-    private fun maybeExecuteJinhakAgentAction(snapshot: JSONObject): Boolean {
+    private fun maybeExecuteJinhakAgentAction(snapshot: JSONObject, expansionStateKey: String?): Boolean {
         if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return false
         if (jinhakAgentActionInFlight || jinhakAgentActionsExecuted >= MAX_JINHAK_AGENT_ACTIONS) return false
         val route = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
+        fun actionKeyFor(action: JinhakAgentNavigator.Candidate): String = RecordUtils.sha256(
+            "${expansionStateKey ?: runtimeSafePath(route)}|${JinhakAgentNavigator.key(route, action)}"
+        )
         val candidate = JinhakAgentNavigator.candidates(snapshot).firstOrNull { action ->
-            !jinhakAgentActionSeen.contains(JinhakAgentNavigator.key(route, action))
+            !jinhakAgentActionSeen.contains(actionKeyFor(action))
         } ?: return false
-        val actionKey = JinhakAgentNavigator.key(route, candidate)
+        val actionKey = actionKeyFor(candidate)
         jinhakAgentActionSeen.add(actionKey)
         jinhakAgentActionInFlight = true
         jinhakAgentActionsExecuted += 1
@@ -2795,6 +2823,21 @@ class MainActivity : Activity() {
             if (sessionId != null) {
                 localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId) }
                 localStore.updateUnifiedSession(sessionId, "jinhak", "running", "jinhak:$effectiveReason")
+                localStore.recordSyncState(
+                    sessionId,
+                    "JINHAK_CRAWL_DIAGNOSTICS",
+                    ProviderId.JINHAK.wireName,
+                    JSONObject()
+                        .put("attemptedSnapshots", batchPageCount)
+                        .put("successfulSnapshots", batchSnapshots.length())
+                        .put("errorEvents", batchErrors.length())
+                        .put("uniqueNavigationExpansionStates", jinhakUniqueNavigationStates)
+                        .put("repeatedNavigationStateSkips", jinhakRepeatedNavigationStateSkips)
+                        .put("agentActionsExecuted", jinhakAgentActionsExecuted)
+                        .put("cloudFrontierPublished", cloudFrontierPublished)
+                        .put("cloudFrontierClaimed", cloudFrontierClaimed),
+                    false
+                )
             }
             handler.postDelayed({ finishUnifiedCollection("jinhak:$effectiveReason") }, 350L)
         }
@@ -2835,6 +2878,8 @@ class MainActivity : Activity() {
                 .put("localAuditPagesScheduled", batchAuditPagesScheduled)
                 .put("universityDiscoveryPagesScheduled", batchUniversityDiscoveryPagesScheduled)
                 .put("jinhakAgentActionsExecuted", jinhakAgentActionsExecuted)
+                .put("jinhakUniqueNavigationStates", jinhakUniqueNavigationStates)
+                .put("jinhakRepeatedNavigationStateSkips", jinhakRepeatedNavigationStateSkips)
                 .put("cloudFrontierPublished", cloudFrontierPublished)
                 .put("cloudFrontierClaimed", cloudFrontierClaimed)
                 .put("sessionLease", sessionVault.summary(provider.wireName)?.toJson() ?: JSONObject.NULL))

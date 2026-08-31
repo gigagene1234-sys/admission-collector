@@ -12,6 +12,16 @@ object JinhakAdapter : ProviderAdapter {
     override val id = ProviderId.JINHAK
     override val supportsBatchCrawl = true
     private const val TARGET_YEAR = 2027
+    private val TABLE_EVIDENCE_PAGE_TYPES = setOf(
+        "jinhak-home",
+        "jinhak-other",
+        "jinhak-editorial-content",
+        "jinhak-admission-strategy",
+        "jinhak-admission-feature",
+        "jinhak-media-content",
+        "jinhak-curation",
+        "jinhak-university-search"
+    )
 
     override fun accepts(url: String): Boolean {
         return try {
@@ -52,6 +62,11 @@ object JinhakAdapter : ProviderAdapter {
         val pageTitle = snapshot.optString("title").replace(Regex("\\s+"), " ").trim()
         val navigationError = Regex("^(?:302\\s+Found|404\\s+Not\\s+Found|500(?:\\s+Internal\\s+Server\\s+Error)?)$", RegexOption.IGNORE_CASE).matches(pageTitle)
         val universityAdmissionInfo = Regex("^.{2,100}에 대한 모든 입시정보\\s*\\|\\s*대학정보\\s*\\|\\s*진학사$").containsMatchIn(pageTitle)
+        val strategyRoute = path.contains("/univ-entrance-info/ipsi-analysis/ipsi-strategy")
+        val featureRoute = path.contains("/univ-entrance-info/susi-special")
+        val mediaRoute = path.contains("/jinhak-tv")
+        val deepAnalysisRoute = path.contains("/univ-major/major-info/major-deep-analysis") ||
+            path.contains("/univ-entrance-info/ipsi-analysis/ipsi-deep-analysis")
         val editorialContent = Regex("(학과\\s*심층분석|대학\\s*심층분석|대학학과\\s*심층분석|지도로\\s*보는\\s*대학|대학교\\s*지도|캠퍼스맵)").containsMatchIn(pageTitle)
 
         // Global menus contain words such as 합격예측/수시저장소 on almost every page.
@@ -59,7 +74,10 @@ object JinhakAdapter : ProviderAdapter {
         val mockReport = url.contains("sapplysample") || Regex("모의지원\\s*리포트").containsMatchIn(headingText)
         val hasActual = Regex("(실제합격자\\s*(?:리포트|사례)|합격자\\s*리포트|전년도\\s*입시결과\\s*(?:리포트|상세))").containsMatchIn(headingText) ||
             Regex("(actual|admitreport|resultreport|passcase)").containsMatchIn(url)
-        val dedicatedMinimum = url.contains("esatminuniv") || Regex("(수능최저|최저학력기준)").containsMatchIn(headingText)
+        // v0.7.1 showed that broad heading-text matching mislabeled strategy/articles
+        // as a dedicated SAT-minimum tool. Only known dedicated routes may receive this type.
+        val dedicatedMinimum = url.contains("esatminuniv") ||
+            path.contains("/sat-minimum") || path.contains("/minimum-requirement")
         val scoreReport = Regex("(score|calc)").containsMatchIn(url) || Regex("성적산출\\s*리포트").containsMatchIn(headingText)
         val earlyStorage = Regex("(storage|save)").containsMatchIn(url) || Regex("(수시|정시)?\\s*저장소|저장대학").containsMatchIn(headingText)
         val universitySearch = url.contains("four-year-university/search") || Regex("대학검색").containsMatchIn(headingText)
@@ -72,7 +90,10 @@ object JinhakAdapter : ProviderAdapter {
             Regex("(login|signin|member/login)").containsMatchIn(url) || Regex("로그인.*비밀번호").containsMatchIn(headingText) -> "jinhak-login"
             navigationError -> "jinhak-navigation-error"
             universityAdmissionInfo -> "jinhak-university-admission-info"
-            editorialContent -> "jinhak-editorial-content"
+            strategyRoute -> "jinhak-admission-strategy"
+            featureRoute -> "jinhak-admission-feature"
+            mediaRoute -> "jinhak-media-content"
+            deepAnalysisRoute || editorialContent -> "jinhak-editorial-content"
             rootPage -> "jinhak-home"
             mockReport -> "jinhak-mock-support-report"
             hasActual -> "jinhak-actual-admit-report"
@@ -99,6 +120,13 @@ object JinhakAdapter : ProviderAdapter {
 
         if (pageType == "jinhak-university-admission-info") {
             return normalizeUniversityAdmissionInfo(snapshot, observedAt)
+        }
+
+        // Observation-first does not mean parser-last. v0.7.1 preserved 200+ tables but
+        // most article/home/reference tables never became spreadsheet-ready rows. Convert
+        // only explicit table cells; never invent missing university/department/admission.
+        if (pageType in TABLE_EVIDENCE_PAGE_TYPES) {
+            return normalizeTableEvidence(snapshot, pageType, observedAt)
         }
 
         if (pageType == "jinhak-early-storage" || pageType == "jinhak-recommended-university") {
@@ -188,7 +216,9 @@ object JinhakAdapter : ProviderAdapter {
         }
 
         if (pageType == "jinhak-home" || pageType == "jinhak-university-search" || pageType == "jinhak-curation" ||
-            pageType == "jinhak-other" || pageType == "jinhak-editorial-content" || pageType == "jinhak-navigation-error") {
+            pageType == "jinhak-other" || pageType == "jinhak-editorial-content" ||
+            pageType == "jinhak-admission-strategy" || pageType == "jinhak-admission-feature" ||
+            pageType == "jinhak-media-content" || pageType == "jinhak-navigation-error") {
             return result
         }
 
@@ -230,7 +260,11 @@ object JinhakAdapter : ProviderAdapter {
             result.put(summary)
         }
 
-        val generic = GenericAdmissionParser.normalize(snapshot)
+        // Generic page-wide inference is intentionally gated. v0.7.1 produced false
+        // bindings from article table headers (for example a literal 70% header becoming grade=70).
+        val generic = if (pageType in setOf("jinhak-actual-admit-report", "jinhak-score-calc-report")) {
+            GenericAdmissionParser.normalize(snapshot)
+        } else JSONArray()
         for (i in 0 until generic.length()) {
             val row = generic.optJSONObject(i) ?: continue
             row.put("providerPageType", pageType)
@@ -250,6 +284,7 @@ object JinhakAdapter : ProviderAdapter {
         "jinhak-sat-minimum" -> "current-admission"
         "jinhak-score-calc-report", "jinhak-student-basic" -> "student-profile"
         "jinhak-home", "jinhak-university-search", "jinhak-curation" -> "reference-navigation"
+        "jinhak-admission-strategy", "jinhak-admission-feature", "jinhak-editorial-content", "jinhak-media-content" -> "admission-reference"
         else -> "reference"
     }
 
@@ -380,6 +415,117 @@ object JinhakAdapter : ProviderAdapter {
             }
         }
         return RecordUtils.dedupe(result)
+    }
+
+    private fun normalizeTableEvidence(snapshot: JSONObject, pageType: String, observedAt: String): JSONArray {
+        val out = JSONArray()
+        val tables = snapshot.optJSONArray("tables") ?: return out
+        val title = snapshot.optString("title").replace(Regex("\\s+"), " ").trim()
+        val explicitUniversity = Regex("([가-힣A-Za-z0-9·.&()\\-]{2,45}(?:대학교|교육대학교|과학기술원)(?:\\([^)]+\\))?)")
+            .find(title)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
+        val titleYear = Regex("(20[0-9]{2})\\s*학년도").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?: Regex("(?<![0-9])(20[0-9]{2})(?![0-9])").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        fun cleanCell(value: String): String = value.replace(Regex("\\s+"), " ").trim().take(1200)
+        fun relevantHeader(cells: List<String>): Boolean {
+            val h = cells.joinToString(" | ")
+            val metric = Regex("(경쟁률|모의지원|합격예측|적정지원컷|평균점|모집인원|지원자|충원|충원율|50%|70%|등급|환산점수|합격선|순위)")
+            val identity = Regex("(전형|학과명|모집단위|대학명|학부|전공)")
+            return metric.containsMatchIn(h) && identity.containsMatchIn(h)
+        }
+        fun uniqueHeader(raw: String, index: Int, used: MutableSet<String>): String {
+            val base = cleanCell(raw).ifBlank { "column${index + 1}" }
+            var key = base
+            var suffix = 2
+            while (!used.add(key)) { key = "$base#$suffix"; suffix += 1 }
+            return key
+        }
+        fun numeric(raw: String): Double? = Regex("-?[0-9]+(?:\\.[0-9]+)?").find(raw.replace(",", ""))?.value?.toDoubleOrNull()
+
+        for (ti in 0 until minOf(tables.length(), 32)) {
+            val rows = tables.optJSONObject(ti)?.optJSONArray("rows") ?: continue
+            if (rows.length() < 2) continue
+            val headerRow = rows.optJSONArray(0) ?: continue
+            val headers = mutableListOf<String>()
+            val used = linkedSetOf<String>()
+            for (ci in 0 until minOf(headerRow.length(), 36)) headers += uniqueHeader(headerRow.optString(ci), ci, used)
+            if (!relevantHeader(headers)) continue
+            val headerText = headers.joinToString(" | ")
+            val tableYear = Regex("(20[0-9]{2})\\s*학년도").find(headerText)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: titleYear
+            val predictionLike = Regex("(모의지원|합격예측|적정지원컷|내\\s*점수|칸)").containsMatchIn(headerText)
+            val historicalLike = !predictionLike && (tableYear != null || Regex("(입시결과|충원|50%|70%|등급)").containsMatchIn(title + " " + headerText))
+            val scope = when {
+                predictionLike -> "current-prediction-reference"
+                historicalLike -> "historical-reference"
+                else -> "admission-reference"
+            }
+
+            for (ri in 1 until minOf(rows.length(), 220)) {
+                val row = rows.optJSONArray(ri) ?: continue
+                val cells = mutableListOf<String>()
+                for (ci in 0 until minOf(row.length(), headers.size)) cells += cleanCell(row.optString(ci))
+                if (cells.all { it.isBlank() }) continue
+                if (cells.joinToString("|") == headers.joinToString("|")) continue
+
+                val columns = JSONObject()
+                for (ci in cells.indices) if (cells[ci].isNotBlank()) columns.put(headers[ci], cells[ci])
+                if (columns.length() < 2) continue
+
+                var department: String? = null
+                var admission: String? = null
+                var combined: String? = null
+                for (ci in headers.indices) {
+                    val h = headers[ci]
+                    val v = cells.getOrNull(ci)?.takeIf { it.isNotBlank() } ?: continue
+                    when {
+                        h.contains("전형/학과") || h.contains("전형/모집단위") -> combined = v
+                        (h == "모집단위" || h.contains("학과명") || h == "학과" || h == "전공") -> department = v
+                        (h == "전형" || h.contains("전형명")) -> admission = v
+                    }
+                }
+
+                val metrics = JSONObject().put("columns", columns)
+                combined?.let { metrics.put("combinedAdmissionDepartmentLabel", it) }
+                for (ci in headers.indices) {
+                    val h = headers[ci]
+                    val v = cells.getOrNull(ci).orEmpty()
+                    val n = numeric(v) ?: continue
+                    when {
+                        h.contains("전년도") && h.contains("경쟁률") -> metrics.put("previousCompetition", n)
+                        h.contains("모의지원") && h.contains("경쟁률") -> metrics.put("mockCompetition", n)
+                        h.contains("경쟁률") -> metrics.put("competition", n)
+                        h.contains("모의지원자") && h.contains("평균점") -> metrics.put("mockApplicantAverageScore", n)
+                        h.contains("적정지원컷") || h.contains("합격예측") && h.contains("컷") -> metrics.put("predictedSupportCut", n)
+                        h.contains("모집인원") -> metrics.put("capacity", n)
+                        h.contains("지원자") -> metrics.put("applicants", n)
+                        h.contains("충원율") -> metrics.put("fillRate", n)
+                        h.contains("충원") -> metrics.put("additionalAdmits", n)
+                        h.contains("50%") -> metrics.put("cut50", n)
+                        h.contains("70%") -> metrics.put("cut70", n)
+                        h.contains("평균") && h.contains("등급") -> metrics.put("averageGrade", n)
+                    }
+                }
+
+                val record = JSONObject()
+                    .put("recordType", "jinhak-table-evidence")
+                    .put("providerPageType", pageType)
+                    .put("dataScope", scope)
+                    .put("year", tableYear ?: JSONObject.NULL)
+                    .put("university", explicitUniversity ?: JSONObject.NULL)
+                    .put("department", department ?: JSONObject.NULL)
+                    .put("admission", admission ?: JSONObject.NULL)
+                    .put("metrics", metrics)
+                    .put("observedAt", observedAt)
+                    .put("tableIndex", ti)
+                    .put("rowOrdinal", ri)
+                    .put("confidence", if (explicitUniversity != null || department != null || admission != null) "medium" else "raw")
+                    .put("sourcePage", safePath(snapshot.optString("url")))
+                    .put("rawEvidence", cells.joinToString(" | ").take(5000))
+                record.put("sourceRowFingerprint", fingerprint(record, observedAt, preserveSnapshot = predictionLike))
+                out.put(record)
+            }
+        }
+        return RecordUtils.dedupe(out)
     }
 
     private fun predictionMetrics(text: String): JSONObject {
