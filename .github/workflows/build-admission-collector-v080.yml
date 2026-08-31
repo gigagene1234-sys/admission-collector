@@ -93,7 +93,6 @@ jobs:
           snap = Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
           store = Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
 
-          # The vault may read the WebView cookie header, but it must have no networking/cloud dependency.
           if 'CloudOffload' in session or 'HttpURLConnection' in session or 'URL(' in session:
               raise SystemExit('session vault has a network/cloud dependency')
           for secret in ['password', 'csrf', 'captcha', 'raw DOM']:
@@ -102,23 +101,21 @@ jobs:
           if 'leaseId' not in session or 'UUID.randomUUID' not in session:
               raise SystemExit('opaque session lease id missing')
 
-          blocked = ['원서\\s*접수','결제','구매','저장','삭제','탈퇴','로그아웃','회원정보','제출','확정']
-          for token in blocked:
+          # Validate the semantic write/action deny-list without depending on Kotlin regex escaping.
+          for token in ['원서', '접수', '결제', '구매', '저장', '삭제', '탈퇴', '로그아웃', '회원정보', '제출', '확정']:
               if token not in agent:
                   raise SystemExit(f'missing agent block token: {token}')
           if 'input.value' in agent or 'document.cookie' in agent:
               raise SystemExit('agent reads form values or cookies')
 
-          # Cloud frontier never receives/uses an authenticated Jinhak browser session.
           if 'cookieHeader' in worker or 'document.cookie' in worker or 'sessionStorage' in worker or 'localStorage' in worker:
               raise SystemExit('worker handles browser session material')
-          if "provider === 'jinhak'" in worker and 'public_fetch_eligible' in worker.split('async function processPublicFrontier',1)[1].split('function scopeProviderFingerprint',1)[0]:
-              # Public scheduled fetch block itself must remain Adiga-only.
-              public = worker.split('async function processPublicFrontier',1)[1].split('function scopeProviderFingerprint',1)[0]
-              if "provider='adiga'" not in public:
-                  raise SystemExit('public scheduled cloud fetch is not Adiga-only')
+          public = worker.split('async function processPublicFrontier',1)[1].split('function scopeProviderFingerprint',1)[0]
+          if "provider='adiga'" not in public:
+              raise SystemExit('public scheduled cloud fetch is not Adiga-only')
+          if "provider='jinhak'" in public or 'provider="jinhak"' in public:
+              raise SystemExit('authenticated Jinhak was added to public cloud fetch')
 
-          # Existing Jinhak department Gate A remains intact: no sibling inheritance in departmentContextFor.
           if 'function departmentContextFor' not in snap or 'function universityContextFor' not in snap:
               raise SystemExit('Jinhak context functions missing')
           dept = snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
