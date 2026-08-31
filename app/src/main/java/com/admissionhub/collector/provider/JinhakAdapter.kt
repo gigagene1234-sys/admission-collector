@@ -4,6 +4,7 @@ import com.admissionhub.collector.parser.GenericAdmissionParser
 import com.admissionhub.collector.parser.RecordUtils
 import com.admissionhub.collector.jinhak.JinhakSiteTopology
 import com.admissionhub.collector.jinhak.JinhakStrategyAnalyzer
+import com.admissionhub.collector.jinhak.JinhakApplicationMission
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -19,6 +20,7 @@ object JinhakAdapter : ProviderAdapter {
         "jinhak-other",
         "jinhak-editorial-content",
         "jinhak-admission-strategy",
+        "jinhak-admission-knowledge",
         "jinhak-admission-feature",
         "jinhak-media-content",
         "jinhak-curation",
@@ -66,6 +68,7 @@ object JinhakAdapter : ProviderAdapter {
         val universityAdmissionInfo = Regex("^.{2,100}에 대한 모든 입시정보\\s*\\|\\s*대학정보\\s*\\|\\s*진학사$").containsMatchIn(pageTitle)
         val strategyRoute = path.contains("/univ-entrance-info/ipsi-analysis/ipsi-strategy")
         val featureRoute = path.contains("/univ-entrance-info/susi-special")
+        val knowledgeRoute = path.contains("/ipsi-knowledge")
         val mediaRoute = path.contains("/jinhak-tv")
         val deepAnalysisRoute = path.contains("/univ-major/major-info/major-deep-analysis") ||
             path.contains("/univ-entrance-info/ipsi-analysis/ipsi-deep-analysis")
@@ -93,6 +96,7 @@ object JinhakAdapter : ProviderAdapter {
             navigationError -> "jinhak-navigation-error"
             universityAdmissionInfo -> "jinhak-university-admission-info"
             strategyRoute -> "jinhak-admission-strategy"
+            knowledgeRoute -> "jinhak-admission-knowledge"
             featureRoute -> "jinhak-admission-feature"
             mediaRoute -> "jinhak-media-content"
             deepAnalysisRoute || editorialContent -> "jinhak-editorial-content"
@@ -115,6 +119,7 @@ object JinhakAdapter : ProviderAdapter {
         val text = GenericAdmissionParser.collectText(snapshot)
         val pageType = classify(snapshot)
         val context = GenericAdmissionParser.inferSnapshotContext(snapshot)
+        val missionContext = JinhakApplicationMission.fromJson(snapshot.optJSONObject("missionApplicationContext"))
         val observedAt = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
         val dataScope = dataScope(pageType)
         val inferredYear = context.year ?: if (dataScope == "current-prediction" || dataScope == "current-admission") TARGET_YEAR else null
@@ -124,7 +129,7 @@ object JinhakAdapter : ProviderAdapter {
             return normalizeUniversityAdmissionInfo(snapshot, observedAt)
         }
 
-        if (pageType == "jinhak-admission-strategy") {
+        if (pageType == "jinhak-admission-strategy" || pageType == "jinhak-admission-knowledge") {
             val strategy = JinhakStrategyAnalyzer.normalize(snapshot, observedAt)
             val evidence = normalizeTableEvidence(snapshot, pageType, observedAt)
             for (i in 0 until evidence.length()) strategy.put(evidence.optJSONObject(i))
@@ -165,15 +170,21 @@ object JinhakAdapter : ProviderAdapter {
                 val compactUniversity = cleanStorageUniversity(compact?.optString("university"))
                 val compactDepartment = cleanStorageDepartment(compact?.optString("department"))
                 val compactAdmission = compact?.optString("admission")?.takeIf { it.isNotBlank() }
-                val university = compactUniversity ?: cleanStorageUniversity(local.university) ?: explicitUniversity
-                val department = compactDepartment ?: cleanStorageDepartment(local.department) ?: explicitDepartment
-                val admission = compactAdmission ?: cleanStorageAdmission(local.admission, evidence)
+                val mission = JinhakApplicationMission.parseCard(evidence, explicitUniversity, explicitDepartment)
+                val university = mission?.university ?: compactUniversity ?: cleanStorageUniversity(local.university) ?: explicitUniversity
+                val department = mission?.departmentRaw ?: compactDepartment ?: cleanStorageDepartment(local.department) ?: explicitDepartment
+                val admission = mission?.admission ?: compactAdmission ?: cleanStorageAdmission(local.admission, evidence)
                 val universityContextSource = cardObj?.optString("universitySource")
                     ?.takeIf { it.isNotBlank() && it != "missing" }
                 val departmentContextSource = cardObj?.optString("departmentSource")
                     ?.takeIf { it.isNotBlank() && it != "missing" }
                 val cardMetrics = predictionMetrics(evidence)
-                compact?.optString("admissionCategory")?.takeIf { it.isNotBlank() }?.let { cardMetrics.put("admissionCategory", it) }
+                mission?.capacity?.let { if (!cardMetrics.has("capacity")) cardMetrics.put("capacity", it) }
+                mission?.admissionCategory?.let { cardMetrics.put("admissionCategory", it) }
+                mission?.campus?.let { cardMetrics.put("campus", it) }
+                mission?.departmentRaw?.let { cardMetrics.put("rawDepartmentLabel", it) }
+                mission?.parseSource?.let { cardMetrics.put("identityParseSource", it) }
+                compact?.optString("admissionCategory")?.takeIf { it.isNotBlank() && !cardMetrics.has("admissionCategory") }?.let { cardMetrics.put("admissionCategory", it) }
                 compact?.optString("combinedAdmissionDepartmentLabel")?.takeIf { it.isNotBlank() }?.let { cardMetrics.put("combinedAdmissionDepartmentLabel", it) }
                 if (evidence.contains("수능최저")) cardMetrics.put("minimumRequirementDisplayed", true)
                 val metricKeys = cardMetrics.keys().asSequence().filter { !cardMetrics.isNull(it) }.toList()
@@ -195,10 +206,12 @@ object JinhakAdapter : ProviderAdapter {
                     .put("university", university ?: JSONObject.NULL)
                     .put("department", department ?: JSONObject.NULL)
                     .put("admission", admission ?: JSONObject.NULL)
+                    .put("applicationIdentityKey", mission?.identityKey ?: JSONObject.NULL)
                     .put("metrics", cardMetrics)
                     .put("observedAt", observedAt)
                     .put("cardIndex", i)
                     .put("contextSource", when {
+                        mission?.identityKey != null -> "same-card-application-grammar"
                         compact != null -> "compact-recommendation-card"
                         local.university == null && explicitUniversity != null && local.department == null && explicitDepartment != null -> "scored-card-root+university+department-context"
                         local.university == null && explicitUniversity != null -> "scored-card-root+explicit-university-context"
@@ -211,6 +224,7 @@ object JinhakAdapter : ProviderAdapter {
                     .put("departmentContextDepth", cardObj?.optInt("departmentDepth", -1) ?: -1)
                     .put("cardRootScore", cardObj?.optInt("score", 0) ?: 0)
                     .put("confidence", when {
+                        mission != null -> mission.confidence
                         university != null && department != null && admission != null -> "high"
                         university != null && department != null -> "medium"
                         department != null -> "low"
@@ -220,18 +234,21 @@ object JinhakAdapter : ProviderAdapter {
                     .put("rawEvidence", evidence)
                 record.put("sourceRowFingerprint", fingerprint(record, observedAt, preserveSnapshot = true))
                 result.put(record)
+                if (mission?.identityKey != null) {
+                    result.put(JinhakApplicationMission.missionEvidence(mission, pageType, observedAt, safePath(snapshot.optString("url"))))
+                }
             }
             return RecordUtils.dedupe(result)
         }
 
         if (pageType == "jinhak-home" || pageType == "jinhak-university-search" || pageType == "jinhak-curation" ||
             pageType == "jinhak-other" || pageType == "jinhak-editorial-content" ||
-            pageType == "jinhak-admission-strategy" || pageType == "jinhak-admission-feature" ||
+            pageType == "jinhak-admission-strategy" || pageType == "jinhak-admission-knowledge" || pageType == "jinhak-admission-feature" ||
             pageType == "jinhak-media-content" || pageType == "jinhak-navigation-error") {
             return result
         }
 
-        val metrics = JSONObject()
+        val metrics = JinhakApplicationMission.semanticMetrics(text)
         putNumber(metrics, "universityCalculatedScore", Regex("(?:대학별\\s*)?(?:환산점수|산출점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
         putNumber(metrics, "convertedGrade", Regex("(?:반영\\s*평균등급|환산등급|내\\s*등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
         putInt(metrics, "stabilityBars", Regex("(?:합격안정성|칸수|칸\\s*수)?\\s*[:：]?\\s*([0-9]{1,2})\\s*칸").find(text)?.groupValues?.getOrNull(1))
@@ -239,7 +256,6 @@ object JinhakAdapter : ProviderAdapter {
         putInt(metrics, "capacity", Regex("(?:모집인원|모집 인원)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
         putInt(metrics, "mockApplicants", Regex("(?:모의지원자수|모의지원자 수|모의지원자)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
         putInt(metrics, "applicants", Regex("(?:현재\\s*)?(?:지원자수|지원자 수|실지원자수|실지원자 수)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
-        putNumber(metrics, "mockCompetition", Regex("(?:모의지원\\s*)?경쟁률\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
         putInt(metrics, "myRank", Regex("(?:내\\s*순위|나의\\s*순위|현재\\s*순위)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
         putNumber(metrics, "predictedCut", Regex("(?:예상\\s*합격선|예상\\s*컷|합격예상점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
         putInt(metrics, "additionalAdmits", Regex("(?:충원합격자수|충원합격자 수|충원인원|충원 인원|추가합격자수)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
@@ -253,12 +269,15 @@ object JinhakAdapter : ProviderAdapter {
                 .put("providerPageType", pageType)
                 .put("dataScope", dataScope)
                 .put("year", inferredYear ?: JSONObject.NULL)
-                .put("university", context.university ?: JSONObject.NULL)
-                .put("department", context.department ?: JSONObject.NULL)
-                .put("admission", context.admission ?: JSONObject.NULL)
+                .put("university", missionContext?.university ?: context.university ?: JSONObject.NULL)
+                .put("department", missionContext?.departmentRaw ?: context.department ?: JSONObject.NULL)
+                .put("admission", missionContext?.admission ?: context.admission ?: JSONObject.NULL)
+                .put("applicationIdentityKey", missionContext?.identityKey ?: JSONObject.NULL)
                 .put("metrics", metrics)
                 .put("observedAt", observedAt)
+                .put("contextSource", if (missionContext?.identityKey != null) "same-application-agent-mission" else "page-context")
                 .put("confidence", when {
+                    missionContext != null -> missionContext.confidence
                     context.university != null && context.department != null -> "high"
                     context.university != null || context.department != null || context.admission != null -> "medium"
                     else -> "raw"
@@ -267,6 +286,10 @@ object JinhakAdapter : ProviderAdapter {
                 .put("rawEvidence", text.take(5000))
             summary.put("sourceRowFingerprint", fingerprint(summary, observedAt, preserveSnapshot = dataScope == "current-prediction"))
             result.put(summary)
+        }
+
+        if (missionContext?.identityKey != null && JinhakApplicationMission.laneForPageType(pageType) != "reference") {
+            result.put(JinhakApplicationMission.missionEvidence(missionContext, pageType, observedAt, safePath(snapshot.optString("url"))))
         }
 
         // Generic page-wide inference is intentionally gated. v0.7.1 produced false
@@ -280,6 +303,13 @@ object JinhakAdapter : ProviderAdapter {
                 .put("dataScope", dataScope)
                 .put("observedAt", observedAt)
             if (row.isNull("year") && inferredYear != null) row.put("year", inferredYear)
+            if (missionContext?.identityKey != null) {
+                if (row.isNull("university") || row.optString("university").isBlank()) row.put("university", missionContext.university ?: JSONObject.NULL)
+                if (row.isNull("department") || row.optString("department").isBlank()) row.put("department", missionContext.departmentRaw ?: JSONObject.NULL)
+                if (row.isNull("admission") || row.optString("admission").isBlank()) row.put("admission", missionContext.admission ?: JSONObject.NULL)
+                row.put("applicationIdentityKey", missionContext.identityKey)
+                    .put("contextSource", "same-application-agent-mission")
+            }
             row.put("sourcePage", safePath(snapshot.optString("url")))
             row.put("sourceRowFingerprint", fingerprint(row, observedAt, preserveSnapshot = dataScope == "current-prediction"))
             result.put(row)
@@ -293,7 +323,7 @@ object JinhakAdapter : ProviderAdapter {
         "jinhak-sat-minimum" -> "current-admission"
         "jinhak-score-calc-report", "jinhak-student-basic" -> "student-profile"
         "jinhak-home", "jinhak-university-search", "jinhak-curation" -> "reference-navigation"
-        "jinhak-admission-strategy", "jinhak-admission-feature", "jinhak-editorial-content", "jinhak-media-content" -> "admission-reference"
+        "jinhak-admission-strategy", "jinhak-admission-knowledge", "jinhak-admission-feature", "jinhak-editorial-content", "jinhak-media-content" -> "admission-reference"
         else -> "reference"
     }
 
@@ -500,7 +530,7 @@ object JinhakAdapter : ProviderAdapter {
                     val v = cells.getOrNull(ci).orEmpty()
                     val n = numeric(v) ?: continue
                     when {
-                        h.contains("전년도") && h.contains("경쟁률") -> metrics.put("previousCompetition", n)
+                        h.contains("전년도") && h.contains("경쟁률") -> metrics.put("previousYearCompetition", n)
                         h.contains("모의지원") && h.contains("경쟁률") -> metrics.put("mockCompetition", n)
                         h.contains("경쟁률") -> metrics.put("competition", n)
                         h.contains("모의지원자") && h.contains("평균점") -> metrics.put("mockApplicantAverageScore", n)
@@ -538,25 +568,24 @@ object JinhakAdapter : ProviderAdapter {
     }
 
     private fun predictionMetrics(text: String): JSONObject {
-        val metrics = JSONObject()
-        putNumber(metrics, "universityCalculatedScore", Regex("(?:대학별\\s*)?(?:환산점수|산출점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
-        if (!metrics.has("universityCalculatedScore")) {
-            putNumber(metrics, "universityCalculatedScore", Regex("내\\s*점수\\s*([0-9]+(?:\\.[0-9]+)?)\\s*점").find(text)?.groupValues?.getOrNull(1))
-        }
-        putNumber(metrics, "convertedGrade", Regex("(?:반영\\s*평균등급|환산등급|내\\s*등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
-        putInt(metrics, "stabilityBars", Regex("(?<![0-9.])(?:합격안정성|칸수|칸\\s*수)?\\s*[:：]?\\s*([0-9]{1,2})\\s*칸").find(text)?.groupValues?.getOrNull(1))
+        val metrics = JinhakApplicationMission.semanticMetrics(text)
+        // Additional metrics are only extracted from labels whose semantics are explicit.
         putNumber(metrics, "predictionProbability", Regex("(?:예상\\s*)?(?:합격률|합격확률|합격가능성)\\s*[:：]?\\s*([0-9]{1,3}(?:\\.[0-9]+)?)\\s*%").find(text)?.groupValues?.getOrNull(1))
-        putText(metrics, "predictionLabel", Regex("(?:합격예측|합격가능성|지원판정|지원전략)?\\s*[:：]?\\s*(안정지원|안정|적정지원|적정|소신지원|소신|위험|상향|하향|불안)").find(text)?.groupValues?.getOrNull(1))
         putInt(metrics, "capacity", Regex("(?:모집인원|모집 인원)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
         if (!metrics.has("capacity")) {
             putInt(metrics, "capacity", Regex("([0-9,]+)\\s*명\\s*내\\s*점수").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
         }
-        putInt(metrics, "mockApplicants", Regex("(?:모의지원자수|모의지원자 수|모의지원자)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
         putInt(metrics, "applicants", Regex("(?:현재\\s*)?(?:지원자수|지원자 수|실지원자수|실지원자 수)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
-        putNumber(metrics, "mockCompetition", Regex("(?:모의지원\\s*)?경쟁률\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
-        putInt(metrics, "myRank", Regex("(?:내\\s*순위|나의\\s*순위|현재\\s*순위)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
-        putNumber(metrics, "predictedCut", Regex("(?:예상\\s*합격선|예상\\s*컷|합격예상점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
         putInt(metrics, "additionalAdmits", Regex("(?:충원합격자수|충원합격자 수|충원인원|충원 인원|추가합격자수)\\s*[:：]?\\s*([0-9,]+)").find(text)?.groupValues?.getOrNull(1)?.replace(",", ""))
+        if (!metrics.has("myCalculatedScore")) {
+            putNumber(metrics, "myCalculatedScore", Regex("(?:대학별\\s*)?(?:환산점수|산출점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
+            if (metrics.has("myCalculatedScore")) metrics.put("universityCalculatedScore", metrics.optDouble("myCalculatedScore"))
+        }
+        if (!metrics.has("myReflectedGrade")) {
+            putNumber(metrics, "myReflectedGrade", Regex("(?:반영\\s*평균등급|환산등급|내\\s*등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
+        }
+        val minimum = Regex("수능최저[^.\\n]{0,100}(충족가능|미충족|불충족|충족)").find(text)?.groupValues?.getOrNull(1)
+        if (!minimum.isNullOrBlank()) metrics.put("minimumStatus", minimum)
         return metrics
     }
 

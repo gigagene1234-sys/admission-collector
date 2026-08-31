@@ -404,6 +404,24 @@ object SnapshotScript {
     if(admissionTerms.test(bt)) blocks.push(bt);
   }
 
+  function applicationContextForAction(el){
+    if(!isJinhakHost||!el) return '';
+    var cur=el;
+    for(var depth=0;cur&&depth<8;depth++,cur=cur.parentElement){
+      if(!visible(cur)) continue;
+      var t=safeCloneText(cur,3000);
+      if(!t||t.length<8) continue;
+      var bars=(t.match(/[0-9]{1,2}\s*칸/g)||[]).length;
+      var capacity=/[0-9,]+\s*명\s*(?:\||\s)*내\s*점수/i.test(t);
+      var appSignal=/(학생부교과|학생부종합|지역인재|교과|종합|면접|학교장추천|고른기회)/i.test(t);
+      var metricSignal=/(내\s*점수|전년도\s*(?:수시\s*)?경쟁률|모의지원|합격예측|합격안정성)/i.test(t);
+      // More than two prediction bars almost certainly means an ancestor spanning cards.
+      if((capacity || bars===1) && appSignal && metricSignal && bars<=2 && t.length<=3000) return t;
+      if(bars>2 || t.length>5200) break;
+    }
+    return '';
+  }
+
   var nav=[];
   var resources=[];
   var pageActions=[];
@@ -457,13 +475,13 @@ object SnapshotScript {
 
     if(isJinhakHost && agentActions.length<160){
       var agentBlocked=/(원서\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰)/i;
-      var agentAllowed=/(상세|보기|조회|검색|리포트|대학\s*정보|전형\s*정보|학과\s*정보|합격\s*예측|모의\s*지원|수시\s*저장소|정시\s*저장소|추천\s*대학|성적\s*분석|다음|더보기|결과|탭)/i;
+      var agentAllowed=/(실제\s*합격자|과거\s*입시결과|입시\s*결과|합격\s*예측\s*리포트|모의\s*지원\s*리포트|지원자\s*분포|대학.?학과별\s*합격\s*예측|합격\s*안정성|상세|보기|조회|검색|리포트|대학\s*정보|전형\s*정보|학과\s*정보|합격\s*예측|모의\s*지원|수시\s*저장소|정시\s*저장소|추천\s*대학|성적\s*분석|입시\s*전략|입시\s*지식|경쟁률|모집\s*요강|다음|더보기|결과|탭)/i;
       var role=cleanText(a.getAttribute('role')||'');
       var dynamicControl=!route || role==='tab' || a.tagName==='BUTTON';
       if(dynamicControl && label && !agentBlocked.test(label+' '+meta2) && agentAllowed.test(label)){
         var ak=li+'|'+label+'|'+String(a.tagName||'')+'|'+role;
         if(!seenAgentAction[ak]){
-          agentActions.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:role==='tab'?'tab-navigation':'read-navigation'});
+          agentActions.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:role==='tab'?'tab-navigation':'read-navigation',contextText:applicationContextForAction(a)});
           seenAgentAction[ak]=1;
         }
       }

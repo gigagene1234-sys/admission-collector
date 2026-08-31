@@ -35,6 +35,7 @@ import com.admissionhub.collector.observation.ObservationEvidence
 import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
 import com.admissionhub.collector.jinhak.JinhakAgentNavigator
 import com.admissionhub.collector.jinhak.JinhakSiteTopology
+import com.admissionhub.collector.jinhak.JinhakApplicationMission
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.provider.ProviderCapabilities
 import com.admissionhub.collector.provider.ProviderCapability
@@ -147,6 +148,12 @@ class MainActivity : Activity() {
     private var jinhakUniqueNavigationStates = 0
     private var jinhakAgentActionInFlight = false
     private var jinhakAgentActionsExecuted = 0
+    private var jinhakMissionContext: JinhakApplicationMission.Context? = null
+    private var jinhakMissionOriginRoute = ""
+    private var jinhakMissionNeedsReturn = false
+    private var jinhakApplicationBoundActions = 0
+    private var jinhakApplicationMissionReturns = 0
+    private val jinhakMissionCoverage = linkedMapOf<String, MutableSet<String>>()
     private val cloudFrontierTaskIds = linkedMapOf<String, String>()
     private var cloudFrontierClaimInProgress = false
     private var cloudFrontierClaimAttempts = 0
@@ -178,8 +185,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_AGENT_ACTIONS = 180
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.8.1"
-        private const val BUILD_CODE = 10810
+        private const val VERSION = "0.8.2"
+        private const val BUILD_CODE = 10820
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1131,6 +1138,12 @@ class MainActivity : Activity() {
         jinhakUniqueNavigationStates = 0
         jinhakAgentActionInFlight = false
         jinhakAgentActionsExecuted = 0
+        jinhakMissionContext = null
+        jinhakMissionOriginRoute = ""
+        jinhakMissionNeedsReturn = false
+        jinhakApplicationBoundActions = 0
+        jinhakApplicationMissionReturns = 0
+        jinhakMissionCoverage.clear()
         cloudFrontierTaskIds.clear()
         cloudFrontierClaimInProgress = false
         cloudFrontierClaimAttempts = 0
@@ -1672,6 +1685,7 @@ class MainActivity : Activity() {
         "jinhak-sat-minimum",
         "jinhak-student-basic",
         "jinhak-university-search",
+        "jinhak-admission-knowledge",
         "jinhak-recommended-university",
         "jinhak-university-admission-info"
     )
@@ -2120,6 +2134,9 @@ class MainActivity : Activity() {
             }
             batchSessionSyncRetries = 0
 
+            if (provider == ProviderId.JINHAK) {
+                jinhakMissionContext?.let { snapshot.put("missionApplicationContext", it.toJson()) }
+            }
             val plan = if (activeAction == null) currentAdapter().paginationPlan(snapshot) else null
             val duplicateOfYear = plan?.let { duplicateYearViewOf(it) }
             if (duplicateOfYear != null && plan != null) {
@@ -2143,7 +2160,23 @@ class MainActivity : Activity() {
             if (plan != null) registerListFingerprint(plan)
 
             val pageRecords = normalizeSnapshot(snapshot)
-            if (provider == ProviderId.JINHAK) jinhakConsecutiveStalls = 0
+            if (provider == ProviderId.JINHAK) {
+                jinhakConsecutiveStalls = 0
+                val mission = jinhakMissionContext
+                val missionKey = mission?.identityKey
+                if (missionKey != null) {
+                    val lane = JinhakApplicationMission.laneForPageType(snapshot.optString("providerPageType"))
+                    if (lane != "reference") jinhakMissionCoverage.getOrPut(missionKey) { linkedSetOf() }.add(lane)
+                }
+                // Saved-application records themselves seed the coverage ledger even before a report is opened.
+                for (ri in 0 until pageRecords.length()) {
+                    val r = pageRecords.optJSONObject(ri) ?: continue
+                    val key = r.optString("applicationIdentityKey").takeIf { it.isNotBlank() && it != "null" } ?: continue
+                    if (r.optString("recordType") == "jinhak-saved-application-prediction") {
+                        jinhakMissionCoverage.getOrPut(key) { linkedSetOf() }.add("saved-application")
+                    }
+                }
+            }
             var jinhakExpansionStateKey: String? = null
             var jinhakExpandOutgoingLinks = true
             if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
@@ -2256,6 +2289,9 @@ class MainActivity : Activity() {
             }
 
             if (provider == ProviderId.JINHAK && activeAction == null && maybeExecuteJinhakAgentAction(snapshot, jinhakExpansionStateKey)) {
+                return@collectSnapshot
+            }
+            if (provider == ProviderId.JINHAK && activeAction == null && maybeReturnToJinhakMissionOrigin(snapshot)) {
                 return@collectSnapshot
             }
 
@@ -2374,19 +2410,44 @@ class MainActivity : Activity() {
         fun actionKeyFor(action: JinhakAgentNavigator.Candidate): String = RecordUtils.sha256(
             "${expansionStateKey ?: runtimeSafePath(route)}|${JinhakAgentNavigator.key(route, action)}"
         )
-        val candidate = JinhakAgentNavigator.candidates(snapshot).firstOrNull { action ->
-            !jinhakAgentActionSeen.contains(actionKeyFor(action))
+        val candidates = JinhakAgentNavigator.candidates(snapshot)
+        val currentMissionKey = jinhakMissionContext?.identityKey
+        val candidate = candidates.firstOrNull { action ->
+            if (jinhakAgentActionSeen.contains(actionKeyFor(action))) return@firstOrNull false
+            val actionMissionKey = action.applicationContext?.identityKey
+            // While inside a mission report, do not jump directly to a DIFFERENT application card.
+            currentMissionKey == null || actionMissionKey == null || actionMissionKey == currentMissionKey
         } ?: return false
         val actionKey = actionKeyFor(candidate)
         jinhakAgentActionSeen.add(actionKey)
+
+        val actionMission = candidate.applicationContext
+        if (actionMission?.identityKey != null) {
+            if (jinhakMissionContext?.identityKey != actionMission.identityKey) {
+                jinhakMissionContext = actionMission
+                jinhakMissionOriginRoute = route
+            }
+            jinhakMissionNeedsReturn = true
+            jinhakApplicationBoundActions += 1
+            jinhakMissionCoverage.getOrPut(actionMission.identityKey) { linkedSetOf() }.add("saved-application")
+            recordRuntimeEvent("jinhak-application-mission-start", JSONObject()
+                .put("applicationIdentityHash", actionMission.identityKey.take(24))
+                .put("missionPriority", candidate.missionPriority)
+                .put("safePath", runtimeSafePath(route)))
+        } else if (jinhakMissionContext?.identityKey != null) {
+            // A report tab may not repeat the application card. The already-bound mission stays active.
+            jinhakMissionNeedsReturn = true
+        }
+
         jinhakAgentActionInFlight = true
         jinhakAgentActionsExecuted += 1
         currentBatchTarget = route.ifBlank { currentBatchTarget }
-        status.text = "진학사 에이전트 직접 탐색 ${jinhakAgentActionsExecuted}/$MAX_JINHAK_AGENT_ACTIONS · ${candidate.label.take(48)}"
+        status.text = "진학사 지원안 미션 ${jinhakAgentActionsExecuted}/$MAX_JINHAK_AGENT_ACTIONS · ${candidate.label.take(48)}"
         recordRuntimeEvent("jinhak-agent-action", JSONObject()
             .put("safePath", runtimeSafePath(route))
             .put("label", candidate.label.take(80))
-            .put("kind", candidate.kind))
+            .put("kind", candidate.kind)
+            .put("applicationBound", jinhakMissionContext?.identityKey != null))
         webView.evaluateJavascript(JinhakAgentNavigator.executionScript(candidate)) { encoded ->
             val result = runCatching { JSONObject(decodeJsString(encoded)) }.getOrNull() ?: JSONObject()
             jinhakAgentActionInFlight = false
@@ -2394,13 +2455,36 @@ class MainActivity : Activity() {
             if (result.optBoolean("ok", false)) {
                 handler.postDelayed({
                     if (!batchRunning || batchPausedForLogin || batchCollecting) return@postDelayed
-                    val now = canonicalizeBatchUrl(webView.url.orEmpty())
-                    if (now == route || sameBatchDocument(now, route)) scheduleBatchSnapshot()
+                    scheduleBatchSnapshot()
                 }, 1100L)
             } else {
                 handler.postDelayed({ loadNextBatchPage() }, 120L)
             }
         }
+        return true
+    }
+
+    private fun maybeReturnToJinhakMissionOrigin(snapshot: JSONObject): Boolean {
+        val mission = jinhakMissionContext ?: return false
+        if (!jinhakMissionNeedsReturn || mission.identityKey == null || jinhakMissionOriginRoute.isBlank()) return false
+        val origin = jinhakMissionOriginRoute
+        val current = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
+        jinhakApplicationMissionReturns += 1
+        recordRuntimeEvent("jinhak-application-mission-return", JSONObject()
+            .put("applicationIdentityHash", mission.identityKey.take(24))
+            .put("fromSafePath", runtimeSafePath(current))
+            .put("toSafePath", runtimeSafePath(origin))
+            .put("coverageLanes", jinhakMissionCoverage[mission.identityKey]?.size ?: 0))
+        // Clear before navigation so the next storage snapshot cannot inherit the previous application.
+        jinhakMissionContext = null
+        jinhakMissionOriginRoute = ""
+        jinhakMissionNeedsReturn = false
+        currentBatchTarget = origin
+        status.text = "지원안 리포트 탐색 종료: 수시저장소 카드로 복귀해 다음 미션을 계속합니다."
+        handler.postDelayed({
+            if (!batchRunning || batchPausedForLogin) return@postDelayed
+            if (webView.canGoBack() && current != origin) webView.goBack() else webView.loadUrl(origin)
+        }, 180L)
         return true
     }
 
@@ -2436,6 +2520,9 @@ class MainActivity : Activity() {
             val next = canonicalizeBatchUrl(nextRaw)
             batchQueued.remove(next)
             if (next.isBlank() || batchVisited.contains(next) || !isProviderUrl(next)) continue
+            jinhakMissionContext = null
+            jinhakMissionOriginRoute = ""
+            jinhakMissionNeedsReturn = false
             currentBatchTarget = next
             status.text = "다음 입시정보 페이지 탐색: ${safeDisplayUrl(next)}"
             webView.loadUrl(next)
@@ -2835,6 +2922,15 @@ class MainActivity : Activity() {
                         .put("uniqueNavigationExpansionStates", jinhakUniqueNavigationStates)
                         .put("repeatedNavigationStateSkips", jinhakRepeatedNavigationStateSkips)
                         .put("agentActionsExecuted", jinhakAgentActionsExecuted)
+                        .put("applicationBoundAgentActions", jinhakApplicationBoundActions)
+                        .put("applicationMissionReturns", jinhakApplicationMissionReturns)
+                        .put("applicationMissionIdentities", jinhakMissionCoverage.size)
+                        .put("applicationMissionCoverage", JSONObject().apply {
+                            val lanes = listOf("saved-application", "current-prediction", "mock-support", "actual-admit", "university-result", "score-analysis", "strategy")
+                            for (lane in lanes) put(lane, jinhakMissionCoverage.values.count { it.contains(lane) })
+                            put("fourOrMoreLanes", jinhakMissionCoverage.values.count { it.size >= 4 })
+                            put("sixOrMoreLanes", jinhakMissionCoverage.values.count { it.size >= 6 })
+                        })
                         .put("cloudFrontierPublished", cloudFrontierPublished)
                         .put("cloudFrontierClaimed", cloudFrontierClaimed),
                     false
@@ -2879,6 +2975,9 @@ class MainActivity : Activity() {
                 .put("localAuditPagesScheduled", batchAuditPagesScheduled)
                 .put("universityDiscoveryPagesScheduled", batchUniversityDiscoveryPagesScheduled)
                 .put("jinhakAgentActionsExecuted", jinhakAgentActionsExecuted)
+                .put("jinhakApplicationBoundActions", jinhakApplicationBoundActions)
+                .put("jinhakApplicationMissionReturns", jinhakApplicationMissionReturns)
+                .put("jinhakApplicationMissionIdentities", jinhakMissionCoverage.size)
                 .put("jinhakUniqueNavigationStates", jinhakUniqueNavigationStates)
                 .put("jinhakRepeatedNavigationStateSkips", jinhakRepeatedNavigationStateSkips)
                 .put("cloudFrontierPublished", cloudFrontierPublished)
