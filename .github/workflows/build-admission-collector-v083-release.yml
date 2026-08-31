@@ -1,0 +1,104 @@
+name: Build Admission Collector v0.8.3 Corrected Release
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v083-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Generate corrected v0.8.3
+        run: |
+          python3 scripts/fix_v083_patch_anchors_v2.py
+          python3 scripts/fix_v083_on_destroy_patch.py
+          python3 scripts/apply_v083_concurrent_slow_lane.py
+      - name: Verify source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          SLOW=app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt
+          STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
+          SNAP=app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          grep -q 'VERSION = "0.8.3"' "$MAIN"
+          grep -q 'BUILD_CODE = 10830' "$MAIN"
+          grep -q 'JINHAK_SLOW_ESCALATION_MS = 35_000L' "$MAIN"
+          test "$(grep -c 'override fun onDestroy()' "$MAIN")" = 1
+          grep -q 'slowLanePool.destroy()' "$MAIN"
+          grep -q 'DEFAULT_MAX_WORKERS = 2' "$SLOW"
+          grep -q 'STALL_CHECK_AFTER_MS = 90_000L' "$SLOW"
+          grep -q 'STALL_NO_PROGRESS_MS = 18_000L' "$SLOW"
+          grep -q 'HARD_MAX_MS = 120_000L' "$SLOW"
+          grep -q 'slowLanePool.hasWork()' "$MAIN"
+          grep -q 'missionContext = mission?.toJson()' "$MAIN"
+          grep -q 'collectionTransport", "concurrent-slow-lane"' "$MAIN"
+          grep -q 'contractVersion\\\":3' "$STORE"
+          grep -q 'mission-link-navigation' "$SNAP"
+          test "$(grep -c 'JINHAK_ABSOLUTE_TARGET_MS' "$MAIN" || true)" = 0
+          test "$(grep -c 'jinhak-absolute-target-timeout' "$MAIN" || true)" = 0
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          slow=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt').read_text()
+          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          for pat in [r'document\s*\.\s*cookie',r'(?:window\s*\.\s*)?localStorage\s*(?:\.|\[)',r'(?:window\s*\.\s*)?sessionStorage\s*(?:\.|\[)',r'querySelector[^\n]{0,160}\.value',r'getElementById[^\n]{0,160}\.value',r'\binput\s*\.\s*value']:
+              if re.search(pat, slow): raise SystemExit('forbidden slow-lane browser material access: '+pat)
+          for token in ['slow-lane-user-action-required','slow-lane-hard-max','slow-lane-no-progress','mission-action-not-found']:
+              if token not in slow: raise SystemExit('missing boundary '+token)
+          dept=snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
+          if 'previousElementSibling' in dept or 'nextElementSibling' in dept: raise SystemExit('cross-card inheritance')
+          PY
+      - uses: actions/setup-java@v5
+        with: {distribution: temurin, java-version: '17'}
+      - name: Restore signing
+        run: |
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: '8.7'}
+      - name: Build
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Verify APK
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "versionCode='10830'" /tmp/badging.txt
+          grep -q "versionName='0.8.3'" /tmp/badging.txt
+          grep -q "application-label:'Admission Collector v0.8.3 Concurrent Slow Lane'" /tmp/badging.txt
+          sha256sum "$APK" | tee /tmp/apk.sha256
+      - name: Commit generated source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt app/src/main/AndroidManifest.xml
+          if ! git diff --cached --quiet; then
+            git commit -m "Implement v0.8.3 concurrent slow lane"
+            git push origin HEAD:main
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-v0.8.3-concurrent-slow-lane-release
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
