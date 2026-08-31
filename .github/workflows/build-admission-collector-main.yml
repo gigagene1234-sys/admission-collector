@@ -36,8 +36,7 @@ jobs:
           manifest = Path('app/src/main/AndroidManifest.xml').read_text()
           def one(pattern, text, label):
               m = re.search(pattern, text)
-              if not m:
-                  raise SystemExit(f'missing {label}')
+              if not m: raise SystemExit(f'missing {label}')
               return m.group(1)
           main_version = one(r'private const val VERSION = "([^"]+)"', main, 'MainActivity VERSION')
           main_build = int(one(r'private const val BUILD_CODE = (\d+)', main, 'MainActivity BUILD_CODE'))
@@ -52,7 +51,7 @@ jobs:
           print(f'Committed version verified: {main_version} ({main_build}) / {label}')
           PY
 
-      - name: Verify architecture and v0.8.2 semantics
+      - name: Verify architecture and v0.8.3 mission-first semantics
         shell: bash
         run: |
           set -euo pipefail
@@ -72,24 +71,31 @@ jobs:
           grep -q 'override val supportsBatchCrawl = true' "$ADAPTER"
           grep -q 'PUBLIC_DETERMINISTIC_COLLECTION' app/src/main/java/com/admissionhub/collector/provider/ProviderCapability.kt
           grep -q 'JINHAK_AUTONOMOUS_CRAWL' "$SYNC"
+          grep -q 'JINHAK_USER_CONSENT_REQUIRED' "$SYNC"
           grep -q 'assistant-xlsx-dashboard-generation' "$STORE"
           grep -q 'contractVersion\\\":3' "$STORE"
           grep -q 'ApplicationMissions' "$STORE"
           grep -q 'applicationIdentityKey' "$STORE"
 
           grep -q 'same-card-admission-capacity-boundary' "$MISSION"
+          grep -q 'stripCardUiPrefix' "$MISSION"
           grep -q 'previousYearCompetition' "$MISSION"
           grep -q 'mockCompetition' "$MISSION"
           grep -q 'myCalculatedScore' "$MISSION"
           grep -q 'myReflectedGrade' "$MISSION"
           grep -q 'mockApplicantAverageScore' "$MISSION"
           grep -q 'mockApplicantAverageGrade' "$MISSION"
-          grep -q 'contextText:applicationContextForAction(a)' "$SNAP"
+          grep -q 'mission-link-navigation' "$SNAP"
+          grep -q 'if(missionLinkBound) continue;' "$SNAP"
+          grep -q 'jinhak-ai-diagnosis-consent' "$SNAP"
           grep -q 'missionApplicationContext' "$MAIN"
           grep -q 'maybeReturnToJinhakMissionOrigin' "$MAIN"
           grep -q 'applicationMissionCoverage' "$MAIN"
+          grep -q 'applicationAnchorActionsDiscovered' "$MAIN"
+          grep -q 'secondsToFirstPopulatedStorage' "$MAIN"
+          grep -q 'jinhakConsentGatesEncountered' "$MAIN"
           grep -q 'jinhak-application-mission-evidence' "$MISSION"
-          grep -q 'jinhak-admission-knowledge' "$ADAPTER"
+          grep -q 'jinhak-application-unbound-observation' "$ADAPTER"
 
           python3 - <<'PY'
           from pathlib import Path
@@ -104,6 +110,14 @@ jobs:
           if 'putNumber(metrics, "mockCompetition"' in adapter: raise SystemExit('broad mockCompetition semantic corruption')
           if 'metrics.put("previousCompetition"' in adapter: raise SystemExit('legacy previousCompetition remains')
           if '철도차량시스템공학과' in mission: raise SystemExit('raw mission parser invents canonical department')
+          if 'jinhak-application-unbound-observation' not in adapter or 'same-card-application-identity-incomplete' not in adapter:
+              raise SystemExit('partial application identity is not preserved separately')
+          if 'mission-link-navigation' not in snap or 'missionLinkBound=missionLink' not in snap:
+              raise SystemExit('same-card anchor report is not mission-bound')
+          if 'if(missionLinkBound) continue;' not in snap:
+              raise SystemExit('mission anchor leaks into generic navigation queue')
+          if 'jinhak-ai-diagnosis-consent' not in snap or 'JINHAK_USER_CONSENT_REQUIRED' not in main:
+              raise SystemExit('provider consent gate is not represented as explicit user action')
           for token in ['document.cookie','localStorage','sessionStorage','input.value','location.href','fetch(','XMLHttpRequest']:
               if token in probe: raise SystemExit('capability probe reads forbidden material: '+token)
           dept=snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
@@ -111,7 +125,7 @@ jobs:
           ctx=snap.split('function applicationContextForAction',1)[1].split('var nav=[]',1)[0]
           for token in ['document.cookie','localStorage','sessionStorage','.value','input.value']:
               if token in ctx: raise SystemExit('mission context reads forbidden material: '+token)
-          for token in ['원서','접수','결제','저장','삭제','로그아웃','제출','확정']:
+          for token in ['원서','접수','결제','저장','삭제','로그아웃','제출','확정','동의','미동의']:
               if token not in agent: raise SystemExit('agent safety boundary missing: '+token)
           for token in ['JINHAK_ABSOLUTE_TARGET_MS = 35_000L','onRenderProcessGone','installRuntimeCrashGuard','onTrimMemory','localStore.writeUnifiedExport(streamSession, writer)']:
               if token not in main: raise SystemExit('runtime/memory guard missing: '+token)
