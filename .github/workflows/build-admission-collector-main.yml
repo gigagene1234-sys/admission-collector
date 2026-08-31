@@ -78,6 +78,19 @@ jobs:
           grep -q 'assistant-xlsx-dashboard-generation' "$STORE"
           grep -q 'recommendedWorkbookSheets' "$STORE"
 
+          # v0.8.0 post-v0.7.1 quality gates.
+          grep -q 'jinhakExpandedNavigationStates' "$MAIN"
+          grep -q 'jinhakRepeatedNavigationStateSkips' "$MAIN"
+          grep -q 'uniqueNavigationExpansionStates' "$MAIN"
+          grep -q 'jinhak-admission-strategy' "$ADAPTER"
+          grep -q 'jinhak-admission-feature' "$ADAPTER"
+          grep -q 'jinhak-media-content' "$ADAPTER"
+          grep -q 'normalizeTableEvidence' "$ADAPTER"
+          grep -q 'jinhak-table-evidence' "$ADAPTER"
+          grep -q 'errorEvidence' "$STORE"
+          grep -q 'syncDiagnostics' "$STORE"
+          grep -q 'contractVersion\\\":2' "$STORE"
+
       - name: Verify privacy observation and memory boundaries
         shell: bash
         run: |
@@ -104,6 +117,10 @@ jobs:
                   raise SystemExit(f'missing runtime/memory guard: {token}')
           if 'writeObservations' not in store or 'doNotInferMissingBindings' not in store:
               raise SystemExit('analysis-ready observation export regression')
+          if 'pageType in setOf("jinhak-actual-admit-report", "jinhak-score-calc-report")' not in adapter:
+              raise SystemExit('generic Jinhak parser is not page-type gated')
+          if 'url.contains("esatminuniv") || Regex("(수능최저|최저학력기준)").containsMatchIn(headingText)' in adapter:
+              raise SystemExit('broad SAT-minimum heading fallback reintroduced')
           PY
 
       - name: Set up JDK 17
