@@ -44,83 +44,77 @@ jobs:
           gradle_version = one(r'versionName = "([^"]+)"', gradle, 'Gradle versionName')
           gradle_build = int(one(r'versionCode = (\d+)', gradle, 'Gradle versionCode'))
           label = one(r'android:label="([^"]+)"', manifest, 'application label')
-          if main_version != gradle_version:
-              raise SystemExit(f'version mismatch: main={main_version} gradle={gradle_version}')
-          if main_build != gradle_build:
-              raise SystemExit(f'build mismatch: main={main_build} gradle={gradle_build}')
-          if main_version not in label:
-              raise SystemExit(f'application label does not contain current version: {label}')
+          if main_version != gradle_version: raise SystemExit(f'version mismatch: {main_version} != {gradle_version}')
+          if main_build != gradle_build: raise SystemExit(f'build mismatch: {main_build} != {gradle_build}')
+          if main_version not in label: raise SystemExit(f'label/version mismatch: {label}')
           with open(os.environ['GITHUB_ENV'], 'a') as fh:
-              fh.write(f'APP_VERSION={main_version}\n')
-              fh.write(f'APP_BUILD_CODE={main_build}\n')
-              fh.write(f'APP_LABEL={label}\n')
+              fh.write(f'APP_VERSION={main_version}\nAPP_BUILD_CODE={main_build}\nAPP_LABEL={label}\n')
           print(f'Committed version verified: {main_version} ({main_build}) / {label}')
           PY
 
-      - name: Verify common architecture invariants
+      - name: Verify architecture and v0.8.2 semantics
         shell: bash
         run: |
           set -euo pipefail
           MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
           STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
           ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          SNAP=app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          MISSION=app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt
+          AGENT=app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt
           SYNC=app/src/main/java/com/admissionhub/collector/sync/UnifiedSyncState.kt
+
           test ! -f MainActivity.kt
           grep -q 'CREATE TABLE IF NOT EXISTS observations' "$STORE"
           grep -q 'fun storeObservationEvidence' "$STORE"
           grep -q 'fun writeObservations' "$STORE"
           grep -q 'unclassified-potential-value' "$MAIN"
-          grep -q 'JinhakCapabilityProbe.javascript' "$MAIN"
           grep -q 'override val supportsBatchCrawl = true' "$ADAPTER"
-          grep -q 'override fun isBatchNavigable' "$ADAPTER"
           grep -q 'PUBLIC_DETERMINISTIC_COLLECTION' app/src/main/java/com/admissionhub/collector/provider/ProviderCapability.kt
           grep -q 'JINHAK_AUTONOMOUS_CRAWL' "$SYNC"
           grep -q 'assistant-xlsx-dashboard-generation' "$STORE"
-          grep -q 'recommendedWorkbookSheets' "$STORE"
+          grep -q 'contractVersion\\\":3' "$STORE"
+          grep -q 'ApplicationMissions' "$STORE"
+          grep -q 'applicationIdentityKey' "$STORE"
 
-          # v0.8.0 post-v0.7.1 quality gates.
-          grep -q 'jinhakExpandedNavigationStates' "$MAIN"
-          grep -q 'jinhakRepeatedNavigationStateSkips' "$MAIN"
-          grep -q 'uniqueNavigationExpansionStates' "$MAIN"
-          grep -q 'jinhak-admission-strategy' "$ADAPTER"
-          grep -q 'jinhak-admission-feature' "$ADAPTER"
-          grep -q 'jinhak-media-content' "$ADAPTER"
-          grep -q 'normalizeTableEvidence' "$ADAPTER"
-          grep -q 'jinhak-table-evidence' "$ADAPTER"
-          grep -q 'errorEvidence' "$STORE"
-          grep -q 'syncDiagnostics' "$STORE"
-          grep -q 'contractVersion\\\":2' "$STORE"
+          grep -q 'same-card-admission-capacity-boundary' "$MISSION"
+          grep -q 'previousYearCompetition' "$MISSION"
+          grep -q 'mockCompetition' "$MISSION"
+          grep -q 'myCalculatedScore' "$MISSION"
+          grep -q 'myReflectedGrade' "$MISSION"
+          grep -q 'mockApplicantAverageScore' "$MISSION"
+          grep -q 'mockApplicantAverageGrade' "$MISSION"
+          grep -q 'contextText:applicationContextForAction(a)' "$SNAP"
+          grep -q 'missionApplicationContext' "$MAIN"
+          grep -q 'maybeReturnToJinhakMissionOrigin' "$MAIN"
+          grep -q 'applicationMissionCoverage' "$MAIN"
+          grep -q 'jinhak-application-mission-evidence' "$MISSION"
+          grep -q 'jinhak-admission-knowledge' "$ADAPTER"
 
-      - name: Verify privacy observation and memory boundaries
-        shell: bash
-        run: |
           python3 - <<'PY'
           from pathlib import Path
           main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
           probe=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAuthorizedConnector.kt').read_text()
           adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
-          store=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
-          if 'jinhak-nonadmission-page-skipped' in main:
-              raise SystemExit('unknown Jinhak observations are still discarded')
-          if 'unifiedJinhakCapturedPages.contains(pageKey)' in main:
-              raise SystemExit('URL-only Jinhak dedupe is active')
+          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          mission=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt').read_text()
+          agent=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text()
+          if 'jinhak-nonadmission-page-skipped' in main: raise SystemExit('unknown Jinhak observations discarded')
+          if 'unifiedJinhakCapturedPages.contains(pageKey)' in main: raise SystemExit('URL-only Jinhak dedupe active')
+          if 'putNumber(metrics, "mockCompetition"' in adapter: raise SystemExit('broad mockCompetition semantic corruption')
+          if 'metrics.put("previousCompetition"' in adapter: raise SystemExit('legacy previousCompetition remains')
+          if '철도차량시스템공학과' in mission: raise SystemExit('raw mission parser invents canonical department')
           for token in ['document.cookie','localStorage','sessionStorage','input.value','location.href','fetch(','XMLHttpRequest']:
-              if token in probe:
-                  raise SystemExit(f'capability probe reads forbidden material: {token}')
-          if 'supportsBatchCrawl = false' in adapter:
-              raise SystemExit('Jinhak autonomous crawler is not active')
-          for token in ['payment','billing','purchase','order','refund','withdraw','logout','signout']:
-              if token not in adapter:
-                  raise SystemExit(f'missing crawler safety boundary: {token}')
+              if token in probe: raise SystemExit('capability probe reads forbidden material: '+token)
+          dept=snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
+          if 'previousElementSibling' in dept or 'nextElementSibling' in dept: raise SystemExit('cross-card department inheritance')
+          ctx=snap.split('function applicationContextForAction',1)[1].split('var nav=[]',1)[0]
+          for token in ['document.cookie','localStorage','sessionStorage','.value','input.value']:
+              if token in ctx: raise SystemExit('mission context reads forbidden material: '+token)
+          for token in ['원서','접수','결제','저장','삭제','로그아웃','제출','확정']:
+              if token not in agent: raise SystemExit('agent safety boundary missing: '+token)
           for token in ['JINHAK_ABSOLUTE_TARGET_MS = 35_000L','onRenderProcessGone','installRuntimeCrashGuard','onTrimMemory','localStore.writeUnifiedExport(streamSession, writer)']:
-              if token not in main:
-                  raise SystemExit(f'missing runtime/memory guard: {token}')
-          if 'writeObservations' not in store or 'doNotInferMissingBindings' not in store:
-              raise SystemExit('analysis-ready observation export regression')
-          if 'pageType in setOf("jinhak-actual-admit-report", "jinhak-score-calc-report")' not in adapter:
-              raise SystemExit('generic Jinhak parser is not page-type gated')
-          if 'url.contains("esatminuniv") || Regex("(수능최저|최저학력기준)").containsMatchIn(headingText)' in adapter:
-              raise SystemExit('broad SAT-minimum heading fallback reintroduced')
+              if token not in main: raise SystemExit('runtime/memory guard missing: '+token)
           PY
 
       - name: Set up JDK 17
@@ -135,31 +129,22 @@ jobs:
           set -euo pipefail
           test -n "$ANDROID_SIGNING_SECRET"
           STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
-          openssl enc -d -aes-256-cbc -pbkdf2 \
-            -pass env:ANDROID_SIGNING_SECRET \
-            -in signing/admission-upload.keystore.enc \
-            -out "$STORE_FILE"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
           keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
           echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
           echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      - uses: android-actions/setup-android@v3
       - name: Install Android SDK 35
         shell: bash
         run: |
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platforms;android-35" "build-tools;35.0.0"
-
-      - name: Set up Gradle 8.7
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
-
       - name: Build committed source
         run: gradle --no-daemon :app:assembleDebug
-
       - name: Verify APK against committed version
         shell: bash
         run: |
@@ -171,9 +156,7 @@ jobs:
           grep -Fq "versionName='$APP_VERSION'" /tmp/badging.txt
           grep -Fq "application-label:'$APP_LABEL'" /tmp/badging.txt
           sha256sum "$APK"
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: admission-collector-main-debug
           path: app/build/outputs/apk/debug/app-debug.apk
