@@ -34,6 +34,7 @@ import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.observation.ObservationEvidence
 import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
 import com.admissionhub.collector.jinhak.JinhakAgentNavigator
+import com.admissionhub.collector.jinhak.JinhakSiteTopology
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.provider.ProviderCapabilities
 import com.admissionhub.collector.provider.ProviderCapability
@@ -177,8 +178,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_AGENT_ACTIONS = 180
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.8.0"
-        private const val BUILD_CODE = 10800
+        private const val VERSION = "0.8.1"
+        private const val BUILD_CODE = 10810
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -905,7 +906,7 @@ class MainActivity : Activity() {
         batchButton.text = "진학사 자동 탐색 준비"
         diagnosticButton.text = "진학사 전체 분석 전송"
         unifiedButton.text = "통합 수집 종료"
-        status.text = "통합 수집 2/2 · 진학사 자동 크롤러 준비: 로그인 세션을 유지한 채 접근 가능한 화면을 자율 순회합니다."
+        status.text = "통합 수집 2/2 · 진학사 목적형 분석 준비: 저장대학→합격예측→모의지원→실제합격자→대학입결→전략 순으로 우선 탐색합니다."
         webView.loadUrl(ProviderId.JINHAK.homeUrl)
     }
 
@@ -2970,7 +2971,13 @@ class MainActivity : Activity() {
         if (batchVisited.contains(url)) return
         val runId = localRunId
         if (runId != null && localStore.isDocumentCompleted(runId, url)) return
-        if (batchQueued.add(url)) batchQueue.addLast(url)
+        if (batchQueued.add(url)) {
+            if (provider == ProviderId.JINHAK && JinhakSiteTopology.isCoreMissionRoute(url)) {
+                batchQueue.addFirst(url)
+            } else {
+                batchQueue.addLast(url)
+            }
+        }
     }
 
     private fun historicalMirrorUrl(url: String): String? {

@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.8.0 Session Agent Cloud"
+        android:label="Admission Collector v0.8.1 Jinhak Mission Analyst"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

@@ -2,6 +2,8 @@ package com.admissionhub.collector.provider
 
 import com.admissionhub.collector.parser.GenericAdmissionParser
 import com.admissionhub.collector.parser.RecordUtils
+import com.admissionhub.collector.jinhak.JinhakSiteTopology
+import com.admissionhub.collector.jinhak.JinhakStrategyAnalyzer
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -30,7 +32,7 @@ object JinhakAdapter : ProviderAdapter {
         } catch (_: Exception) { false }
     }
 
-    override fun seedUrls(): List<String> = listOf("https://www.jinhak.com/")
+    override fun seedUrls(): List<String> = JinhakSiteTopology.missionSeeds()
 
     override fun isBatchNavigable(url: String): Boolean {
         if (!accepts(url)) return false
@@ -120,6 +122,13 @@ object JinhakAdapter : ProviderAdapter {
 
         if (pageType == "jinhak-university-admission-info") {
             return normalizeUniversityAdmissionInfo(snapshot, observedAt)
+        }
+
+        if (pageType == "jinhak-admission-strategy") {
+            val strategy = JinhakStrategyAnalyzer.normalize(snapshot, observedAt)
+            val evidence = normalizeTableEvidence(snapshot, pageType, observedAt)
+            for (i in 0 until evidence.length()) strategy.put(evidence.optJSONObject(i))
+            return RecordUtils.dedupe(strategy)
         }
 
         // Observation-first does not mean parser-last. v0.7.1 preserved 200+ tables but
