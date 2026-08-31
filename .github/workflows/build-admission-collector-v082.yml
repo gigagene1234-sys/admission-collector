@@ -1,0 +1,214 @@
+name: Build Admission Collector v0.8.2 Application Mission Closure
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v082.yml"
+      - "scripts/apply_v082_application_mission.py"
+      - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt"
+      - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt"
+      - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakSiteTopology.kt"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip ci]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+
+    steps:
+      - name: Checkout v0.8.1 base plus v0.8.2 mission modules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v0.8.2 source integration
+        run: python3 scripts/apply_v082_application_mission.py
+
+      - name: Verify application-mission and privacy invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          SNAP=app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          MISSION=app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt
+          AGENT=app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt
+          TOPO=app/src/main/java/com/admissionhub/collector/jinhak/JinhakSiteTopology.kt
+          STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
+
+          grep -q 'private const val VERSION = "0.8.2"' "$MAIN"
+          grep -q 'private const val BUILD_CODE = 10820' "$MAIN"
+          grep -q 'versionCode = 10820' app/build.gradle.kts
+          grep -q 'versionName = "0.8.2"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.8.2 Application Mission Closure' app/src/main/AndroidManifest.xml
+
+          # Application identity must be bounded inside the same card, not invented from suffixes.
+          grep -q 'same-card-admission-capacity-boundary' "$MISSION"
+          grep -q 'capacityBoundary' "$MISSION"
+          grep -q 'departmentRaw' "$MISSION"
+          grep -q 'applicationContextForAction' "$SNAP"
+          grep -q 'contextText:applicationContextForAction(a)' "$SNAP"
+          grep -q 'applicationContext' "$AGENT"
+          grep -q 'missionApplicationContext' "$MAIN"
+          grep -q 'same-application-agent-mission' "$ADAPTER"
+
+          # v0.8.1 semantic corruption regression gate.
+          grep -q 'previousYearCompetition' "$MISSION"
+          grep -q 'mockCompetition' "$MISSION"
+          grep -q 'myCalculatedScore' "$MISSION"
+          grep -q 'myReflectedGrade' "$MISSION"
+          grep -q 'mockApplicantAverageScore' "$MISSION"
+          grep -q 'mockApplicantAverageGrade' "$MISSION"
+          python3 - <<'PY'
+          from pathlib import Path
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          mission=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt').read_text()
+          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          if '(?:모의지원\\\\s*)?경쟁률' in adapter:
+              raise SystemExit('broad competition regex still allows previous-year competition to become mockCompetition')
+          if 'metrics.put("previousCompetition"' in adapter:
+              raise SystemExit('legacy previousCompetition semantic field remains')
+          # The known v0.8.1 abbreviation must be accepted as RAW bounded label, not expanded.
+          if '철도차량시스템공학과' in mission:
+              raise SystemExit('mission parser hardcodes/invents canonical department name')
+          # No form values, cookie or storage material may be added to snapshot context payload.
+          context_block=snap.split('function applicationContextForAction',1)[1].split('var nav=[]',1)[0]
+          for forbidden in ['document.cookie','localStorage','sessionStorage','.value','input.value']:
+              if forbidden in context_block:
+                  raise SystemExit(f'forbidden material in application context helper: {forbidden}')
+          # Existing department context must continue to reject previous/next sibling inheritance.
+          dept=snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
+          if 'previousElementSibling' in dept or 'nextElementSibling' in dept:
+              raise SystemExit('cross-card department sibling inheritance reintroduced')
+          PY
+
+          # Mission closure and diagnostic coverage.
+          grep -q 'maybeReturnToJinhakMissionOrigin' "$MAIN"
+          grep -q 'applicationMissionCoverage' "$MAIN"
+          grep -q 'applicationBoundAgentActions' "$MAIN"
+          grep -q 'jinhak-application-mission-evidence' "$MISSION"
+          grep -q 'ADMISSION_KNOWLEDGE' "$TOPO"
+          grep -q 'jinhak-admission-knowledge' "$ADAPTER"
+          grep -q 'contractVersion\\\":3' "$STORE"
+          grep -q 'ApplicationMissions' "$STORE"
+
+          # Preserve all established safety/runtime boundaries.
+          grep -q 'JINHAK_ABSOLUTE_TARGET_MS = 35_000L' "$MAIN"
+          grep -q 'localStore.writeUnifiedExport(streamSession, writer)' "$MAIN"
+          grep -q 'onRenderProcessGone' "$MAIN"
+          grep -q 'AndroidKeyStore' app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt
+          grep -q 'AES/GCM/NoPadding' app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt
+          python3 - <<'PY'
+          from pathlib import Path
+          agent=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text()
+          for token in ['원서','접수','결제','저장','삭제','로그아웃','제출','확정']:
+              if token not in agent:
+                  raise SystemExit(f'missing agent safety boundary: {token}')
+          PY
+
+      - name: Run application grammar fixture checks
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          # Mirror the explicit card grammar as a build-time fixture against the real v0.8.1 shape.
+          text='국립한국교통대[종합]학생부종합Ⅱ[의왕]철도차량시스템공13명 내 점수 764.02점 전교과 4.15등급 전년도 경쟁률 5.33 모의지원자 평균 750.02점 전교과 4.07등급 4칸'
+          uni=re.search(r'^(.+?)(?=\[)',text).group(1)
+          rest=text[len(uni):]
+          cat=re.match(r'^\[([^]]+)\]',rest); rest=rest[cat.end():]
+          adm=re.match(r'^(학생부종합Ⅱ|학생부종합Ⅰ|학생부교과|학생부종합|지역인재교과|교과면접)',rest); rest=rest[adm.end():]
+          campus=re.match(r'^\[([^]]+)\]',rest); rest=rest[campus.end():]
+          boundary=re.search(r'([0-9,]+)\s*명\s*내\s*점수',rest)
+          dept=rest[:boundary.start()].strip()
+          assert uni=='국립한국교통대'
+          assert adm.group(1)=='학생부종합Ⅱ'
+          assert campus.group(1)=='의왕'
+          assert dept=='철도차량시스템공'
+          assert '공학과' not in dept
+          prev=float(re.search(r'전년도\s*경쟁률\s*([0-9.]+)',text).group(1))
+          mock=re.search(r'모의지원\s*경쟁률\s*([0-9.]+)',text)
+          assert prev==5.33 and mock is None
+          print('Application grammar fixture passed:',uni,adm.group(1),campus.group(1),dept,prev)
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -pass env:ANDROID_SIGNING_SECRET \
+            -in signing/admission-upload.keystore.enc \
+            -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build v0.8.2
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify signed APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "versionCode='10820'" /tmp/badging.txt
+          grep -q "versionName='0.8.2'" /tmp/badging.txt
+          grep -q "application-label:'Admission Collector v0.8.2 Application Mission Closure'" /tmp/badging.txt
+          sha256sum "$APK" | tee /tmp/apk.sha256
+
+      - name: Persist v0.8.2 committed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
+            app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt \
+            app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt \
+            app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml
+          if ! git diff --cached --quiet; then
+            git commit -m "Apply v0.8.2 Application Mission Closure"
+            git push origin HEAD:main
+          fi
+
+      - name: Upload v0.8.2 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-v0.8.2-application-mission-closure-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
