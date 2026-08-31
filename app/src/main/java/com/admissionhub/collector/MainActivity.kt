@@ -154,6 +154,15 @@ class MainActivity : Activity() {
     private var jinhakApplicationBoundActions = 0
     private var jinhakApplicationMissionReturns = 0
     private val jinhakMissionCoverage = linkedMapOf<String, MutableSet<String>>()
+    private val jinhakMissionAnchorDiscoveredKeys = linkedSetOf<String>()
+    private var jinhakMissionAnchorActionsExecuted = 0
+    private var jinhakConsentGatePending = false
+    private var jinhakConsentResumePending = false
+    private var jinhakConsentGatesEncountered = 0
+    private var jinhakConsentGatesResolved = 0
+    private var jinhakMissionBootstrapStartedAtMs = 0L
+    private var jinhakFirstPopulatedStorageAtMs = 0L
+    private var jinhakUnboundSavedApplicationObservations = 0
     private val cloudFrontierTaskIds = linkedMapOf<String, String>()
     private var cloudFrontierClaimInProgress = false
     private var cloudFrontierClaimAttempts = 0
@@ -185,8 +194,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_AGENT_ACTIONS = 180
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.8.2"
-        private const val BUILD_CODE = 10820
+        private const val VERSION = "0.8.3"
+        private const val BUILD_CODE = 10830
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -290,7 +299,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         val resume = Button(this).apply {
-            text = "로그인 갱신 후 계속"
+            text = "로그인/동의 후 계속"
             setOnClickListener { resumeAfterLogin() }
         }
         val save = Button(this).apply {
@@ -1144,6 +1153,15 @@ class MainActivity : Activity() {
         jinhakApplicationBoundActions = 0
         jinhakApplicationMissionReturns = 0
         jinhakMissionCoverage.clear()
+        jinhakMissionAnchorDiscoveredKeys.clear()
+        jinhakMissionAnchorActionsExecuted = 0
+        jinhakConsentGatePending = false
+        jinhakConsentResumePending = false
+        jinhakConsentGatesEncountered = 0
+        jinhakConsentGatesResolved = 0
+        jinhakMissionBootstrapStartedAtMs = if (provider == ProviderId.JINHAK) System.currentTimeMillis() else 0L
+        jinhakFirstPopulatedStorageAtMs = 0L
+        jinhakUnboundSavedApplicationObservations = 0
         cloudFrontierTaskIds.clear()
         cloudFrontierClaimInProgress = false
         cloudFrontierClaimAttempts = 0
@@ -1153,7 +1171,9 @@ class MainActivity : Activity() {
         jinhakAbsoluteTargetKey = ""
         ++jinhakAbsoluteTargetGeneration
         disarmBatchNavigationWatchdog()
-        currentBatchTarget = canonicalizeBatchUrl(url)
+        currentBatchTarget = if (provider == ProviderId.JINHAK) {
+            canonicalizeBatchUrl(currentAdapter().seedUrls().firstOrNull() ?: url)
+        } else canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
         if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
             localRunId = localStore.beginOrResume(provider.wireName, VERSION)
@@ -1503,6 +1523,20 @@ class MainActivity : Activity() {
     }
 
     private fun resumeAfterLogin() {
+        if (provider == ProviderId.JINHAK && batchRunning && batchPausedForLogin && jinhakConsentGatePending) {
+            // User must choose consent/decline and confirm inside the provider UI.  This button
+            // only resumes observation; it never clicks or selects either provider choice.
+            jinhakConsentGatePending = false
+            jinhakConsentResumePending = true
+            batchPausedForLogin = false
+            showBatchCover()
+            sessionState.text = "△ 진학사 동의 선택 확인 중"
+            status.text = "사용자 선택 후 진학사 화면을 다시 확인합니다. 선택값은 Collector가 읽거나 변경하지 않습니다."
+            handler.postDelayed({
+                if (batchRunning && !batchPausedForLogin && provider == ProviderId.JINHAK && !batchCollecting) scheduleBatchSnapshot()
+            }, 650L)
+            return
+        }
         if (!batchRunning || !batchPausedForLogin) {
             checkSessionState()
             return
@@ -2135,6 +2169,26 @@ class MainActivity : Activity() {
             batchSessionSyncRetries = 0
 
             if (provider == ProviderId.JINHAK) {
+                val gate = snapshot.optJSONObject("interactionGate") ?: JSONObject()
+                if (gate.optBoolean("requiresUserAction", false)) {
+                    pauseJinhakForConsent(snapshot)
+                    return@collectSnapshot
+                }
+                if (jinhakConsentResumePending) {
+                    jinhakConsentResumePending = false
+                    jinhakConsentGatesResolved += 1
+                    unifiedSessionId?.let { sessionId ->
+                        localStore.recordSyncState(
+                            sessionId,
+                            UnifiedSyncState.JINHAK_AUTONOMOUS_CRAWL.name,
+                            ProviderId.JINHAK.wireName,
+                            JSONObject().put("resumedAfterUserConsentGate", true),
+                            false
+                        )
+                    }
+                    recordRuntimeEvent("jinhak-user-consent-resolved", JSONObject()
+                        .put("safePath", runtimeSafePath(snapshot.optString("url"))))
+                }
                 jinhakMissionContext?.let { snapshot.put("missionApplicationContext", it.toJson()) }
             }
             val plan = if (activeAction == null) currentAdapter().paginationPlan(snapshot) else null
@@ -2162,6 +2216,26 @@ class MainActivity : Activity() {
             val pageRecords = normalizeSnapshot(snapshot)
             if (provider == ProviderId.JINHAK) {
                 jinhakConsecutiveStalls = 0
+                val pageTypeNow = snapshot.optString("providerPageType")
+                if (pageTypeNow == "jinhak-early-storage" && jinhakFirstPopulatedStorageAtMs == 0L) {
+                    var populated = false
+                    for (ri in 0 until pageRecords.length()) {
+                        val r = pageRecords.optJSONObject(ri) ?: continue
+                        if (r.optString("recordType") == "jinhak-saved-application-prediction" &&
+                            r.optString("applicationIdentityKey").isNotBlank() && r.optString("applicationIdentityKey") != "null") {
+                            populated = true
+                            break
+                        }
+                    }
+                    if (populated) jinhakFirstPopulatedStorageAtMs = System.currentTimeMillis()
+                }
+                val actions = snapshot.optJSONArray("agentActions") ?: JSONArray()
+                for (ai in 0 until actions.length()) {
+                    val a = actions.optJSONObject(ai) ?: continue
+                    if (a.optString("kind") != "mission-link-navigation") continue
+                    val key = RecordUtils.sha256(listOf(a.optString("label"), a.optString("contextText")).joinToString("|"))
+                    jinhakMissionAnchorDiscoveredKeys.add(key)
+                }
                 val mission = jinhakMissionContext
                 val missionKey = mission?.identityKey
                 if (missionKey != null) {
@@ -2175,6 +2249,9 @@ class MainActivity : Activity() {
                     if (r.optString("recordType") == "jinhak-saved-application-prediction") {
                         jinhakMissionCoverage.getOrPut(key) { linkedSetOf() }.add("saved-application")
                     }
+                }
+                jinhakUnboundSavedApplicationObservations += (0 until pageRecords.length()).count { idx ->
+                    pageRecords.optJSONObject(idx)?.optString("recordType") == "jinhak-application-unbound-observation"
                 }
             }
             var jinhakExpansionStateKey: String? = null
@@ -2403,6 +2480,35 @@ class MainActivity : Activity() {
     }
 
 
+    private fun pauseJinhakForConsent(snapshot: JSONObject) {
+        if (provider != ProviderId.JINHAK || !batchRunning) return
+        if (!jinhakConsentGatePending) jinhakConsentGatesEncountered += 1
+        jinhakConsentGatePending = true
+        jinhakConsentResumePending = false
+        batchPausedForLogin = true
+        batchCollecting = false
+        batchNavigationWatchdogRecovery = false
+        disarmBatchNavigationWatchdog()
+        hideBatchCover()
+        sessionState.text = "○ 진학사 사용자 동의 선택 필요"
+        status.text = "진학사에서 학생부 AI진단 점수 활용 동의를 직접 선택하고 확인한 뒤 '로그인/동의 후 계속'을 누르세요. Collector는 동의/미동의를 자동 선택하지 않습니다."
+        unifiedSessionId?.let { sessionId ->
+            localStore.recordSyncState(
+                sessionId,
+                UnifiedSyncState.JINHAK_USER_CONSENT_REQUIRED.name,
+                ProviderId.JINHAK.wireName,
+                JSONObject()
+                    .put("gateType", snapshot.optJSONObject("interactionGate")?.optString("type") ?: "provider-consent")
+                    .put("safePath", runtimeSafePath(snapshot.optString("url")))
+                    .put("missionBound", jinhakMissionContext?.identityKey != null),
+                true
+            )
+        }
+        recordRuntimeEvent("jinhak-user-consent-required", JSONObject()
+            .put("safePath", runtimeSafePath(snapshot.optString("url")))
+            .put("missionBound", jinhakMissionContext?.identityKey != null))
+    }
+
     private fun maybeExecuteJinhakAgentAction(snapshot: JSONObject, expansionStateKey: String?): Boolean {
         if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return false
         if (jinhakAgentActionInFlight || jinhakAgentActionsExecuted >= MAX_JINHAK_AGENT_ACTIONS) return false
@@ -2441,6 +2547,7 @@ class MainActivity : Activity() {
 
         jinhakAgentActionInFlight = true
         jinhakAgentActionsExecuted += 1
+        if (candidate.kind == "mission-link-navigation") jinhakMissionAnchorActionsExecuted += 1
         currentBatchTarget = route.ifBlank { currentBatchTarget }
         status.text = "진학사 지원안 미션 ${jinhakAgentActionsExecuted}/$MAX_JINHAK_AGENT_ACTIONS · ${candidate.label.take(48)}"
         recordRuntimeEvent("jinhak-agent-action", JSONObject()
@@ -2925,6 +3032,13 @@ class MainActivity : Activity() {
                         .put("applicationBoundAgentActions", jinhakApplicationBoundActions)
                         .put("applicationMissionReturns", jinhakApplicationMissionReturns)
                         .put("applicationMissionIdentities", jinhakMissionCoverage.size)
+                        .put("missionBootstrapAtMs", jinhakMissionBootstrapStartedAtMs)
+                        .put("secondsToFirstPopulatedStorage", if (jinhakMissionBootstrapStartedAtMs > 0L && jinhakFirstPopulatedStorageAtMs > 0L) (jinhakFirstPopulatedStorageAtMs - jinhakMissionBootstrapStartedAtMs) / 1000.0 else JSONObject.NULL)
+                        .put("applicationAnchorActionsDiscovered", jinhakMissionAnchorDiscoveredKeys.size)
+                        .put("applicationAnchorActionsExecuted", jinhakMissionAnchorActionsExecuted)
+                        .put("consentGatesEncountered", jinhakConsentGatesEncountered)
+                        .put("consentGatesResolved", jinhakConsentGatesResolved)
+                        .put("unboundSavedApplicationObservations", jinhakUnboundSavedApplicationObservations)
                         .put("applicationMissionCoverage", JSONObject().apply {
                             val lanes = listOf("saved-application", "current-prediction", "mock-support", "actual-admit", "university-result", "score-analysis", "strategy")
                             for (lane in lanes) put(lane, jinhakMissionCoverage.values.count { it.contains(lane) })
@@ -2978,6 +3092,12 @@ class MainActivity : Activity() {
                 .put("jinhakApplicationBoundActions", jinhakApplicationBoundActions)
                 .put("jinhakApplicationMissionReturns", jinhakApplicationMissionReturns)
                 .put("jinhakApplicationMissionIdentities", jinhakMissionCoverage.size)
+                .put("jinhakApplicationAnchorActionsDiscovered", jinhakMissionAnchorDiscoveredKeys.size)
+                .put("jinhakApplicationAnchorActionsExecuted", jinhakMissionAnchorActionsExecuted)
+                .put("jinhakConsentGatesEncountered", jinhakConsentGatesEncountered)
+                .put("jinhakConsentGatesResolved", jinhakConsentGatesResolved)
+                .put("jinhakUnboundSavedApplicationObservations", jinhakUnboundSavedApplicationObservations)
+                .put("jinhakSecondsToFirstPopulatedStorage", if (jinhakMissionBootstrapStartedAtMs > 0L && jinhakFirstPopulatedStorageAtMs > 0L) (jinhakFirstPopulatedStorageAtMs - jinhakMissionBootstrapStartedAtMs) / 1000.0 else JSONObject.NULL)
                 .put("jinhakUniqueNavigationStates", jinhakUniqueNavigationStates)
                 .put("jinhakRepeatedNavigationStateSkips", jinhakRepeatedNavigationStateSkips)
                 .put("cloudFrontierPublished", cloudFrontierPublished)

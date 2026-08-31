@@ -194,6 +194,32 @@ object JinhakAdapter : ProviderAdapter {
                     "stabilityBars", "predictionProbability", "predictionLabel", "myRank", "predictedCut"
                 ).any { cardMetrics.has(it) && !cardMetrics.isNull(it) }
                 if (!hasPrimaryPrediction) continue
+
+                if (pageType == "jinhak-early-storage" && mission?.identityKey == null) {
+                    val unboundMetrics = JSONObject(cardMetrics.toString())
+                        .put("identityParseSource", mission?.parseSource ?: "unbound-no-same-card-identity")
+                        .put("unboundReason", "same-card-application-identity-incomplete")
+                    val unbound = JSONObject()
+                        .put("recordType", "jinhak-application-unbound-observation")
+                        .put("providerPageType", pageType)
+                        .put("dataScope", "current-prediction-unbound")
+                        .put("year", mission?.year ?: local.year ?: TARGET_YEAR)
+                        .put("university", mission?.university ?: compactUniversity ?: explicitUniversity ?: JSONObject.NULL)
+                        .put("department", JSONObject.NULL)
+                        .put("admission", mission?.admission ?: compactAdmission ?: JSONObject.NULL)
+                        .put("applicationIdentityKey", JSONObject.NULL)
+                        .put("metrics", unboundMetrics)
+                        .put("observedAt", observedAt)
+                        .put("cardIndex", i)
+                        .put("contextSource", "unbound-observation-preserved-no-department-inference")
+                        .put("confidence", "raw")
+                        .put("sourcePage", safePath(snapshot.optString("url")))
+                        .put("rawEvidence", evidence)
+                    unbound.put("sourceRowFingerprint", fingerprint(unbound, observedAt, preserveSnapshot = true))
+                    result.put(unbound)
+                    continue
+                }
+
                 val logical = RecordUtils.sha256(listOf(
                     university ?: "", department ?: "", admission ?: "", cardMetrics.toString()
                 ).joinToString("|"))

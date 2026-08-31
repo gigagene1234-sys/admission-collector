@@ -124,6 +124,15 @@ object SnapshotScript {
   var pw=document.querySelectorAll('input[type=password]');
   for(var p=0;p<pw.length;p++){ if(visible(pw[p])) { pass=true; break; } }
   var bodyText=(document.body&&document.body.innerText?document.body.innerText:'').slice(0,16000);
+  var jinhakProviderHost=/(^|\.)jinhak\.com$/i.test(location.hostname);
+  var jinhakAiConsentRequired=jinhakProviderHost &&
+    /학생부\s*AI진단\s*점수\s*활용\s*동의/i.test(bodyText) &&
+    /(?:^|\s)동의(?:\s|$)/i.test(bodyText) && /미동의/i.test(bodyText);
+  var interactionGate={
+    requiresUserAction:jinhakAiConsentRequired,
+    type:jinhakAiConsentRequired?'jinhak-ai-diagnosis-consent':'',
+    safeLabel:jinhakAiConsentRequired?'학생부 AI진단 점수 활용 동의':''
+  };
   var logoutControl=false;
   var sessionControls=document.querySelectorAll('a,button,[role=button]');
   for(var sc=0;sc<sessionControls.length;sc++){
@@ -473,16 +482,20 @@ object SnapshotScript {
       if(route) scriptCandidates++;
     }
 
+    var missionLinkBound=false;
     if(isJinhakHost && agentActions.length<160){
-      var agentBlocked=/(원서\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰)/i;
+      var agentBlocked=/(원서\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰|동의|미동의)/i;
       var agentAllowed=/(실제\s*합격자|과거\s*입시결과|입시\s*결과|합격\s*예측\s*리포트|모의\s*지원\s*리포트|지원자\s*분포|대학.?학과별\s*합격\s*예측|합격\s*안정성|상세|보기|조회|검색|리포트|대학\s*정보|전형\s*정보|학과\s*정보|합격\s*예측|모의\s*지원|수시\s*저장소|정시\s*저장소|추천\s*대학|성적\s*분석|입시\s*전략|입시\s*지식|경쟁률|모집\s*요강|다음|더보기|결과|탭)/i;
       var role=cleanText(a.getAttribute('role')||'');
-      var dynamicControl=!route || role==='tab' || a.tagName==='BUTTON';
+      var applicationContext=applicationContextForAction(a);
+      var missionLink=!!route && String(a.tagName||'').toUpperCase()==='A' && applicationContext.length>0;
+      var dynamicControl=!route || role==='tab' || a.tagName==='BUTTON' || missionLink;
       if(dynamicControl && label && !agentBlocked.test(label+' '+meta2) && agentAllowed.test(label)){
         var ak=li+'|'+label+'|'+String(a.tagName||'')+'|'+role;
         if(!seenAgentAction[ak]){
-          agentActions.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:role==='tab'?'tab-navigation':'read-navigation',contextText:applicationContextForAction(a)});
+          agentActions.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(role==='tab'?'tab-navigation':'read-navigation'),contextText:applicationContext});
           seenAgentAction[ak]=1;
+          missionLinkBound=missionLink;
         }
       }
     }
@@ -497,6 +510,7 @@ object SnapshotScript {
       continue;
     }
 
+    if(missionLinkBound) continue;
     if(!route) continue;
     var ru;
     try{ ru=new URL(route,location.href); }catch(e2){ continue; }
@@ -523,6 +537,7 @@ object SnapshotScript {
     collectedAt:new Date().toISOString(),
     session:{needsLogin:(pass||loginUrl||loginRequired)&&!authenticated,authenticated:authenticated},
     pageState:{isError:pageError,errorType:errorType},
+    interactionGate:interactionGate,
     listMeta:{totalItems:isNaN(listTotal)?-1:listTotal,visibleDataRows:visibleDataRows},
     discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length,agentActions:agentActions.length,jinhakDeepPage:jinhakDeepPage},
     context:context,

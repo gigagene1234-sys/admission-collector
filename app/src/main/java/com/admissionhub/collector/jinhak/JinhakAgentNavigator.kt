@@ -72,7 +72,7 @@ object JinhakAgentNavigator {
               var label=clean(el.innerText||el.textContent||el.getAttribute('aria-label')||el.getAttribute('title')||'').slice(0,120);
               var expected=$expected;
               if(label!==expected) return JSON.stringify({ok:false,reason:'label-changed'});
-              var blocked=/(원서\\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰)/i;
+              var blocked=/(원서\\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰|동의|미동의)/i;
               var allowed=/(실제\\s*합격자|과거\\s*입시결과|입시\\s*결과|합격\\s*예측\\s*리포트|모의\\s*지원\\s*리포트|지원자\\s*분포|대학.?학과별\\s*합격\\s*예측|합격\\s*안정성|상세|보기|조회|검색|리포트|대학\\s*정보|전형\\s*정보|학과\\s*정보|합격\\s*예측|모의\\s*지원|수시\\s*저장소|정시\\s*저장소|추천\\s*대학|성적\\s*분석|입시\\s*전략|입시\\s*지식|경쟁률|모집\\s*요강|다음|더보기|결과|탭)/i;
               if(blocked.test(label)||!allowed.test(label)) return JSON.stringify({ok:false,reason:'policy-block'});
               var before=location.href;
@@ -83,7 +83,7 @@ object JinhakAgentNavigator {
     }
 
     private fun isSafeReadNavigationLabel(label: String): Boolean {
-        if (Regex("(원서\\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰)", RegexOption.IGNORE_CASE).containsMatchIn(label)) return false
+        if (Regex("(원서\\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰|동의|미동의)", RegexOption.IGNORE_CASE).containsMatchIn(label)) return false
         return Regex(
             "(실제\\s*합격자|과거\\s*입시결과|입시\\s*결과|합격\\s*예측\\s*리포트|모의\\s*지원\\s*리포트|지원자\\s*분포|대학.?학과별\\s*합격\\s*예측|합격\\s*안정성|상세|보기|조회|검색|리포트|대학\\s*정보|전형\\s*정보|학과\\s*정보|합격\\s*예측|모의\\s*지원|수시\\s*저장소|정시\\s*저장소|추천\\s*대학|성적\\s*분석|입시\\s*전략|입시\\s*지식|경쟁률|모집\\s*요강|다음|더보기|결과|탭)",
             RegexOption.IGNORE_CASE

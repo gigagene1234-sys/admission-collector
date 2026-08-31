@@ -13,7 +13,7 @@ import org.json.JSONObject
  * Adiga/provider mappings; the raw Jinhak label is never silently expanded.
  */
 object JinhakApplicationMission {
-    const val SEMANTICS_VERSION = 2
+    const val SEMANTICS_VERSION = 3
 
     data class Context(
         val year: Int = 2027,
@@ -68,7 +68,7 @@ object JinhakApplicationMission {
     }
 
     private val universityPrefix = Regex(
-        """^(?:[0-9]{1,2}\s*칸\s*)?([가-힣A-Za-z0-9·.&+()\-]{2,45}?(?:대학교|교육대학교|과학기술원|대(?:\([^)]+\))?))(?=\s*\[)"""
+        """^([가-힣A-Za-z0-9·.&+()\-]{2,45}?(?:대학교|교육대학교|과학기술원|대(?:\([^)]+\))?))(?=\s*\[)"""
     )
     private val category = Regex("""^\s*\[([^\]]{1,24})\]\s*""")
     private val campus = Regex("""^\s*\[([^\]]{1,30})\]\s*""")
@@ -85,7 +85,8 @@ object JinhakApplicationMission {
         explicitUniversity: String? = null,
         explicitDepartment: String? = null
     ): Context? {
-        val text = rawText.replace(Regex("""\s+"""), " ").trim().take(6000)
+        val rawVisibleText = rawText.replace(Regex("""\s+"""), " ").trim().take(6000)
+        val text = stripCardUiPrefix(rawVisibleText)
         if (text.isBlank()) return null
 
         val capacityMatch = capacityBoundary.find(text)
@@ -109,9 +110,17 @@ object JinhakApplicationMission {
         val admission = admissionMatch?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
         if (admissionMatch != null) working = working.substring(admissionMatch.range.last + 1).trim()
 
-        val campusMatch = campus.find(working)
-        val campusLabel = campusMatch?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
-        if (campusMatch != null) working = working.substring(campusMatch.range.last + 1).trim()
+        var campusLabel: String? = null
+        // Some cards repeat the admission category after the admission name, e.g.
+        // [교과]일반[교과][대전]안경광학.  The repeated [교과] is metadata, not campus.
+        while (true) {
+            val bracket = campus.find(working) ?: break
+            val token = bracket.groupValues.getOrNull(1)?.trim().orEmpty()
+            working = working.substring(bracket.range.last + 1).trim()
+            if (isAdmissionMetaBracket(token, admissionCategory)) continue
+            campusLabel = token.takeIf { it.isNotBlank() }
+            break
+        }
 
         // Use the local "N명 내 점수" marker as the right boundary. Recompute in the remaining
         // text so labels such as 철도차량시스템공 are accepted without inventing "학과".
@@ -238,11 +247,28 @@ object JinhakApplicationMission {
             .put("sourceRowFingerprint", RecordUtils.sha256(listOf(context.identityKey ?: "partial", lane, observedAt.substring(0, 16)).joinToString("|")))
     }
 
+    private fun stripCardUiPrefix(value: String): String {
+        var s = value.replace(Regex("""\s+"""), " ").trim()
+        // UI chrome observed in storage cards: "닫기7칸건국대...".  These tokens are
+        // display controls/prediction badges and must never participate in university identity.
+        s = s.replace(Regex("""^(?:(?:닫기|열기)\s*)+"""), "").trim()
+        s = s.replace(Regex("""^(?:[0-9]{1,2}\s*칸\s*)+"""), "").trim()
+        s = s.replace(Regex("""^(?:(?:닫기|열기)\s*)+"""), "").trim()
+        return s
+    }
+
+    private fun isAdmissionMetaBracket(token: String, category: String?): Boolean {
+        val t = token.replace(Regex("""\s+"""), "").trim()
+        if (t.isBlank()) return true
+        if (category != null && t.equals(category.replace(Regex("""\s+"""), ""), ignoreCase = true)) return true
+        return Regex("""^(?:교과|종합|논술|실기|실적|학생부교과|학생부종합|수시|정시)$""").matches(t)
+    }
+
     private fun yearToken(text: String): Int = Regex("""(?<![0-9])(20[0-9]{2})(?:학년도)?(?![0-9])""")
         .find(text)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 2027
 
     private fun cleanUniversity(value: String?): String? {
-        val s = value?.replace(Regex("""\s+"""), " ")?.trim()?.takeIf { it.length in 2..60 } ?: return null
+        val s = value?.let(::stripCardUiPrefix)?.replace(Regex("""\s+"""), " ")?.trim()?.takeIf { it.length in 2..60 } ?: return null
         if (Regex("""(경쟁률|합격|예측|지원|전형|모집|학과|학부|전공|점수|등급)""").containsMatchIn(s)) return null
         return s
     }
