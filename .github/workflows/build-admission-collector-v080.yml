@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-collector-v080.yml"
       - "scripts/apply_v080_session_agent_cloud.py"
+      - "scripts/fix_v080_session_vault_compile.py"
   workflow_dispatch:
 
 permissions:
@@ -26,7 +27,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply v0.8.0 architecture patch
-        run: python3 scripts/apply_v080_session_agent_cloud.py
+        run: |
+          python3 scripts/apply_v080_session_agent_cloud.py
+          python3 scripts/fix_v080_session_vault_compile.py
 
       - name: Verify v0.8.0 source architecture
         shell: bash
@@ -101,7 +104,6 @@ jobs:
           if 'leaseId' not in session or 'UUID.randomUUID' not in session:
               raise SystemExit('opaque session lease id missing')
 
-          # Validate the semantic write/action deny-list without depending on Kotlin regex escaping.
           for token in ['원서', '접수', '결제', '구매', '저장', '삭제', '탈퇴', '로그아웃', '회원정보', '제출', '확정']:
               if token not in agent:
                   raise SystemExit(f'missing agent block token: {token}')
