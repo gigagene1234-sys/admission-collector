@@ -24,7 +24,40 @@ jobs:
       - name: Checkout committed source
         uses: actions/checkout@v4
 
-      - name: Verify committed-source architecture invariants
+      - name: Resolve and verify committed version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, os
+          main = Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          gradle = Path('app/build.gradle.kts').read_text()
+          manifest = Path('app/src/main/AndroidManifest.xml').read_text()
+          def one(pattern, text, label):
+              m = re.search(pattern, text)
+              if not m:
+                  raise SystemExit(f'missing {label}')
+              return m.group(1)
+          main_version = one(r'private const val VERSION = "([^"]+)"', main, 'MainActivity VERSION')
+          main_build = int(one(r'private const val BUILD_CODE = (\d+)', main, 'MainActivity BUILD_CODE'))
+          gradle_version = one(r'versionName = "([^"]+)"', gradle, 'Gradle versionName')
+          gradle_build = int(one(r'versionCode = (\d+)', gradle, 'Gradle versionCode'))
+          label = one(r'android:label="([^"]+)"', manifest, 'application label')
+          if main_version != gradle_version:
+              raise SystemExit(f'version mismatch: main={main_version} gradle={gradle_version}')
+          if main_build != gradle_build:
+              raise SystemExit(f'build mismatch: main={main_build} gradle={gradle_build}')
+          if main_version not in label:
+              raise SystemExit(f'application label does not contain current version: {label}')
+          with open(os.environ['GITHUB_ENV'], 'a') as fh:
+              fh.write(f'APP_VERSION={main_version}\n')
+              fh.write(f'APP_BUILD_CODE={main_build}\n')
+              fh.write(f'APP_LABEL={label}\n')
+          print(f'Committed version verified: {main_version} ({main_build}) / {label}')
+          PY
+
+      - name: Verify common architecture invariants
         shell: bash
         run: |
           set -euo pipefail
@@ -33,11 +66,6 @@ jobs:
           ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
           SYNC=app/src/main/java/com/admissionhub/collector/sync/UnifiedSyncState.kt
           test ! -f MainActivity.kt
-          grep -q 'private const val VERSION = "0.7.1"' "$MAIN"
-          grep -q 'private const val BUILD_CODE = 10710' "$MAIN"
-          grep -q 'versionCode = 10710' app/build.gradle.kts
-          grep -q 'versionName = "0.7.1"' app/build.gradle.kts
-          grep -q 'Admission Collector v0.7.1 Autonomous Analysis Ready' app/src/main/AndroidManifest.xml
           grep -q 'CREATE TABLE IF NOT EXISTS observations' "$STORE"
           grep -q 'fun storeObservationEvidence' "$STORE"
           grep -q 'fun writeObservations' "$STORE"
@@ -50,7 +78,7 @@ jobs:
           grep -q 'assistant-xlsx-dashboard-generation' "$STORE"
           grep -q 'recommendedWorkbookSheets' "$STORE"
 
-      - name: Verify safety observation and memory boundaries
+      - name: Verify privacy observation and memory boundaries
         shell: bash
         run: |
           python3 - <<'PY'
@@ -67,7 +95,7 @@ jobs:
               if token in probe:
                   raise SystemExit(f'capability probe reads forbidden material: {token}')
           if 'supportsBatchCrawl = false' in adapter:
-              raise SystemExit('Jinhak autonomous crawler rollback is not active')
+              raise SystemExit('Jinhak autonomous crawler is not active')
           for token in ['payment','billing','purchase','order','refund','withdraw','logout','signout']:
               if token not in adapter:
                   raise SystemExit(f'missing crawler safety boundary: {token}')
@@ -115,22 +143,22 @@ jobs:
       - name: Build committed source
         run: gradle --no-daemon :app:assembleDebug
 
-      - name: Verify APK
+      - name: Verify APK against committed version
         shell: bash
         run: |
           set -euo pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
-          grep -q "versionCode='10710'" /tmp/badging.txt
-          grep -q "versionName='0.7.1'" /tmp/badging.txt
-          grep -q "application-label:'Admission Collector v0.7.1 Autonomous Analysis Ready'" /tmp/badging.txt
+          grep -Fq "versionCode='$APP_BUILD_CODE'" /tmp/badging.txt
+          grep -Fq "versionName='$APP_VERSION'" /tmp/badging.txt
+          grep -Fq "application-label:'$APP_LABEL'" /tmp/badging.txt
           sha256sum "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: admission-collector-main-v0.7.1-debug
+          name: admission-collector-main-debug
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
