@@ -407,10 +407,12 @@ object SnapshotScript {
   var nav=[];
   var resources=[];
   var pageActions=[];
+  var agentActions=[];
   var linkNodes=document.querySelectorAll('a,button,[role=button],[onclick],[data-href],[data-url],[data-link],[data-path]');
   var seenNav={};
   var seenRes={};
   var seenPageAction={};
+  var seenAgentAction={};
   var currentParts=location.pathname.split('/').filter(Boolean);
   var prefix=currentParts.slice(0,2).join('/');
   var scriptCandidates=0;
@@ -453,6 +455,20 @@ object SnapshotScript {
       if(route) scriptCandidates++;
     }
 
+    if(isJinhakHost && agentActions.length<160){
+      var agentBlocked=/(원서\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰)/i;
+      var agentAllowed=/(상세|보기|조회|검색|리포트|대학\s*정보|전형\s*정보|학과\s*정보|합격\s*예측|모의\s*지원|수시\s*저장소|정시\s*저장소|추천\s*대학|성적\s*분석|다음|더보기|결과|탭)/i;
+      var role=cleanText(a.getAttribute('role')||'');
+      var dynamicControl=!route || role==='tab' || a.tagName==='BUTTON';
+      if(dynamicControl && label && !agentBlocked.test(label+' '+meta2) && agentAllowed.test(label)){
+        var ak=li+'|'+label+'|'+String(a.tagName||'')+'|'+role;
+        if(!seenAgentAction[ak]){
+          agentActions.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:role==='tab'?'tab-navigation':'read-navigation'});
+          seenAgentAction[ak]=1;
+        }
+      }
+    }
+
     var resourceRaw=(raw && directUrlish) ? raw : (route||'');
     var exportUrl=safeExportUrl(resourceRaw);
     var u=null;
@@ -490,7 +506,7 @@ object SnapshotScript {
     session:{needsLogin:(pass||loginUrl||loginRequired)&&!authenticated,authenticated:authenticated},
     pageState:{isError:pageError,errorType:errorType},
     listMeta:{totalItems:isNaN(listTotal)?-1:listTotal,visibleDataRows:visibleDataRows},
-    discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length,jinhakDeepPage:jinhakDeepPage},
+    discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length,agentActions:agentActions.length,jinhakDeepPage:jinhakDeepPage},
     context:context,
     selectionContext:selectionContext,
     jinhakCards:jinhakCards,
@@ -499,6 +515,7 @@ object SnapshotScript {
     blocks:blocks,
     navigationLinks:nav,
     pageActions:pageActions,
+    agentActions:agentActions,
     resourceLinks:resources
   });
 })();

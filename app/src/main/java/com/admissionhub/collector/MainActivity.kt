@@ -33,6 +33,8 @@ import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.observation.ObservationEvidence
 import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
+import com.admissionhub.collector.jinhak.JinhakAgentNavigator
+import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.provider.ProviderCapabilities
 import com.admissionhub.collector.provider.ProviderCapability
 import com.admissionhub.collector.sync.UnifiedSyncState
@@ -55,6 +57,7 @@ class MainActivity : Activity() {
     private lateinit var unifiedButton: Button
     private lateinit var cloudOffload: CloudOffloadCoordinator
     private lateinit var localStore: LocalCollectorStore
+    private lateinit var sessionVault: SecureSessionVault
 
     private val handler = Handler(Looper.getMainLooper())
     private val sessionKeepAlive = object : Runnable {
@@ -137,6 +140,14 @@ class MainActivity : Activity() {
     private var unifiedJinhakAutoCapture = false
     private val unifiedJinhakCapturedPages = linkedSetOf<String>()
     private var unifiedAutoCaptureScheduled = false
+    private val jinhakAgentActionSeen = linkedSetOf<String>()
+    private var jinhakAgentActionInFlight = false
+    private var jinhakAgentActionsExecuted = 0
+    private val cloudFrontierTaskIds = linkedMapOf<String, String>()
+    private var cloudFrontierClaimInProgress = false
+    private var cloudFrontierClaimAttempts = 0
+    private var cloudFrontierPublished = 0
+    private var cloudFrontierClaimed = 0
     private var batchSkipSnapshotUntilMs = 0L
     private var runtimeLastSafePath = ""
     private var runtimeRendererRecovering = false
@@ -160,9 +171,11 @@ class MainActivity : Activity() {
         private const val JINHAK_HARD_STALL_MS = 24_000L
         private const val JINHAK_ABSOLUTE_TARGET_MS = 35_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
+        private const val MAX_JINHAK_AGENT_ACTIONS = 180
+        private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.7.1"
-        private const val BUILD_CODE = 10710
+        private const val VERSION = "0.8.0"
+        private const val BUILD_CODE = 10800
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -172,6 +185,7 @@ class MainActivity : Activity() {
         installRuntimeCrashGuard()
         cloudOffload = CloudOffloadCoordinator(this)
         localStore = LocalCollectorStore(this)
+        sessionVault = SecureSessionVault(this)
         buildUi()
         configureWebView()
         val resumed = resumeInterruptedUnifiedSessionIfNeeded()
@@ -568,7 +582,10 @@ class MainActivity : Activity() {
         provider = which
         localRunId = localStore.latestResumableRun(which.wireName)
         CookieManager.getInstance().flush()
-        sessionState.text = "세션 상태 확인 중"
+        val restoredLease = runCatching { sessionVault.restore(which.wireName) }.getOrNull()
+        sessionState.text = if (restoredLease?.restored == true) {
+            "● 암호화 세션 lease 복구 · ${restoredLease.leaseId.take(8)}…"
+        } else "세션 상태 확인 중"
         val capabilities = ProviderCapabilities.profile(which)
         status.text = if (which == ProviderId.JINHAK) {
             "진학사 observation-first 모드 · active ${capabilities.active.size} / discoverable ${capabilities.discoverable.size} · 분류 여부와 무관하게 증거 보존"
@@ -576,7 +593,7 @@ class MainActivity : Activity() {
             "어디가 공식정보 모드 · active ${capabilities.active.size} · deterministic ID/year planner 기반 전환 준비"
         }
         batchButton.text = when (which) {
-            ProviderId.JINHAK -> "현재 진학사 화면 전체 분석·누적"
+            ProviderId.JINHAK -> "진학사 에이전트 자동 수집"
             ProviderId.ADIGA -> "어디가 복구 보류"
         }
         diagnosticButton.text = if (which == ProviderId.JINHAK) "진학사 전체 분석 전송" else "어디가 진단 로그 전송"
@@ -673,9 +690,15 @@ class MainActivity : Activity() {
                 val needsLogin = obj.optBoolean("needsLogin", false)
                 val authenticated = obj.optBoolean("authenticated", false)
                 sessionState.text = when {
-                    authenticated -> "● 로그인 유지됨"
+                    authenticated -> "● 로그인 유지됨 · 보안 세션 lease 갱신"
                     needsLogin -> "○ 로그인 갱신 필요"
                     else -> "△ 로그인 상태 미확정"
+                }
+                if (authenticated) {
+                    val currentUrl = webView.url.orEmpty()
+                    if (currentUrl.isNotBlank()) {
+                        runCatching { sessionVault.captureAuthenticated(provider.wireName, currentUrl, VERSION) }
+                    }
                 }
                 callback?.invoke(needsLogin, authenticated)
             } catch (_: Exception) {
@@ -808,7 +831,12 @@ class MainActivity : Activity() {
             unifiedPendingAdigaStart = false
             unifiedPendingJinhakStart = true
             unifiedJinhakAutoCapture = false
-            status.text = "이전 중단 감지: 진학사 자동 크롤러를 체크포인트에서 재개합니다."
+            val lease = runCatching { sessionVault.restore(ProviderId.JINHAK.wireName) }.getOrNull()
+            status.text = if (lease?.restored == true) {
+                "이전 중단 감지: 암호화 로그인 세션을 복구하고 진학사 에이전트를 체크포인트에서 재개합니다."
+            } else {
+                "이전 중단 감지: 저장된 브라우저 세션을 검증한 뒤 진학사 에이전트를 재개합니다."
+            }
             webView.loadUrl(ProviderId.JINHAK.homeUrl)
             true
         }
@@ -1093,6 +1121,14 @@ class MainActivity : Activity() {
         batchAuditPagesScheduled = 0
         batchUniversityDiscoveryPagesScheduled = 0
         batchPersistedPageSignatureOwners.clear()
+        jinhakAgentActionSeen.clear()
+        jinhakAgentActionInFlight = false
+        jinhakAgentActionsExecuted = 0
+        cloudFrontierTaskIds.clear()
+        cloudFrontierClaimInProgress = false
+        cloudFrontierClaimAttempts = 0
+        cloudFrontierPublished = 0
+        cloudFrontierClaimed = 0
         batchSkipSnapshotUntilMs = 0L
         jinhakAbsoluteTargetKey = ""
         ++jinhakAbsoluteTargetGeneration
@@ -1140,6 +1176,13 @@ class MainActivity : Activity() {
 
     private fun beginBatchNavigation(runId: String?) {
         enqueueProviderSeeds()
+        cloudOffload.probeFrontier { available ->
+            runOnUiThread {
+                if (available) {
+                    status.text = "Cloud frontier 연결됨: 링크 계획·중복제거·재시도를 클라우드와 동기화합니다."
+                }
+            }
+        }
         if (runId != null && batchPageActions.isEmpty()) {
             status.text = "Cloud 체크포인트 연결: ${runId.take(8)}… / 기본 정보영역 ${batchQueue.size}개 탐색"
         } else if (runId == null) {
@@ -2155,6 +2198,9 @@ class MainActivity : Activity() {
                 batchLocalRecordsPersisted += localStore.storeRecords(runId, provider.wireName, pageRecords)
                 val navKey = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
                 localStore.markDocument(runId, navKey, "completed")
+                cloudFrontierTaskIds.remove(navKey)?.let { taskId ->
+                    cloudOffload.completeFrontier(taskId, "completed", null)
+                }
                 when {
                     activeAction != null -> localStore.markPage(
                         runId, activeAction.familyKey, activeAction.requestedYear,
@@ -2181,6 +2227,10 @@ class MainActivity : Activity() {
             } else {
                 batchPageActionVisited.add(pageActionKey(activeAction))
                 activeBatchPageAction = null
+            }
+
+            if (provider == ProviderId.JINHAK && activeAction == null && maybeExecuteJinhakAgentAction(snapshot)) {
+                return@collectSnapshot
             }
 
             status.text = if (activeAction != null) {
@@ -2290,6 +2340,41 @@ class MainActivity : Activity() {
         persistedPageSignatureOwners(action)[signature] = action.page
     }
 
+
+    private fun maybeExecuteJinhakAgentAction(snapshot: JSONObject): Boolean {
+        if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return false
+        if (jinhakAgentActionInFlight || jinhakAgentActionsExecuted >= MAX_JINHAK_AGENT_ACTIONS) return false
+        val route = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
+        val candidate = JinhakAgentNavigator.candidates(snapshot).firstOrNull { action ->
+            !jinhakAgentActionSeen.contains(JinhakAgentNavigator.key(route, action))
+        } ?: return false
+        val actionKey = JinhakAgentNavigator.key(route, candidate)
+        jinhakAgentActionSeen.add(actionKey)
+        jinhakAgentActionInFlight = true
+        jinhakAgentActionsExecuted += 1
+        currentBatchTarget = route.ifBlank { currentBatchTarget }
+        status.text = "진학사 에이전트 직접 탐색 ${jinhakAgentActionsExecuted}/$MAX_JINHAK_AGENT_ACTIONS · ${candidate.label.take(48)}"
+        recordRuntimeEvent("jinhak-agent-action", JSONObject()
+            .put("safePath", runtimeSafePath(route))
+            .put("label", candidate.label.take(80))
+            .put("kind", candidate.kind))
+        webView.evaluateJavascript(JinhakAgentNavigator.executionScript(candidate)) { encoded ->
+            val result = runCatching { JSONObject(decodeJsString(encoded)) }.getOrNull() ?: JSONObject()
+            jinhakAgentActionInFlight = false
+            if (!batchRunning || batchPausedForLogin) return@evaluateJavascript
+            if (result.optBoolean("ok", false)) {
+                handler.postDelayed({
+                    if (!batchRunning || batchPausedForLogin || batchCollecting) return@postDelayed
+                    val now = canonicalizeBatchUrl(webView.url.orEmpty())
+                    if (now == route || sameBatchDocument(now, route)) scheduleBatchSnapshot()
+                }, 1100L)
+            } else {
+                handler.postDelayed({ loadNextBatchPage() }, 120L)
+            }
+        }
+        return true
+    }
+
     private fun loadNextBatchPage() {
         if (!batchRunning || batchPausedForLogin) return
         if (batchCloudPlansPending > 0) {
@@ -2325,6 +2410,38 @@ class MainActivity : Activity() {
             currentBatchTarget = next
             status.text = "다음 입시정보 페이지 탐색: ${safeDisplayUrl(next)}"
             webView.loadUrl(next)
+            return
+        }
+        if (!cloudFrontierClaimInProgress && cloudFrontierClaimAttempts < MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS) {
+            cloudFrontierClaimInProgress = true
+            cloudFrontierClaimAttempts += 1
+            cloudOffload.claimFrontier(provider.wireName, 40) { result ->
+                runOnUiThread {
+                    cloudFrontierClaimInProgress = false
+                    if (!batchRunning || batchPausedForLogin) return@runOnUiThread
+                    val tasks = result.getOrNull() ?: JSONArray()
+                    var added = 0
+                    for (i in 0 until tasks.length()) {
+                        val item = tasks.optJSONObject(i) ?: continue
+                        val url = canonicalizeBatchUrl(item.optString("url"))
+                        val taskId = item.optString("taskId")
+                        if (url.isBlank() || taskId.isBlank() || !isBatchNavigableProviderUrl(url)) continue
+                        if (!batchVisited.contains(url) && batchQueued.add(url)) {
+                            batchQueue.addLast(url)
+                            cloudFrontierTaskIds[url] = taskId
+                            added += 1
+                        }
+                    }
+                    cloudFrontierClaimed += added
+                    if (added > 0) {
+                        cloudFrontierClaimAttempts = 0
+                        status.text = "Cloud frontier에서 ${added}개 탐색 작업 인계: 로그인된 브라우저 에이전트가 계속 처리합니다."
+                        handler.postDelayed({ loadNextBatchPage() }, 80L)
+                    } else {
+                        handler.postDelayed({ loadNextBatchPage() }, 80L)
+                    }
+                }
+            }
             return
         }
         if (LOCAL_FIRST_BETA && (provider == ProviderId.ADIGA || provider == ProviderId.JINHAK)) verifyLocalCompletionOrFinish()
@@ -2716,7 +2833,11 @@ class MainActivity : Activity() {
                 .put("localPagesSkipped", batchLocalPagesSkipped)
                 .put("localRecordsPersistedThisSegment", batchLocalRecordsPersisted)
                 .put("localAuditPagesScheduled", batchAuditPagesScheduled)
-                .put("universityDiscoveryPagesScheduled", batchUniversityDiscoveryPagesScheduled))
+                .put("universityDiscoveryPagesScheduled", batchUniversityDiscoveryPagesScheduled)
+                .put("jinhakAgentActionsExecuted", jinhakAgentActionsExecuted)
+                .put("cloudFrontierPublished", cloudFrontierPublished)
+                .put("cloudFrontierClaimed", cloudFrontierClaimed)
+                .put("sessionLease", sessionVault.summary(provider.wireName)?.toJson() ?: JSONObject.NULL))
             .put("localFirst", JSONObject()
                 .put("enabled", LOCAL_FIRST_BETA)
                 .put("cloudRequestsDuringBatch", 0)
@@ -2773,17 +2894,28 @@ class MainActivity : Activity() {
     }
 
     private fun enqueueDiscoveredLinks(links: JSONArray) {
+        val frontierBatch = JSONArray()
         for (i in 0 until links.length()) {
             val obj = links.optJSONObject(i) ?: continue
             val url = canonicalizeBatchUrl(obj.optString("url"))
             if (url.isBlank() || !isBatchNavigableProviderUrl(url)) continue
             enqueueDiscoveredUrl(url)
-            // One 2027 university-list pass is enough to discover university codes.
-            // Mirror each 2027 university detail to 2026 so the same university's
-            // 2025 actual-result section is collected without crawling the huge
-            // duplicate 2026 department list.
-            historicalMirrorUrl(url)?.let { mirror -> enqueueDiscoveredUrl(mirror) }
+            frontierBatch.put(url)
+            historicalMirrorUrl(url)?.let { mirror ->
+                enqueueDiscoveredUrl(mirror)
+                frontierBatch.put(mirror)
+            }
             if (batchQueue.size + batchVisited.size >= MAX_BATCH_PAGES * 2) break
+        }
+        if (frontierBatch.length() > 0) {
+            cloudOffload.publishFrontier(
+                provider = provider.wireName,
+                urls = frontierBatch,
+                sourceSafePath = runtimeSafePath(webView.url),
+                publicFetchEligible = provider == ProviderId.ADIGA
+            ) { accepted ->
+                if (accepted > 0) cloudFrontierPublished += accepted
+            }
         }
     }
 

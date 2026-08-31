@@ -15,6 +15,9 @@
       "database_id": "ed2a4417-c427-415b-8414-6b1f06c7194d"
     }
   ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
   "queues": {
     "producers": [
       {

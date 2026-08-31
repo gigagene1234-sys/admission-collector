@@ -16,7 +16,13 @@ export default {
         return json({
           ok: true,
           service: "admission-collector-offload",
-          version: "0.3.9",
+          version: "0.4.0",
+          capabilities: {
+            frontierBatch: true,
+            frontierClaim: true,
+            publicAdigaDiscovery: true,
+            acceptsBrowserSessionMaterial: false,
+          },
           time: new Date().toISOString(),
         });
       }
@@ -130,6 +136,22 @@ export default {
         return getResumePlan(env, runId, familyKey, requestedYear, totalPages, limit);
       }
 
+
+      if (request.method === "POST" && url.pathname === "/v1/frontier/batch") {
+        const body = await readJson(request, 512_000);
+        return frontierBatch(env, body);
+      }
+
+      if (request.method === "POST" && url.pathname === "/v1/frontier/claim") {
+        const body = await readJson(request, 64_000);
+        return frontierClaim(env, body);
+      }
+
+      if (request.method === "POST" && url.pathname === "/v1/frontier/complete") {
+        const body = await readJson(request, 128_000);
+        return frontierComplete(env, body);
+      }
+
       return json({ error: "not_found" }, 404);
     } catch (error) {
       console.error(JSON.stringify({
@@ -157,6 +179,10 @@ export default {
         throw error;
       }
     }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(processPublicFrontier(env, 12));
   },
 };
 
@@ -566,6 +592,186 @@ async function getResumePlan(env, runId, familyKey, requestedYear, totalPages, l
     serverErrorCooldownSeconds: Math.floor(SERVER_ERROR_RETRY_COOLDOWN_MS / 1000),
     truncated: missing.length >= limit || retry.length >= limit || deferred.length >= limit,
   });
+}
+
+
+function allowedProviderHost(provider, host) {
+  host = String(host || "").toLowerCase();
+  if (provider === "adiga") return host === "adiga.kr" || host.endsWith(".adiga.kr");
+  if (provider === "jinhak") return host === "jinhak.com" || host.endsWith(".jinhak.com");
+  return false;
+}
+
+function sanitizeFrontierUrl(provider, raw) {
+  try {
+    const url = new URL(String(raw || ""));
+    if (url.protocol !== "https:" || !allowedProviderHost(provider, url.hostname)) return null;
+    const forbidden = /token|session|auth|csrf|transkey|captcha|password|passwd|secret|credential|userid|ipmac/i;
+    const clean = new URL(url.origin + url.pathname);
+    for (const [key, value] of url.searchParams.entries()) {
+      if (!forbidden.test(key) && String(value).length <= 400) clean.searchParams.append(key, value);
+    }
+    clean.hash = "";
+    return clean.toString();
+  } catch (_) {
+    return null;
+  }
+}
+
+async function sha256Hex(text) {
+  const bytes = new TextEncoder().encode(String(text || ""));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function frontierBatch(env, body) {
+  const provider = String(body.provider || "").toLowerCase();
+  if (!['adiga', 'jinhak'].includes(provider)) return json({ error: "invalid_provider" }, 400);
+  const urls = Array.isArray(body.urls) ? body.urls.slice(0, 200) : [];
+  const sourceSafePath = String(body.sourceSafePath || "").slice(0, 300);
+  const publicFetchEligible = provider === 'adiga' && body.publicFetchEligible === true;
+  const now = new Date().toISOString();
+  let accepted = 0;
+  let rejected = 0;
+  for (const raw of urls) {
+    const clean = sanitizeFrontierUrl(provider, raw);
+    if (!clean) { rejected += 1; continue; }
+    const hash = await sha256Hex(clean);
+    const taskId = `${provider}-${hash}`;
+    const result = await env.DB.prepare(`
+      INSERT INTO crawl_frontier (
+        task_id, provider, url, url_hash, source_safe_path, state, priority,
+        public_fetch_eligible, attempt_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', 100, ?, 0, ?, ?)
+      ON CONFLICT(provider, url_hash) DO UPDATE SET
+        source_safe_path = CASE WHEN excluded.source_safe_path != '' THEN excluded.source_safe_path ELSE crawl_frontier.source_safe_path END,
+        public_fetch_eligible = MAX(crawl_frontier.public_fetch_eligible, excluded.public_fetch_eligible),
+        updated_at = excluded.updated_at
+    `).bind(taskId, provider, clean, hash, sourceSafePath, publicFetchEligible ? 1 : 0, now, now).run();
+    accepted += 1;
+  }
+  return json({ accepted, rejected, provider });
+}
+
+async function releaseExpiredFrontierLeases(env) {
+  const now = new Date().toISOString();
+  await env.DB.prepare(`
+    UPDATE crawl_frontier
+    SET state='pending', lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+    WHERE state='claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?
+  `).bind(now, now).run();
+}
+
+async function frontierClaim(env, body) {
+  const provider = String(body.provider || "").toLowerCase();
+  if (!['adiga', 'jinhak'].includes(provider)) return json({ error: "invalid_provider" }, 400);
+  const clientId = String(body.clientId || "").slice(0, 100);
+  if (!clientId) return json({ error: "clientId_required" }, 400);
+  const limit = boundedInt(body.limit || 20, 1, 50) || 20;
+  await releaseExpiredFrontierLeases(env);
+  const rows = await env.DB.prepare(`
+    SELECT task_id, url, attempt_count
+    FROM crawl_frontier
+    WHERE provider=? AND state='pending' AND attempt_count < 4
+    ORDER BY priority ASC, updated_at ASC
+    LIMIT ?
+  `).bind(provider, limit).all();
+  const now = new Date();
+  const expires = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
+  const tasks = [];
+  for (const row of rows.results || []) {
+    const updated = await env.DB.prepare(`
+      UPDATE crawl_frontier
+      SET state='claimed', lease_owner=?, lease_expires_at=?, attempt_count=attempt_count+1, updated_at=?
+      WHERE task_id=? AND state='pending'
+    `).bind(clientId, expires, now.toISOString(), row.task_id).run();
+    if (Number(updated?.meta?.changes || 0) > 0) {
+      tasks.push({ taskId: row.task_id, url: row.url, attempt: Number(row.attempt_count || 0) + 1 });
+    }
+  }
+  return json({ provider, tasks, leaseSeconds: 300 });
+}
+
+async function frontierComplete(env, body) {
+  const tasks = Array.isArray(body.tasks) ? body.tasks.slice(0, 100) : [];
+  const now = new Date().toISOString();
+  let updated = 0;
+  for (const item of tasks) {
+    const taskId = String(item?.taskId || "");
+    const requestedState = String(item?.state || "completed");
+    const state = ['completed', 'error', 'pending'].includes(requestedState) ? requestedState : 'error';
+    if (!taskId) continue;
+    const result = await env.DB.prepare(`
+      UPDATE crawl_frontier
+      SET state=?, error_type=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+      WHERE task_id=?
+    `).bind(state, nullableString(item?.errorType), now, taskId).run();
+    updated += Number(result?.meta?.changes || 0);
+  }
+  return json({ updated });
+}
+
+function extractPublicLinks(provider, baseUrl, html) {
+  const out = [];
+  const seen = new Set();
+  const regex = /<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']/ig;
+  let match;
+  while ((match = regex.exec(html)) && out.length < 180) {
+    let absolute;
+    try { absolute = new URL(match[1], baseUrl).toString(); } catch (_) { continue; }
+    const clean = sanitizeFrontierUrl(provider, absolute);
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+  }
+  return out;
+}
+
+function extractTitle(html) {
+  const match = String(html || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return match ? match[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300) : '';
+}
+
+async function processPublicFrontier(env, maxTasks) {
+  await releaseExpiredFrontierLeases(env);
+  const rows = await env.DB.prepare(`
+    SELECT task_id, provider, url, url_hash, attempt_count
+    FROM crawl_frontier
+    WHERE provider='adiga' AND public_fetch_eligible=1 AND state='pending' AND attempt_count < 4
+    ORDER BY priority ASC, updated_at ASC
+    LIMIT ?
+  `).bind(maxTasks).all();
+  for (const row of rows.results || []) {
+    const now = new Date().toISOString();
+    await env.DB.prepare(`UPDATE crawl_frontier SET state='claimed', lease_owner='cloud-public', lease_expires_at=?, attempt_count=attempt_count+1, updated_at=? WHERE task_id=? AND state='pending'`)
+      .bind(new Date(Date.now() + 60000).toISOString(), now, row.task_id).run();
+    try {
+      const response = await fetch(row.url, {
+        method: 'GET',
+        redirect: 'follow',
+        headers: { 'accept': 'text/html,application/xhtml+xml', 'user-agent': 'AdmissionCollectorCloud/0.4.0' },
+      });
+      const contentType = String(response.headers.get('content-type') || '').slice(0, 120);
+      const contentLength = Number(response.headers.get('content-length') || 0);
+      let html = '';
+      if (response.ok && /text\/html|application\/xhtml\+xml/i.test(contentType) && (!contentLength || contentLength <= 1200000)) {
+        html = (await response.text()).slice(0, 1200000);
+      }
+      const links = html ? extractPublicLinks('adiga', row.url, html) : [];
+      const bodyHash = html ? await sha256Hex(html) : null;
+      await env.DB.prepare(`
+        INSERT INTO public_page_snapshots(provider,url_hash,url,status_code,content_type,title,body_hash,discovered_links_json,observed_at)
+        VALUES('adiga',?,?,?,?,?,?,?,?)
+        ON CONFLICT(provider,url_hash) DO UPDATE SET status_code=excluded.status_code,content_type=excluded.content_type,title=excluded.title,body_hash=excluded.body_hash,discovered_links_json=excluded.discovered_links_json,observed_at=excluded.observed_at
+      `).bind(row.url_hash, row.url, response.status, contentType, extractTitle(html), bodyHash, JSON.stringify(links), now).run();
+      if (links.length) await frontierBatch(env, { provider: 'adiga', urls: links, sourceSafePath: new URL(row.url).hostname + new URL(row.url).pathname, publicFetchEligible: true });
+      await env.DB.prepare(`UPDATE crawl_frontier SET state='completed', error_type=NULL, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE task_id=?`)
+        .bind(now, row.task_id).run();
+    } catch (error) {
+      await env.DB.prepare(`UPDATE crawl_frontier SET state='pending', error_type=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE task_id=?`)
+        .bind(String(error?.name || 'public-fetch-error').slice(0, 80), now, row.task_id).run();
+    }
+  }
 }
 
 function scopeProviderFingerprint(provider, year, fingerprint) {

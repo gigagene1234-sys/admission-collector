@@ -144,6 +144,48 @@ class CloudOffloadClient(
         })
     }
 
+    fun getHealth(callback: (Result<JSONObject>) -> Unit) = io.execute {
+        callback(runCatching { publicGet("/health") })
+    }
+
+    fun publishFrontier(
+        provider: String,
+        urls: JSONArray,
+        sourceSafePath: String,
+        publicFetchEligible: Boolean,
+        callback: (Result<Int>) -> Unit
+    ) = io.execute {
+        callback(runCatching {
+            val response = post("/v1/frontier/batch", JSONObject()
+                .put("provider", provider)
+                .put("urls", urls)
+                .put("sourceSafePath", sourceSafePath)
+                .put("publicFetchEligible", publicFetchEligible))
+            response.optInt("accepted", 0)
+        })
+    }
+
+    fun claimFrontier(provider: String, clientId: String, limit: Int, callback: (Result<JSONArray>) -> Unit) = io.execute {
+        callback(runCatching {
+            post("/v1/frontier/claim", JSONObject()
+                .put("provider", provider)
+                .put("clientId", clientId)
+                .put("limit", limit.coerceIn(1, 50)))
+                .optJSONArray("tasks") ?: JSONArray()
+        })
+    }
+
+    fun completeFrontier(taskId: String, state: String, errorType: String?, callback: (Result<Unit>) -> Unit = {}) = io.execute {
+        callback(runCatching {
+            post("/v1/frontier/complete", JSONObject()
+                .put("tasks", JSONArray().put(JSONObject()
+                    .put("taskId", taskId)
+                    .put("state", state)
+                    .put("errorType", errorType ?: JSONObject.NULL))))
+            Unit
+        })
+    }
+
     fun shutdown() {
         io.shutdownNow()
     }
@@ -154,16 +196,18 @@ class CloudOffloadClient(
     private fun get(path: String): JSONObject =
         request("GET", path, null)
 
-    private fun request(method: String, path: String, body: String?): JSONObject {
-        val token = tokenProvider()?.takeIf { it.isNotBlank() }
-            ?: error("Cloud offload token is not configured")
+    private fun publicGet(path: String): JSONObject = request("GET", path, null, requireAuth = false)
+
+    private fun request(method: String, path: String, body: String?, requireAuth: Boolean = true): JSONObject {
+        val token = if (requireAuth) tokenProvider()?.takeIf { it.isNotBlank() }
+            ?: error("Cloud offload token is not configured") else null
 
         val base = workerUrl.trimEnd('/')
         val connection = (URL(base + path).openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 12_000
             readTimeout = 20_000
-            setRequestProperty("Authorization", "Bearer $token")
+            if (token != null) setRequestProperty("Authorization", "Bearer $token")
             setRequestProperty("Accept", "application/json")
             if (body != null) {
                 doOutput = true

@@ -30,6 +30,9 @@ class CloudOffloadCoordinator(context: Context) {
     @Volatile private var lastError: String? = null
     @Volatile private var uploadedChunks: Int = 0
     @Volatile private var reusedRun: Boolean = false
+    @Volatile private var frontierAvailable: Boolean? = null
+    @Volatile private var frontierProbeInFlight: Boolean = false
+    private val frontierClientId: String by lazy { prefs.getString(KEY_FRONTIER_CLIENT_ID, null) ?: java.util.UUID.randomUUID().toString().also { prefs.edit().putString(KEY_FRONTIER_CLIENT_ID, it).apply() } }
 
     data class PendingChunk(
         val provider: String,
@@ -222,6 +225,66 @@ class CloudOffloadCoordinator(context: Context) {
         currentClient.getResumePlan(runId, familyKey, requestedYear, totalPages, callback)
     }
 
+    fun probeFrontier(callback: (Boolean) -> Unit = {}) {
+        val cached = frontierAvailable
+        if (cached != null) { callback(cached); return }
+        synchronized(lock) {
+            if (frontierProbeInFlight) { callback(false); return }
+            frontierProbeInFlight = true
+            ensureClientLocked()
+        }
+        val currentClient = synchronized(lock) { client }
+        if (currentClient == null) {
+            frontierProbeInFlight = false
+            frontierAvailable = false
+            callback(false)
+            return
+        }
+        currentClient.getHealth { result ->
+            val available = result.getOrNull()?.optJSONObject("capabilities")?.optBoolean("frontierBatch", false) == true
+            frontierAvailable = available
+            frontierProbeInFlight = false
+            callback(available)
+        }
+    }
+
+    fun publishFrontier(
+        provider: String,
+        urls: JSONArray,
+        sourceSafePath: String,
+        publicFetchEligible: Boolean,
+        callback: (Int) -> Unit = {}
+    ) {
+        if (urls.length() == 0 || !isConfigured()) { callback(0); return }
+        probeFrontier { available ->
+            if (!available) { callback(0); return@probeFrontier }
+            val currentClient = synchronized(lock) { ensureClientLocked(); client }
+            if (currentClient == null) { callback(0); return@probeFrontier }
+            currentClient.publishFrontier(provider, urls, sourceSafePath, publicFetchEligible) { result ->
+                result.onFailure { lastError = it.message }
+                callback(result.getOrDefault(0))
+            }
+        }
+    }
+
+    fun claimFrontier(provider: String, limit: Int, callback: (Result<JSONArray>) -> Unit) {
+        if (!isConfigured()) { callback(Result.success(JSONArray())); return }
+        probeFrontier { available ->
+            if (!available) { callback(Result.success(JSONArray())); return@probeFrontier }
+            val currentClient = synchronized(lock) { ensureClientLocked(); client }
+            if (currentClient == null) { callback(Result.success(JSONArray())); return@probeFrontier }
+            currentClient.claimFrontier(provider, frontierClientId, limit, callback)
+        }
+    }
+
+    fun completeFrontier(taskId: String, state: String, errorType: String?) {
+        if (taskId.isBlank() || frontierAvailable != true) return
+        val currentClient = synchronized(lock) { ensureClientLocked(); client } ?: return
+        currentClient.completeFrontier(taskId, state, errorType) { result ->
+            result.onFailure { lastError = it.message }
+        }
+    }
+
     fun pendingPages(callback: (Result<JSONObject>) -> Unit) {
         val runId = synchronized(lock) { activeRunId }
         val currentClient = synchronized(lock) { ensureClientLocked(); client }
@@ -311,6 +374,7 @@ class CloudOffloadCoordinator(context: Context) {
         .put("uploadedChunks", uploadedChunks)
         .put("pendingChunks", synchronized(lock) { pendingChunks.size })
         .put("lastError", lastError ?: JSONObject.NULL)
+        .put("frontierAvailable", frontierAvailable ?: JSONObject.NULL)
 
     fun showSettingsDialog(activity: Activity, onChanged: (() -> Unit)? = null) {
         val layout = LinearLayout(activity).apply {
@@ -455,6 +519,7 @@ class CloudOffloadCoordinator(context: Context) {
         private const val KEY_TOKEN = "ingest_token"
         private const val KEY_ACTIVE_RUN = "active_run_id"
         private const val KEY_ACTIVE_PROVIDER = "active_provider"
+        private const val KEY_FRONTIER_CLIENT_ID = "frontier_client_id"
         private const val MAX_PENDING_CHUNKS = 200
     }
 }
