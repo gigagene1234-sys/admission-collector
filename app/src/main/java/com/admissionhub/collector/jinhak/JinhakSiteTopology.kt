@@ -11,6 +11,7 @@ enum class JinhakMissionLane(val wireName: String, val basePriority: Int) {
     SCORE_ANALYSIS("score-analysis", 88),
     RECOMMENDATION("recommendation", 82),
     STRATEGY("strategy", 68),
+    ADMISSION_KNOWLEDGE("admission-knowledge", 64),
     REFERENCE("reference", 35),
     MEDIA("media", 12),
     UNKNOWN("unknown", 5)
@@ -19,10 +20,10 @@ enum class JinhakMissionLane(val wireName: String, val basePriority: Int) {
 /**
  * Route-first map of the Jinhak admissions product.
  *
- * This is deliberately a mission topology, not a generic site crawler. The collector
- * should finish the user's admissions evidence lanes before spending time on editorial
- * or media content. Authenticated report pages are visited only inside an active,
- * user-started on-device collection session; browser credentials are never exported.
+ * v0.8.2 keeps discovery breadth, but treats the application as the unit of work:
+ * saved application -> current prediction -> mock support -> actual admit -> university
+ * result/criteria -> relevant strategy/knowledge. Low-value media stays reachable evidence,
+ * but never outranks an unfinished application mission.
  */
 object JinhakSiteTopology {
     private const val ROOT = "https://www.jinhak.com"
@@ -56,6 +57,8 @@ object JinhakSiteTopology {
                 JinhakMissionLane.RECOMMENDATION
             path.contains("/ipsi-analysis/ipsi-strategy") || text.contains("입시전략") ->
                 JinhakMissionLane.STRATEGY
+            path.contains("/ipsi-knowledge") || text.contains("입시지식") || text.contains("입시 상식") ->
+                JinhakMissionLane.ADMISSION_KNOWLEDGE
             path.contains("/jinhak-tv") -> JinhakMissionLane.MEDIA
             path.contains("/early/") || path.contains("/univ-major/") || path.contains("/univ-entrance-info/") ->
                 JinhakMissionLane.REFERENCE
@@ -77,6 +80,8 @@ object JinhakSiteTopology {
 
     fun shouldExpandEditorial(url: String, label: String = ""): Boolean {
         val lane = lane(url, label)
-        return lane == JinhakMissionLane.STRATEGY || lane == JinhakMissionLane.UNIVERSITY_RESULT
+        return lane == JinhakMissionLane.STRATEGY ||
+            lane == JinhakMissionLane.ADMISSION_KNOWLEDGE ||
+            lane == JinhakMissionLane.UNIVERSITY_RESULT
     }
 }
