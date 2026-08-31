@@ -42,6 +42,31 @@ object JinhakApplicationMission {
             .put("rawCombinedLabel", rawCombinedLabel ?: JSONObject.NULL)
     }
 
+    fun fromJson(obj: JSONObject?): Context? {
+        obj ?: return null
+        val university = obj.optString("university").takeIf { it.isNotBlank() && it != "null" }
+        val admissionCategory = obj.optString("admissionCategory").takeIf { it.isNotBlank() && it != "null" }
+        val admission = obj.optString("admission").takeIf { it.isNotBlank() && it != "null" }
+        val campus = obj.optString("campus").takeIf { it.isNotBlank() && it != "null" }
+        val department = obj.optString("departmentRaw").takeIf { it.isNotBlank() && it != "null" }
+        val identityKey = obj.optString("identityKey").takeIf { it.isNotBlank() && it != "null" }
+        val capacity = if (obj.has("capacity") && !obj.isNull("capacity")) obj.optInt("capacity").takeIf { it >= 0 } else null
+        if (university == null && department == null && admission == null && identityKey == null) return null
+        return Context(
+            year = obj.optInt("year", 2027),
+            university = university,
+            admissionCategory = admissionCategory,
+            admission = admission,
+            campus = campus,
+            departmentRaw = department,
+            capacity = capacity,
+            identityKey = identityKey,
+            parseSource = obj.optString("parseSource", "mission-json").ifBlank { "mission-json" },
+            confidence = obj.optString("confidence", "medium").ifBlank { "medium" },
+            rawCombinedLabel = obj.optString("rawCombinedLabel").takeIf { it.isNotBlank() && it != "null" }
+        )
+    }
+
     private val universityPrefix = Regex(
         """^(?:[0-9]{1,2}\s*칸\s*)?([가-힣A-Za-z0-9·.&+()\-]{2,45}?(?:대학교|교육대학교|과학기술원|대(?:\([^)]+\))?))(?=\s*\[)"""
     )
