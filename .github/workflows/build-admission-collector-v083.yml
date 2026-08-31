@@ -6,7 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-collector-v083.yml"
       - "scripts/apply_v083_concurrent_slow_lane.py"
-      - "scripts/fix_v083_patch_anchors.py"
+      - "scripts/fix_v083_patch_anchors_v2.py"
   workflow_dispatch:
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
 
       - name: Apply concurrent slow lane implementation
         run: |
-          python3 scripts/fix_v083_patch_anchors.py
+          python3 scripts/fix_v083_patch_anchors_v2.py
           python3 scripts/apply_v083_concurrent_slow_lane.py
 
       - name: Verify v0.8.3 scheduling and safety invariants
