@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-collector-v083.yml"
       - "scripts/apply_v083_concurrent_slow_lane.py"
+      - "scripts/fix_v083_patch_anchors.py"
   workflow_dispatch:
 
 permissions:
@@ -26,7 +27,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply concurrent slow lane implementation
-        run: python3 scripts/apply_v083_concurrent_slow_lane.py
+        run: |
+          python3 scripts/fix_v083_patch_anchors.py
+          python3 scripts/apply_v083_concurrent_slow_lane.py
 
       - name: Verify v0.8.3 scheduling and safety invariants
         shell: bash
@@ -45,18 +48,12 @@ jobs:
           grep -q 'versionName = "0.8.3"' app/build.gradle.kts
           grep -q 'Admission Collector v0.8.3 Concurrent Slow Lane' "$MANIFEST"
 
-          # 35s is escalation, not failure.
           grep -q 'JINHAK_SLOW_ESCALATION_MS = 35_000L' "$MAIN"
           grep -q 'jinhak-slow-lane-escalated' "$MAIN"
           grep -q 'slow-lane", 0, null' "$MAIN"
-          if grep -q 'JINHAK_ABSOLUTE_TARGET_MS' "$MAIN"; then
-            echo 'old absolute timeout constant remains'; exit 1
-          fi
-          if grep -q 'jinhak-absolute-target-timeout' "$MAIN"; then
-            echo '35s absolute failure behavior remains'; exit 1
-          fi
+          if grep -q 'JINHAK_ABSOLUTE_TARGET_MS' "$MAIN"; then echo 'old absolute timeout constant remains'; exit 1; fi
+          if grep -q 'jinhak-absolute-target-timeout' "$MAIN"; then echo '35s absolute failure behavior remains'; exit 1; fi
 
-          # Bounded concurrency and progress-based completion/failure.
           grep -q 'DEFAULT_MAX_WORKERS = 2' "$SLOW"
           grep -q 'STALL_CHECK_AFTER_MS = 90_000L' "$SLOW"
           grep -q 'STALL_NO_PROGRESS_MS = 18_000L' "$SLOW"
@@ -66,7 +63,6 @@ jobs:
           grep -q 'slowLanePool.hasWork()' "$MAIN"
           grep -q '메인 탐색 완료 · slow worker' "$MAIN"
 
-          # Mission replay and result merge.
           grep -q 'jinhakLastAgentActionMissionContext' "$MAIN"
           grep -q 'missionContext = mission?.toJson()' "$MAIN"
           grep -q 'replayScript' "$SLOW"
@@ -75,7 +71,6 @@ jobs:
           grep -q 'jinhakSlowLaneCompleted' "$MAIN"
           grep -q 'slowLaneProgressExtensions' "$MAIN"
 
-          # Existing observation and semantic protections must remain.
           grep -q 'CREATE TABLE IF NOT EXISTS observations' "$STORE"
           grep -q 'contractVersion\\\":3' "$STORE"
           grep -q 'previousYearCompetition' app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt
@@ -90,27 +85,18 @@ jobs:
           slow=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt').read_text()
           snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
           probe=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAuthorizedConnector.kt').read_text()
-          if 'jinhak-absolute-target-timeout' in main:
-              raise SystemExit('old timeout failure remains')
-          if 'localStore.markDocument(runId, target, "error", 0, "jinhak-absolute-target-timeout")' in main:
-              raise SystemExit('35s still marks error')
+          if 'jinhak-absolute-target-timeout' in main: raise SystemExit('old timeout failure remains')
+          if 'localStore.markDocument(runId, target, "error", 0, "jinhak-absolute-target-timeout")' in main: raise SystemExit('35s still marks error')
           for token in ['document.cookie','localStorage','sessionStorage','input.value','.value']:
-              if token in slow:
-                  raise SystemExit(f'slow lane reads forbidden browser secret/form material: {token}')
+              if token in slow: raise SystemExit(f'slow lane reads forbidden browser secret/form material: {token}')
           for token in ['document.cookie','localStorage','sessionStorage','input.value','location.href','fetch(','XMLHttpRequest']:
-              if token in probe:
-                  raise SystemExit(f'capability probe reads forbidden material: {token}')
+              if token in probe: raise SystemExit(f'capability probe reads forbidden material: {token}')
           dept=snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
-          if 'previousElementSibling' in dept or 'nextElementSibling' in dept:
-              raise SystemExit('cross-card department inheritance reintroduced')
-          required=['slow-lane-user-action-required','slow-lane-hard-max','slow-lane-no-progress','mission-action-not-found']
-          for token in required:
-              if token not in slow:
-                  raise SystemExit(f'missing slow-lane boundary: {token}')
-          if 'FrameLayout.LayoutParams.MATCH_PARENT' not in slow:
-              raise SystemExit('slow worker viewport is not full host size')
-          if 'translationX = -10000f' not in main:
-              raise SystemExit('offscreen worker host missing')
+          if 'previousElementSibling' in dept or 'nextElementSibling' in dept: raise SystemExit('cross-card department inheritance reintroduced')
+          for token in ['slow-lane-user-action-required','slow-lane-hard-max','slow-lane-no-progress','mission-action-not-found']:
+              if token not in slow: raise SystemExit(f'missing slow-lane boundary: {token}')
+          if 'FrameLayout.LayoutParams.MATCH_PARENT' not in slow: raise SystemExit('slow worker viewport is not full host size')
+          if 'translationX = -10000f' not in main: raise SystemExit('offscreen worker host missing')
           PY
 
       - name: Set up JDK 17
@@ -125,10 +111,7 @@ jobs:
           set -euo pipefail
           test -n "$ANDROID_SIGNING_SECRET"
           STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
-          openssl enc -d -aes-256-cbc -pbkdf2 \
-            -pass env:ANDROID_SIGNING_SECRET \
-            -in signing/admission-upload.keystore.enc \
-            -out "$STORE_FILE"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
           keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
           echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
           echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
@@ -168,10 +151,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add \
-            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
-            app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt \
-            app/src/main/AndroidManifest.xml
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt app/src/main/AndroidManifest.xml
           if ! git diff --cached --quiet; then
             git commit -m "Implement v0.8.3 concurrent slow lane"
             git push origin HEAD:main
