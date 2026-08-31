@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-collector-v082.yml"
       - "scripts/apply_v082_application_mission.py"
+      - "scripts/fix_v082_apply_anchor.py"
       - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt"
       - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt"
       - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakSiteTopology.kt"
@@ -29,7 +30,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply v0.8.2 source integration
-        run: python3 scripts/apply_v082_application_mission.py
+        run: |
+          python3 scripts/fix_v082_apply_anchor.py
+          python3 scripts/apply_v082_application_mission.py
 
       - name: Verify application-mission and privacy invariants
         shell: bash
@@ -49,7 +52,6 @@ jobs:
           grep -q 'versionName = "0.8.2"' app/build.gradle.kts
           grep -q 'Admission Collector v0.8.2 Application Mission Closure' app/src/main/AndroidManifest.xml
 
-          # Application identity must be bounded inside the same card, not invented from suffixes.
           grep -q 'same-card-admission-capacity-boundary' "$MISSION"
           grep -q 'capacityBoundary' "$MISSION"
           grep -q 'departmentRaw' "$MISSION"
@@ -59,7 +61,6 @@ jobs:
           grep -q 'missionApplicationContext' "$MAIN"
           grep -q 'same-application-agent-mission' "$ADAPTER"
 
-          # v0.8.1 semantic corruption regression gate.
           grep -q 'previousYearCompetition' "$MISSION"
           grep -q 'mockCompetition' "$MISSION"
           grep -q 'myCalculatedScore' "$MISSION"
@@ -75,21 +76,17 @@ jobs:
               raise SystemExit('broad competition regex still allows previous-year competition to become mockCompetition')
           if 'metrics.put("previousCompetition"' in adapter:
               raise SystemExit('legacy previousCompetition semantic field remains')
-          # The known v0.8.1 abbreviation must be accepted as RAW bounded label, not expanded.
           if '철도차량시스템공학과' in mission:
               raise SystemExit('mission parser hardcodes/invents canonical department name')
-          # No form values, cookie or storage material may be added to snapshot context payload.
           context_block=snap.split('function applicationContextForAction',1)[1].split('var nav=[]',1)[0]
           for forbidden in ['document.cookie','localStorage','sessionStorage','.value','input.value']:
               if forbidden in context_block:
                   raise SystemExit(f'forbidden material in application context helper: {forbidden}')
-          # Existing department context must continue to reject previous/next sibling inheritance.
           dept=snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
           if 'previousElementSibling' in dept or 'nextElementSibling' in dept:
               raise SystemExit('cross-card department sibling inheritance reintroduced')
           PY
 
-          # Mission closure and diagnostic coverage.
           grep -q 'maybeReturnToJinhakMissionOrigin' "$MAIN"
           grep -q 'applicationMissionCoverage' "$MAIN"
           grep -q 'applicationBoundAgentActions' "$MAIN"
@@ -99,7 +96,6 @@ jobs:
           grep -q 'contractVersion\\\":3' "$STORE"
           grep -q 'ApplicationMissions' "$STORE"
 
-          # Preserve all established safety/runtime boundaries.
           grep -q 'JINHAK_ABSOLUTE_TARGET_MS = 35_000L' "$MAIN"
           grep -q 'localStore.writeUnifiedExport(streamSession, writer)' "$MAIN"
           grep -q 'onRenderProcessGone' "$MAIN"
@@ -118,7 +114,6 @@ jobs:
         run: |
           python3 - <<'PY'
           import re
-          # Mirror the explicit card grammar as a build-time fixture against the real v0.8.1 shape.
           text='국립한국교통대[종합]학생부종합Ⅱ[의왕]철도차량시스템공13명 내 점수 764.02점 전교과 4.15등급 전년도 경쟁률 5.33 모의지원자 평균 750.02점 전교과 4.07등급 4칸'
           uni=re.search(r'^(.+?)(?=\[)',text).group(1)
           rest=text[len(uni):]
