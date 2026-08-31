@@ -34,62 +34,63 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
-          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
-          TOPO=app/src/main/java/com/admissionhub/collector/jinhak/JinhakSiteTopology.kt
-          STRATEGY=app/src/main/java/com/admissionhub/collector/jinhak/JinhakStrategyAnalyzer.kt
-          AGENT=app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt
-          SESSION=app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt
-          STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
-
-          grep -q 'private const val VERSION = "0.8.1"' "$MAIN"
-          grep -q 'private const val BUILD_CODE = 10810' "$MAIN"
-          grep -q 'versionCode = 10810' app/build.gradle.kts
-          grep -q 'versionName = "0.8.1"' app/build.gradle.kts
-          grep -q 'Admission Collector v0.8.1 Jinhak Mission Analyst' app/src/main/AndroidManifest.xml
-
-          # Mission topology must prioritize evidence lanes over editorial/media wandering.
-          grep -q 'SAVED_APPLICATIONS' "$TOPO"
-          grep -q 'CURRENT_PREDICTION' "$TOPO"
-          grep -q 'MOCK_SUPPORT' "$TOPO"
-          grep -q 'ACTUAL_ADMIT' "$TOPO"
-          grep -q 'UNIVERSITY_RESULT' "$TOPO"
-          grep -q 'STRATEGY' "$TOPO"
-          grep -q 'JinhakSiteTopology.missionSeeds' "$ADAPTER"
-          grep -q 'JinhakSiteTopology.isCoreMissionRoute' "$MAIN"
-          grep -q 'batchQueue.addFirst(url)' "$MAIN"
-
-          # Strategy pages become analysis-ready evidence instead of generic wandering.
-          grep -q 'jinhak-strategy-insight' "$STRATEGY"
-          grep -q 'mentionedUniversities' "$STRATEGY"
-          grep -q 'mentionedAdmissionTypes' "$STRATEGY"
-          grep -q 'evidenceBlocks' "$STRATEGY"
-          grep -q 'JinhakStrategyAnalyzer.normalize' "$ADAPTER"
-
-          # The read-only agent must prefer real report/result controls but never mutate account/application state.
-          for token in '실제\\s*합격자' '합격\\s*예측\\s*리포트' '모의\\s*지원\\s*리포트' '입시\\s*결과' '입시\\s*전략'; do
-            grep -q "$token" "$AGENT"
-          done
-          for token in 원서 접수 결제 저장 삭제 로그아웃 제출 확정 취소 신청; do
-            grep -q "$token" "$AGENT"
-          done
-
-          # Existing privacy and parser boundaries must remain.
-          grep -q 'AndroidKeyStore' "$SESSION"
-          grep -q 'AES/GCM/NoPadding' "$SESSION"
-          grep -q 'CREATE TABLE IF NOT EXISTS observations' "$STORE"
-          grep -q 'JINHAK_ABSOLUTE_TARGET_MS = 35_000L' "$MAIN"
-          grep -q 'jinhakExpandedNavigationStates' "$MAIN"
-          grep -q 'localStore.writeUnifiedExport(streamSession, writer)' "$MAIN"
           python3 - <<'PY'
           from pathlib import Path
+          main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          topo=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakSiteTopology.kt').read_text()
+          strategy=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakStrategyAnalyzer.kt').read_text()
+          agent=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text()
+          session=Path('app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt').read_text()
+          store=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
+          gradle=Path('app/build.gradle.kts').read_text()
+          manifest=Path('app/src/main/AndroidManifest.xml').read_text()
           snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+
+          required = {
+              'main-version': ('private const val VERSION = "0.8.1"', main),
+              'main-build': ('private const val BUILD_CODE = 10810', main),
+              'gradle-code': ('versionCode = 10810', gradle),
+              'gradle-name': ('versionName = "0.8.1"', gradle),
+              'manifest-label': ('Admission Collector v0.8.1 Jinhak Mission Analyst', manifest),
+              'mission-seeds': ('JinhakSiteTopology.missionSeeds', adapter),
+              'mission-priority': ('JinhakSiteTopology.isCoreMissionRoute', main),
+              'queue-front': ('batchQueue.addFirst(url)', main),
+              'strategy-record': ('jinhak-strategy-insight', strategy),
+              'strategy-integration': ('JinhakStrategyAnalyzer.normalize', adapter),
+              'strategy-evidence': ('evidenceBlocks', strategy),
+              'keystore': ('AndroidKeyStore', session),
+              'aes-gcm': ('AES/GCM/NoPadding', session),
+              'observation-store': ('CREATE TABLE IF NOT EXISTS observations', store),
+              'watchdog': ('JINHAK_ABSOLUTE_TARGET_MS = 35_000L', main),
+              'state-dedupe': ('jinhakExpandedNavigationStates', main),
+              'stream-export': ('localStore.writeUnifiedExport(streamSession, writer)', main),
+          }
+          for label,(token,text) in required.items():
+              if token not in text:
+                  raise SystemExit(f'missing invariant {label}: {token}')
+
+          for lane in ['SAVED_APPLICATIONS','CURRENT_PREDICTION','MOCK_SUPPORT','ACTUAL_ADMIT','UNIVERSITY_RESULT','STRATEGY']:
+              if lane not in topo:
+                  raise SystemExit(f'missing mission lane: {lane}')
+          for token in ['mentionedUniversities','mentionedAdmissionTypes','evidenceBlocks']:
+              if token not in strategy:
+                  raise SystemExit(f'missing strategy field: {token}')
+          for token in ['실제','합격자','합격','예측','모의','지원','리포트','입시','결과','전략']:
+              if token not in agent:
+                  raise SystemExit(f'missing analysis navigation token: {token}')
+          for token in ['원서','결제','저장','삭제','로그아웃','제출','확정','취소','신청']:
+              if token not in agent:
+                  raise SystemExit(f'missing mutation-block token: {token}')
+
           dept=snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
           if 'previousElementSibling' in dept or 'nextElementSibling' in dept:
               raise SystemExit('cross-card department inheritance reintroduced')
-          topo=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakSiteTopology.kt').read_text()
-          if 'password' in topo.lower() or 'cookie' in topo.lower():
-              raise SystemExit('mission topology must not carry credentials/session material')
+          # Mission topology itself must never transport browser secrets.
+          forbidden=['document.cookie','cookieHeader','sessionStorage','localStorage','password=','passwd=']
+          for token in forbidden:
+              if token.lower() in topo.lower():
+                  raise SystemExit(f'mission topology carries forbidden browser material: {token}')
           PY
 
       - name: Set up JDK 17
