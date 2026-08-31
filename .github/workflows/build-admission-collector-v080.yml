@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-collector-v080.yml"
       - "scripts/apply_v080_post071_quality.py"
+      - "scripts/fix_v080_post071_kotlin_escape.py"
   workflow_dispatch:
 
 permissions:
@@ -26,7 +27,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply post-v0.7.1 quality patch
-        run: python3 scripts/apply_v080_post071_quality.py
+        run: |
+          python3 scripts/apply_v080_post071_quality.py
+          python3 scripts/fix_v080_post071_kotlin_escape.py
 
       - name: Verify post-v0.7.1 collection invariants
         shell: bash
@@ -45,14 +48,12 @@ jobs:
           grep -q 'versionCode = 10800' app/build.gradle.kts
           grep -q 'versionName = "0.8.0"' app/build.gradle.kts
 
-          # v0.7.1 finding A: identical rendered states must not re-expand links forever.
           grep -q 'jinhakExpandedNavigationStates' "$MAIN"
           grep -q 'jinhakRepeatedNavigationStateSkips' "$MAIN"
           grep -q 'ObservationEvidence.identity' "$MAIN"
           grep -q 'jinhak-repeat-state-expansion-skip' "$MAIN"
           grep -q 'uniqueNavigationExpansionStates' "$MAIN"
 
-          # v0.7.1 finding B: route-first classification, no heading-only SAT-minimum fallback.
           grep -q 'jinhak-admission-strategy' "$JINHAK"
           grep -q 'jinhak-admission-feature' "$JINHAK"
           grep -q 'jinhak-media-content' "$JINHAK"
@@ -69,15 +70,15 @@ jobs:
           gate = 'pageType in setOf("jinhak-actual-admit-report", "jinhak-score-calc-report")'
           if gate not in text:
               raise SystemExit('generic parser is not page-type gated')
+          if 'Regex("(학과\\\\s*심층분석' not in text:
+              raise SystemExit('Kotlin regex escaping is not compile-safe')
           PY
 
-          # v0.7.1 finding C: Errors sheet must have actual row-level evidence.
           grep -q 'errorEvidence' "$STORE"
           grep -q 'syncDiagnostics' "$STORE"
           grep -q 'SELECT navigation_key,state,error_type,retry_count,updated_at FROM documents' "$STORE"
           grep -q 'contractVersion\\\":2' "$STORE"
 
-          # Retain the established privacy and context boundaries.
           grep -q 'AndroidKeyStore' "$SESSION"
           grep -q 'AES/GCM/NoPadding' "$SESSION"
           grep -q 'object JinhakAgentNavigator' "$AGENT"
