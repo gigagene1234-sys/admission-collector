@@ -1,5 +1,6 @@
 name: Build Admission Collector v0.8.3 Corrected Release
 
+# lifecycle-fixer-trigger: 2026-08-31
 on:
   push:
     branches: [ main ]
