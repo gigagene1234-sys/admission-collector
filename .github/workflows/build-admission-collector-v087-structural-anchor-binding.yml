@@ -18,156 +18,11 @@ jobs:
       ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-        with: {fetch-depth: 0}
+        with:
+          fetch-depth: 0
 
-      - name: Apply structural same-card mission anchor binding
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          snap_path = Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt')
-          agent_path = Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt')
-          main_path = Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt')
-          gradle_path = Path('app/build.gradle.kts')
-          manifest_path = Path('app/src/main/AndroidManifest.xml')
-
-          snap = snap_path.read_text()
-          if 'var jinhakCardBindings=[];' not in snap:
-              old = '  var jinhakCards=[];\n'
-              new = '  var jinhakCards=[];\n  var jinhakCardBindings=[];\n'
-              if old not in snap:
-                  raise SystemExit('jinhakCards declaration anchor not found')
-              snap = snap.replace(old, new, 1)
-
-          if 'jinhakCardBindings.push({' not in snap:
-              old = '''      jinhakCards.push({
-        text:entry.text,
-        score:entry.score,
-        rootTag:String(entry.el.tagName||'').slice(0,20),
-        primaryPrediction:true,
-        university:universityCtx.name,
-        universitySource:universityCtx.source,
-        universityDepth:universityCtx.depth,
-        department:departmentCtx.name,
-        departmentSource:departmentCtx.source,
-        departmentDepth:departmentCtx.depth
-      });'''
-              new = '''      // v0.8.7: retain the exact DOM root that produced the already-structured
-      // university/department pair. This is runtime-only and is never exported as raw DOM.
-      jinhakCardBindings.push({
-        root:entry.el,
-        text:entry.text,
-        university:universityCtx.name||'',
-        department:departmentCtx.name||''
-      });
-      jinhakCards.push({
-        text:entry.text,
-        score:entry.score,
-        rootTag:String(entry.el.tagName||'').slice(0,20),
-        primaryPrediction:true,
-        university:universityCtx.name,
-        universitySource:universityCtx.source,
-        universityDepth:universityCtx.depth,
-        department:departmentCtx.name,
-        departmentSource:departmentCtx.source,
-        departmentDepth:departmentCtx.depth
-      });'''
-              if old not in snap:
-                  raise SystemExit('jinhakCards push block not found')
-              snap = snap.replace(old, new, 1)
-
-          if 'function applicationBindingForAction(el)' not in snap:
-              anchor = '  function applicationContextForAction(el){\n'
-              helper = '''  // v0.8.7: bind an action only to a detected card root that actually contains it.
-  // No previous/next sibling lookup and no page-wide nearest-card inference are permitted.
-  function applicationBindingForAction(el){
-    var result={contextText:'',university:'',department:'',source:'none'};
-    if(!isJinhakHost||!el) return result;
-    var matches=[];
-    for(var bi=0;bi<jinhakCardBindings.length;bi++){
-      var binding=jinhakCardBindings[bi];
-      if(binding&&binding.root&&binding.root.contains&&binding.root.contains(el)) matches.push(binding);
-    }
-    if(matches.length){
-      // Nested roots can legitimately contain the same action. The smallest structured root is
-      // the strictest same-card boundary and therefore wins deterministically.
-      matches.sort(function(a,b){return String(a.text||'').length-String(b.text||'').length;});
-      var chosen=matches[0];
-      result.contextText=String(chosen.text||'').slice(0,3000);
-      result.university=String(chosen.university||'').slice(0,80);
-      result.department=String(chosen.department||'').slice(0,120);
-      result.source='same-card-root';
-      return result;
-    }
-    result.contextText=applicationContextForAction(el);
-    if(result.contextText) result.source='ancestor-text';
-    return result;
-  }
-
-'''
-              if anchor not in snap:
-                  raise SystemExit('applicationContextForAction boundary not found')
-              snap = snap.replace(anchor, helper + anchor, 1)
-
-          old = '''      var applicationContext=applicationContextForAction(a);
-      var missionLink=!!route && String(a.tagName||'').toUpperCase()==='A' && applicationContext.length>0;'''
-          new = '''      var applicationBinding=applicationBindingForAction(a);
-      var applicationContext=applicationBinding.contextText||'';
-      var missionLink=!!route && String(a.tagName||'').toUpperCase()==='A' && applicationContext.length>0;'''
-          if old in snap:
-              snap = snap.replace(old, new, 1)
-          elif 'var applicationBinding=applicationBindingForAction(a);' not in snap:
-              raise SystemExit('agent application context block not found')
-
-          old = "missionAnchorDiscovery.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:'mission-link-navigation',contextText:applicationContext});"
-          new = "missionAnchorDiscovery.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:'mission-link-navigation',contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source});"
-          if old in snap:
-              snap = snap.replace(old, new, 1)
-          elif 'applicationBindingSource:applicationBinding.source' not in snap:
-              raise SystemExit('missionAnchorDiscovery push not found')
-
-          old = "var entry={scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(role==='tab'?'tab-navigation':'read-navigation'),contextText:applicationContext};"
-          new = "var entry={scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(role==='tab'?'tab-navigation':'read-navigation'),contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source};"
-          if old in snap:
-              snap = snap.replace(old, new, 1)
-          elif 'applicationUniversity:applicationBinding.university' not in snap:
-              raise SystemExit('mission action entry not found')
-          snap_path.write_text(snap)
-
-          agent = agent_path.read_text()
-          old = '                val app = JinhakApplicationMission.parseCard(contextText)\n'
-          new = '''                val explicitUniversity = obj.optString("applicationUniversity")
-                    .replace(Regex("\\\\s+"), " ").trim().take(80).takeIf { it.isNotBlank() }
-                val explicitDepartment = obj.optString("applicationDepartment")
-                    .replace(Regex("\\\\s+"), " ").trim().take(120).takeIf { it.isNotBlank() }
-                val app = JinhakApplicationMission.parseCard(
-                    contextText,
-                    explicitUniversity = explicitUniversity,
-                    explicitDepartment = explicitDepartment
-                )
-'''
-          if old in agent:
-              agent = agent.replace(old, new, 1)
-          elif 'explicitUniversity = obj.optString("applicationUniversity")' not in agent:
-              raise SystemExit('JinhakAgentNavigator parseCard anchor not found')
-          agent_path.write_text(agent)
-
-          main = main_path.read_text()
-          main = main.replace('private const val VERSION = "0.8.6"', 'private const val VERSION = "0.8.7"', 1)
-          main = main.replace('private const val BUILD_CODE = 10860', 'private const val BUILD_CODE = 10870', 1)
-          main_path.write_text(main)
-
-          gradle = gradle_path.read_text()
-          gradle = gradle.replace('versionCode = 10860', 'versionCode = 10870', 1)
-          gradle = gradle.replace('versionName = "0.8.6"', 'versionName = "0.8.7"', 1)
-          gradle_path.write_text(gradle)
-
-          manifest = manifest_path.read_text()
-          manifest = manifest.replace('Admission Collector v0.8.6 Persistent Mission Ledger', 'Admission Collector v0.8.7 Structural Anchor Binding', 1)
-          manifest_path.write_text(manifest)
-          PY
+      - name: Apply v0.8.7 source patch
+        run: python3 .github/scripts/patch_v087.py
 
       - name: Verify v0.8.7 source invariants
         shell: bash
@@ -180,7 +35,6 @@ jobs:
           ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
           YEAR=app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt
           STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
-
           grep -q 'VERSION = "0.8.7"' "$MAIN"
           grep -q 'BUILD_CODE = 10870' "$MAIN"
           grep -q 'versionCode = 10870' app/build.gradle.kts
@@ -202,24 +56,15 @@ jobs:
           grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
           grep -q 'historical-multi-year-or-unresolved' "$YEAR"
           grep -q 'applicantAverageGrade' "$ADAPTER"
-
-          python3 - <<'PY'
-          from pathlib import Path
-          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
-          ledger=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt').read_text()
-          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
-          if 'previousElementSibling' in snap or 'nextElementSibling' in snap:
-              raise SystemExit('neighbor-card traversal introduced')
-          if 'override val supportsBatchCrawl = true' in adapter:
-              raise SystemExit('protected broad Jinhak crawl re-enabled')
-          if any(x in ledger for x in ('document.cookie','localStorage','sessionStorage')):
-              raise SystemExit('ledger session-material access regression')
-          if 'binding.root.contains(el)' not in snap:
-              raise SystemExit('strict DOM containment binding missing')
-          PY
+          ! grep -q 'previousElementSibling' "$SNAP"
+          ! grep -q 'nextElementSibling' "$SNAP"
+          ! grep -q 'override val supportsBatchCrawl = true' "$ADAPTER"
 
       - uses: actions/setup-java@v5
-        with: {distribution: temurin, java-version: '17'}
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: Restore stable signing key
         shell: bash
         run: |
@@ -230,14 +75,21 @@ jobs:
           keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
           echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
           echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
       - uses: android-actions/setup-android@v3
-      - run: |
+
+      - name: Install Android SDK 35
+        run: |
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
       - uses: gradle/actions/setup-gradle@v4
-        with: {gradle-version: '8.7'}
+        with:
+          gradle-version: '8.7'
+
       - name: Build patched v0.8.7 source
         run: gradle --no-daemon :app:assembleDebug
+
       - name: Verify patched v0.8.7 APK
         shell: bash
         run: |
@@ -249,18 +101,18 @@ jobs:
           grep -q "versionName='0.8.7'" /tmp/badging.txt
           grep -q "application-label:'Admission Collector v0.8.7 Structural Anchor Binding'" /tmp/badging.txt
           sha256sum "$APK"
+
       - name: Commit v0.8.7 source
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add \
-            app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
-            app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt \
-            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
-            app/build.gradle.kts \
-            app/src/main/AndroidManifest.xml
+          git add app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          git add app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          git add app/build.gradle.kts
+          git add app/src/main/AndroidManifest.xml
           if git diff --cached --quiet; then
             echo "No source changes to commit"
           else
@@ -276,7 +128,10 @@ jobs:
       ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-        with: {ref: main, fetch-depth: 1}
+        with:
+          ref: main
+          fetch-depth: 1
+
       - name: Verify committed v0.8.7 source
         shell: bash
         run: |
@@ -293,8 +148,12 @@ jobs:
           grep -q 'override val supportsBatchCrawl = false' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
           ! grep -q 'previousElementSibling' "$SNAP"
           ! grep -q 'nextElementSibling' "$SNAP"
+
       - uses: actions/setup-java@v5
-        with: {distribution: temurin, java-version: '17'}
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: Restore stable signing key
         shell: bash
         run: |
@@ -305,14 +164,21 @@ jobs:
           keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
           echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
           echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
       - uses: android-actions/setup-android@v3
-      - run: |
+
+      - name: Install Android SDK 35
+        run: |
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
       - uses: gradle/actions/setup-gradle@v4
-        with: {gradle-version: '8.7'}
+        with:
+          gradle-version: '8.7'
+
       - name: Build committed main
         run: gradle --no-daemon :app:assembleDebug
+
       - name: Verify final v0.8.7 APK
         shell: bash
         run: |
@@ -326,6 +192,7 @@ jobs:
           grep -q "application-label:'Admission Collector v0.8.7 Structural Anchor Binding'" badging.txt
           cp "$SRC" "$OUT"
           sha256sum "$OUT" | tee Admission-Collector-v0.8.7-Structural-Anchor-Binding.sha256
+
       - uses: actions/upload-artifact@v4
         with:
           name: admission-collector-main-v0.8.7-final
@@ -335,6 +202,7 @@ jobs:
             apksigner.txt
             badging.txt
           retention-days: 14
+
       - name: Publish v0.8.7 release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -342,7 +210,7 @@ jobs:
         run: |
           set -euo pipefail
           SHA=$(git rev-parse HEAD)
-          NOTES="Committed-main independent build. versionName 0.8.7 / versionCode 10870. Structural Mission Anchor Binding carries university/department only from an exact containing same-card DOM root into mission actions, then reuses the existing Kotlin identity parser and Persistent Mission Target Ledger. No neighboring-card inference was added. Build, signature, source-invariant and package checks passed. Real-device E2E remains unverified until a new exported JSON is analyzed. Commit: $SHA"
+          NOTES="Committed-main independent build. versionName 0.8.7 / versionCode 10870. Structural Mission Anchor Binding carries university and department only from an exact containing same-card DOM root into mission actions, then reuses the existing Kotlin identity parser and Persistent Mission Target Ledger. No neighboring-card inference was added. Build, signature, source-invariant and package checks passed. Real-device E2E remains unverified until a new exported JSON is analyzed. Commit: $SHA"
           if gh release view v0.8.7 >/dev/null 2>&1; then
             gh release upload v0.8.7 Admission-Collector-v0.8.7-Structural-Anchor-Binding.apk Admission-Collector-v0.8.7-Structural-Anchor-Binding.sha256 --clobber
           else
