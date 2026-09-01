@@ -14,7 +14,13 @@ data class PaginationPlan(
 
 interface ProviderAdapter {
     val id: ProviderId
+    /** Broad provider-wide batch traversal, intended for public/authorized collection surfaces. */
     val supportsBatchCrawl: Boolean
+    /**
+     * Explicit user-started, authenticated, bounded read-only mission traversal.
+     * This is intentionally distinct from broad provider-wide batch crawling.
+     */
+    val supportsUserSessionMissionTraversal: Boolean get() = false
 
     fun accepts(url: String): Boolean
     fun seedUrls(): List<String> = emptyList()
