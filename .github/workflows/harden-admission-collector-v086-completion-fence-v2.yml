@@ -1,0 +1,225 @@
+name: Harden Admission Collector v0.8.6 Completion Fence v2
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/harden-admission-collector-v086-completion-fence-v2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+
+      - name: Add strict ledger completion fence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          ledger_path=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt')
+          main_path=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt')
+
+          ledger=ledger_path.read_text()
+          if 'fun failAllOutstanding(reason: String)' not in ledger:
+              anchor='    fun stateOf(targetId: String?): State?'
+              if anchor not in ledger:
+                  raise SystemExit('ledger stateOf boundary not found')
+              method='''    /** Terminalize non-terminal targets before final completion. */
+              fun failAllOutstanding(reason: String): Int {
+                  val stranded = targets.values.filter {
+                      it.state == State.PENDING || it.state == State.CLICKED || it.state == State.DEFERRED
+                  }
+                  stranded.forEach {
+                      it.state = State.FAILED
+                      it.failureReason = reason.take(100)
+                      it.updatedAtMs = System.currentTimeMillis()
+                  }
+                  return stranded.size
+              }
+
+          '''
+              ledger=ledger.replace(anchor, method+anchor, 1)
+              ledger_path.write_text(ledger)
+
+          main=main_path.read_text()
+          marker='jinhak-mission-ledger-completion-fence'
+          if marker not in main:
+              start=main.find('    private fun verifyLocalCompletionOrFinish() {')
+              end=main.find('    private fun verifyCloudCompletionOrFinish(', start)
+              if start < 0 or end < 0 or end <= start:
+                  raise SystemExit('local completion function boundaries not found')
+              fn='''    private fun verifyLocalCompletionOrFinish() {
+                  if (!batchRunning || batchPausedForLogin) return
+                  if (provider == ProviderId.JINHAK && jinhakMissionTargetLedger.outstandingCount() > 0) {
+                      val outstanding = jinhakMissionTargetLedger.outstandingCount()
+                      val terminalized = jinhakMissionTargetLedger.failAllOutstanding("completion-fence-stranded-target")
+                      batchErrors.put(JSONObject()
+                          .put("type", "jinhak-mission-ledger-completion-fence")
+                          .put("outstandingBeforeFence", outstanding)
+                          .put("terminalized", terminalized))
+                      recordRuntimeEvent("jinhak-mission-ledger-completion-fence", JSONObject()
+                          .put("outstandingBeforeFence", outstanding)
+                          .put("terminalized", terminalized)
+                          .put("ledger", jinhakMissionTargetLedger.summary()))
+                      finishBatch("completed-with-local-errors")
+                      return
+                  }
+                  val runId = localRunId
+                  if (runId == null) {
+                      finishBatch("completed")
+                      return
+                  }
+                  val unresolved = localStore.unresolvedCount(runId)
+                  if (unresolved > 0) finishBatch("completed-with-local-errors")
+                  else finishBatch("completed")
+              }
+
+          '''
+              main=main[:start]+fn+main[end:]
+              main_path.write_text(main)
+          PY
+
+      - name: Verify source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          LEDGER=app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt
+          STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
+          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          YEAR=app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt
+          grep -q 'VERSION = "0.8.6"' "$MAIN"
+          grep -q 'BUILD_CODE = 10860' "$MAIN"
+          grep -q 'versionCode = 10860' app/build.gradle.kts
+          grep -q 'versionName = "0.8.6"' app/build.gradle.kts
+          grep -q 'fun failAllOutstanding(reason: String): Int' "$LEDGER"
+          grep -q 'jinhak-mission-ledger-completion-fence' "$MAIN"
+          grep -q 'jinhakDiagnosticsSummary' "$STORE"
+          grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
+          grep -q 'historical-multi-year-or-unresolved' "$YEAR"
+          ! grep -q 'override val supportsBatchCrawl = true' "$ADAPTER"
+          ! grep -q 'document.cookie' "$LEDGER"
+          ! grep -q 'localStorage' "$LEDGER"
+          ! grep -q 'sessionStorage' "$LEDGER"
+
+      - uses: actions/setup-java@v5
+        with: {distribution: temurin, java-version: '17'}
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: '8.7'}
+      - name: Build patched source
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Verify patched APK
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "versionCode='10860'" /tmp/badging.txt
+          grep -q "versionName='0.8.6'" /tmp/badging.txt
+          grep -q "application-label:'Admission Collector v0.8.6 Persistent Mission Ledger'" /tmp/badging.txt
+          sha256sum "$APK"
+      - name: Commit hardened source
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt
+          if ! git diff --cached --quiet; then
+            git commit -m "Harden v0.8.6 mission ledger completion fence"
+            git push origin HEAD:main
+          fi
+
+  independent-main-build:
+    needs: patch-build-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: main, fetch-depth: 1}
+      - name: Verify committed source
+        run: |
+          set -euo pipefail
+          grep -q 'jinhak-mission-ledger-completion-fence' app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          grep -q 'fun failAllOutstanding(reason: String): Int' app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt
+          grep -q 'jinhakDiagnosticsSummary' app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
+          grep -q 'override val supportsBatchCrawl = false' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'versionCode = 10860' app/build.gradle.kts
+          grep -q 'versionName = "0.8.6"' app/build.gradle.kts
+      - uses: actions/setup-java@v5
+        with: {distribution: temurin, java-version: '17'}
+      - name: Restore stable signing key
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: '8.7'}
+      - name: Build committed main
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Verify final APK
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.8.6-Persistent-Mission-Ledger.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10860'" badging.txt
+          grep -q "versionName='0.8.6'" badging.txt
+          grep -q "application-label:'Admission Collector v0.8.6 Persistent Mission Ledger'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.8.6-Persistent-Mission-Ledger.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.8.6-final
+          path: |
+            Admission-Collector-v0.8.6-Persistent-Mission-Ledger.apk
+            Admission-Collector-v0.8.6-Persistent-Mission-Ledger.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="Committed-main independent build. versionName 0.8.6 / versionCode 10860. Includes strict mission-ledger completion fence. Build, signature, and package checks passed. Real-device E2E remains unverified until exported JSON is analyzed. Commit: $SHA"
+          if gh release view v0.8.6 >/dev/null 2>&1; then
+            gh release upload v0.8.6 Admission-Collector-v0.8.6-Persistent-Mission-Ledger.apk Admission-Collector-v0.8.6-Persistent-Mission-Ledger.sha256 --clobber
+          else
+            gh release create v0.8.6 Admission-Collector-v0.8.6-Persistent-Mission-Ledger.apk Admission-Collector-v0.8.6-Persistent-Mission-Ledger.sha256 --target "$SHA" --title "Admission Collector v0.8.6 — Persistent Mission Ledger" --notes "$NOTES"
+          fi
