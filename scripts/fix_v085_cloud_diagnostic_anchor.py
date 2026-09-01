@@ -12,7 +12,9 @@ m = m.replace(
     cloud_failed_anchor + '\\n                        .put("cloudFrontierOutstanding", (cloudFrontierClaimed - cloudFrontierCompleted).coerceAtLeast(0))'
 )
 '''
-new, count = pattern.subn(replacement, t, count=1)
+# Use a callable replacement so re.sub does not reinterpret backslash escapes
+# embedded in the generated Python source.
+new, count = pattern.subn(lambda _match: replacement, t, count=1)
 if count != 1:
     raise SystemExit(f'expected one cloud diagnostic patch stanza, found {count}')
 p.write_text(new)
