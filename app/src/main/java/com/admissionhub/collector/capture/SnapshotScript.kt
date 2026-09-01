@@ -422,26 +422,60 @@ object SnapshotScript {
     if(admissionTerms.test(bt)) blocks.push(bt);
   }
 
-  // v0.8.7: bind an action only to a detected card root that actually contains it.
-  // No previous/next sibling lookup and no page-wide nearest-card inference are permitted.
+  // v0.8.8: bind report actions by direct card containment or by a bounded ancestor that contains exactly one detected card root.
+  // No sibling traversal and no nearest-card inference are permitted.
   function applicationBindingForAction(el){
     var result={contextText:'',university:'',department:'',source:'none'};
     if(!isJinhakHost||!el) return result;
-    var matches=[];
-    for(var bi=0;bi<jinhakCardBindings.length;bi++){
-      var binding=jinhakCardBindings[bi];
-      if(binding&&binding.root&&binding.root.contains&&binding.root.contains(el)) matches.push(binding);
-    }
-    if(matches.length){
-      // Nested roots may contain the same action. Prefer the smallest structured root.
-      matches.sort(function(a,b){return String(a.text||'').length-String(b.text||'').length;});
-      var chosen=matches[0];
-      result.contextText=String(chosen.text||'').slice(0,3000);
-      result.university=String(chosen.university||'').slice(0,80);
-      result.department=String(chosen.department||'').slice(0,120);
-      result.source='same-card-root';
+
+    function useBinding(binding,source){
+      result.contextText=String(binding.text||'').slice(0,3000);
+      result.university=String(binding.university||'').slice(0,80);
+      result.department=String(binding.department||'').slice(0,120);
+      result.source=source;
       return result;
     }
+
+    // Gate A1: strongest ownership proof — the action itself is inside one detected card root.
+    var direct=[];
+    for(var bi=0;bi<jinhakCardBindings.length;bi++){
+      var binding=jinhakCardBindings[bi];
+      if(binding&&binding.root&&binding.root.contains&&binding.root.contains(el)) direct.push(binding);
+    }
+    if(direct.length){
+      direct.sort(function(a,b){return String(a.text||'').length-String(b.text||'').length;});
+      return useBinding(direct[0],'same-card-root');
+    }
+
+    // Gate A2: some Jinhak layouts render the report toolbar as a sibling of the metric/card
+    // body. Walk ancestors only. The first bounded ancestor may own the action only when it
+    // contains exactly ONE non-overlapping detected card root. If two cards enter the same
+    // container, binding is rejected rather than guessed. No previous/next sibling or nearest
+    // card inference is used.
+    var cur=el.parentElement;
+    for(var depth=0;cur&&depth<8;depth++,cur=cur.parentElement){
+      var tag=String(cur.tagName||'').toUpperCase();
+      if(tag==='BODY'||tag==='HTML') break;
+      var contained=[];
+      for(var ci=0;ci<jinhakCardBindings.length;ci++){
+        var cb=jinhakCardBindings[ci];
+        if(cb&&cb.root&&cur.contains&&cur.contains(cb.root)) contained.push(cb);
+      }
+      if(contained.length>1) break;
+      if(contained.length===1){
+        var only=contained[0];
+        if(only.university&&only.department){
+          var containerText=safeCloneText(cur,9000);
+          if(containerText && containerText.length<=8500){
+            return useBinding(only,'unique-card-container');
+          }
+        }
+        break;
+      }
+    }
+
+    // Evidence-only fallback. It can help page analysis, but without a structurally bound
+    // university+department pair Kotlin will not manufacture an application identity.
     result.contextText=applicationContextForAction(el);
     if(result.contextText) result.source='ancestor-text';
     return result;

@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.8.7 Structural Anchor Binding"
+        android:label="Admission Collector v0.8.8 Unique Container Mission Binding"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

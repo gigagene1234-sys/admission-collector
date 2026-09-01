@@ -154,6 +154,8 @@ class MainActivity : Activity() {
     private var jinhakUniqueNavigationStates = 0
     private var jinhakAgentActionInFlight = false
     private var jinhakAgentActionsExecuted = 0
+    private var jinhakMissionActionsExecuted = 0
+    private var jinhakGenericActionsExecuted = 0
     private var jinhakMissionContext: JinhakApplicationMission.Context? = null
     private var jinhakMissionOriginRoute = ""
     private var jinhakMissionNeedsReturn = false
@@ -166,6 +168,9 @@ class MainActivity : Activity() {
     private val jinhakMissionAnchorDiscoveredKeys = linkedSetOf<String>()
     private val jinhakMissionAnchorPromotedKeys = linkedSetOf<String>()
     private val jinhakMissionAnchorParsedKeys = linkedSetOf<String>()
+    private val jinhakMissionAnchorStructuredKeys = linkedSetOf<String>()
+    private val jinhakMissionBindingSourceKeys = linkedSetOf<String>()
+    private val jinhakMissionBindingSourceCounts = linkedMapOf<String, Int>()
     private val jinhakMissionAnchorSelectedKeys = linkedSetOf<String>()
     private val jinhakMissionAnchorClickedKeys = linkedSetOf<String>()
     private val jinhakReportConfirmedKeys = linkedSetOf<String>()
@@ -223,11 +228,12 @@ class MainActivity : Activity() {
         private const val JINHAK_HARD_STALL_MS = 24_000L
         private const val JINHAK_SLOW_ESCALATION_MS = 35_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
-        private const val MAX_JINHAK_AGENT_ACTIONS = 260
+        private const val MAX_JINHAK_GENERIC_ACTIONS = 180
+        private const val MAX_JINHAK_MISSION_ACTIONS = 220
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.8.7"
-        private const val BUILD_CODE = 10870
+        private const val VERSION = "0.8.8"
+        private const val BUILD_CODE = 10880
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1207,6 +1213,8 @@ class MainActivity : Activity() {
         jinhakUniqueNavigationStates = 0
         jinhakAgentActionInFlight = false
         jinhakAgentActionsExecuted = 0
+        jinhakMissionActionsExecuted = 0
+        jinhakGenericActionsExecuted = 0
         jinhakMissionContext = null
         jinhakReportBridgeContext = null
         jinhakMissionOriginRoute = ""
@@ -1220,6 +1228,9 @@ class MainActivity : Activity() {
         jinhakMissionAnchorDiscoveredKeys.clear()
         jinhakMissionAnchorPromotedKeys.clear()
         jinhakMissionAnchorParsedKeys.clear()
+        jinhakMissionAnchorStructuredKeys.clear()
+        jinhakMissionBindingSourceKeys.clear()
+        jinhakMissionBindingSourceCounts.clear()
         jinhakMissionAnchorSelectedKeys.clear()
         jinhakMissionAnchorClickedKeys.clear()
         jinhakReportConfirmedKeys.clear()
@@ -2553,6 +2564,16 @@ class MainActivity : Activity() {
                     val a = promotedAnchors.optJSONObject(ai) ?: continue
                     val key = RecordUtils.sha256(listOf(a.optString("label"), a.optString("contextText")).joinToString("|"))
                     jinhakMissionAnchorPromotedKeys.add(key)
+                    val bindingSource = a.optString("applicationBindingSource", "unknown").ifBlank { "unknown" }.take(40)
+                    val sourceKey = RecordUtils.sha256("$key|$bindingSource")
+                    if (jinhakMissionBindingSourceKeys.add(sourceKey)) {
+                        jinhakMissionBindingSourceCounts[bindingSource] = (jinhakMissionBindingSourceCounts[bindingSource] ?: 0) + 1
+                    }
+                    val structuredUniversity = a.optString("applicationUniversity").trim()
+                    val structuredDepartment = a.optString("applicationDepartment").trim()
+                    if (structuredUniversity.isNotBlank() && structuredDepartment.isNotBlank()) {
+                        jinhakMissionAnchorStructuredKeys.add(key)
+                    }
                 }
                 val parsedMissionCandidates = JinhakAgentNavigator.candidates(snapshot)
                 val ledgerOrigin = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
@@ -2845,16 +2866,6 @@ class MainActivity : Activity() {
     private fun maybeExecuteJinhakAgentAction(snapshot: JSONObject, expansionStateKey: String?): Boolean {
         if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return false
         if (jinhakAgentActionInFlight) return false
-        if (jinhakAgentActionsExecuted >= MAX_JINHAK_AGENT_ACTIONS) {
-            if (jinhakMissionTargetLedger.hasActionablePending()) {
-                jinhakMissionTargetLedger.failAllPending("agent-action-limit")
-                recordRuntimeEvent("jinhak-mission-target-limit", JSONObject()
-                    .put("limit", MAX_JINHAK_AGENT_ACTIONS)
-                    .put("ledger", jinhakMissionTargetLedger.summary()))
-            }
-            return false
-        }
-
         val route = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
         fun actionKeyFor(action: JinhakAgentNavigator.Candidate): String = RecordUtils.sha256(
             "${expansionStateKey ?: runtimeSafePath(route)}|${JinhakAgentNavigator.key(route, action)}"
@@ -2920,6 +2931,20 @@ class MainActivity : Activity() {
 
         val candidate = selection.candidate ?: return false
         val ledgerTargetIdForAction = ledgerTarget?.targetId
+        val missionBudgetedAction = ledgerTargetIdForAction != null || candidate.applicationContext?.identityKey != null
+        if (missionBudgetedAction) {
+            if (jinhakMissionActionsExecuted >= MAX_JINHAK_MISSION_ACTIONS) {
+                jinhakMissionTargetLedger.failAllPending("mission-action-limit")
+                recordRuntimeEvent("jinhak-mission-target-limit", JSONObject()
+                    .put("missionLimit", MAX_JINHAK_MISSION_ACTIONS)
+                    .put("missionExecuted", jinhakMissionActionsExecuted)
+                    .put("genericExecuted", jinhakGenericActionsExecuted)
+                    .put("ledger", jinhakMissionTargetLedger.summary()))
+                return false
+            }
+        } else if (jinhakGenericActionsExecuted >= MAX_JINHAK_GENERIC_ACTIONS) {
+            return false
+        }
         jinhakActiveMissionTargetId = ledgerTargetIdForAction
         if (ledgerTargetIdForAction != null) jinhakMissionTargetLedger.markAttempted(ledgerTargetIdForAction)
 
@@ -2965,9 +2990,10 @@ class MainActivity : Activity() {
         }
         jinhakAgentActionInFlight = true
         jinhakAgentActionsExecuted += 1
+        if (missionBudgetedAction) jinhakMissionActionsExecuted += 1 else jinhakGenericActionsExecuted += 1
         if (candidate.kind == "mission-link-navigation") jinhakMissionAnchorActionsAttempted += 1
         currentBatchTarget = route.ifBlank { currentBatchTarget }
-        status.text = "진학사 지원안 미션 ${jinhakAgentActionsExecuted}/$MAX_JINHAK_AGENT_ACTIONS · ${candidate.label.take(48)} · ledger ${jinhakMissionTargetLedger.pendingCount()}대기"
+        status.text = "진학사 미션 ${jinhakMissionActionsExecuted}/$MAX_JINHAK_MISSION_ACTIONS · 일반 ${jinhakGenericActionsExecuted}/$MAX_JINHAK_GENERIC_ACTIONS · ${candidate.label.take(48)} · ledger ${jinhakMissionTargetLedger.pendingCount()}대기"
         recordRuntimeEvent("jinhak-agent-action", JSONObject()
             .put("safePath", runtimeSafePath(route))
             .put("label", candidate.label.take(80))
@@ -3535,6 +3561,10 @@ class MainActivity : Activity() {
                         .put("uniqueNavigationExpansionStates", jinhakUniqueNavigationStates)
                         .put("repeatedNavigationStateSkips", jinhakRepeatedNavigationStateSkips)
                         .put("agentActionsExecuted", jinhakAgentActionsExecuted)
+                        .put("missionActionsExecuted", jinhakMissionActionsExecuted)
+                        .put("genericActionsExecuted", jinhakGenericActionsExecuted)
+                        .put("missionActionLimit", MAX_JINHAK_MISSION_ACTIONS)
+                        .put("genericActionLimit", MAX_JINHAK_GENERIC_ACTIONS)
                         .put("applicationBoundAgentActions", jinhakApplicationBoundActions)
                         .put("applicationMissionReturns", jinhakApplicationMissionReturns)
                         .put("applicationMissionIdentities", jinhakMissionCoverage.size)
@@ -3542,6 +3572,8 @@ class MainActivity : Activity() {
                         .put("secondsToFirstPopulatedStorage", if (jinhakMissionBootstrapStartedAtMs > 0L && jinhakFirstPopulatedStorageAtMs > 0L) (jinhakFirstPopulatedStorageAtMs - jinhakMissionBootstrapStartedAtMs) / 1000.0 else JSONObject.NULL)
                         .put("applicationAnchorActionsDiscovered", jinhakMissionAnchorDiscoveredKeys.size)
                         .put("applicationAnchorActionsPromoted", jinhakMissionAnchorPromotedKeys.size)
+                        .put("applicationAnchorStructuredBindings", jinhakMissionAnchorStructuredKeys.size)
+                        .put("applicationAnchorBindingSources", JSONObject(jinhakMissionBindingSourceCounts as Map<*, *>))
                         .put("applicationAnchorActionsParsed", jinhakMissionAnchorParsedKeys.size)
                         .put("applicationAnchorActionsSelected", jinhakMissionAnchorSelectedKeys.size)
                         .put("applicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
@@ -3622,6 +3654,8 @@ class MainActivity : Activity() {
                 .put("localAuditPagesScheduled", batchAuditPagesScheduled)
                 .put("universityDiscoveryPagesScheduled", batchUniversityDiscoveryPagesScheduled)
                 .put("jinhakAgentActionsExecuted", jinhakAgentActionsExecuted)
+                .put("jinhakMissionActionsExecuted", jinhakMissionActionsExecuted)
+                .put("jinhakGenericActionsExecuted", jinhakGenericActionsExecuted)
                 .put("jinhakApplicationBoundActions", jinhakApplicationBoundActions)
                 .put("jinhakApplicationMissionReturns", jinhakApplicationMissionReturns)
                 .put("jinhakApplicationMissionIdentities", jinhakMissionCoverage.size)
