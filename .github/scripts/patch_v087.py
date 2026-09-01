@@ -16,12 +16,13 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 
 
 snap = SNAP.read_text()
-snap = replace_once(
-    snap,
-    '  var jinhakCards=[];\n',
-    '  var jinhakCards=[];\n  var jinhakCardBindings=[];\n',
-    'jinhakCardBindings declaration',
-)
+if 'var jinhakCardBindings=[];' not in snap:
+    snap = replace_once(
+        snap,
+        '  var jinhakCards=[];\n',
+        '  var jinhakCards=[];\n  var jinhakCardBindings=[];\n',
+        'jinhakCardBindings declaration',
+    )
 
 old_cards = '''      jinhakCards.push({
         text:entry.text,
@@ -55,7 +56,8 @@ new_cards = '''      // v0.8.7: retain the exact DOM root that produced the alre
         departmentSource:departmentCtx.source,
         departmentDepth:departmentCtx.depth
       });'''
-snap = replace_once(snap, old_cards, new_cards, 'structured card binding')
+if 'jinhakCardBindings.push({' not in snap:
+    snap = replace_once(snap, old_cards, new_cards, 'structured card binding')
 
 helper_anchor = '  function applicationContextForAction(el){\n'
 helper = '''  // v0.8.7: bind an action only to a detected card root that actually contains it.
@@ -145,4 +147,4 @@ manifest = replace_once(
 )
 MANIFEST.write_text(manifest)
 
-print('v0.8.7 structural mission anchor binding patch applied')
+print('v0.8.7 structural mission anchor binding patch applied/idempotent')
