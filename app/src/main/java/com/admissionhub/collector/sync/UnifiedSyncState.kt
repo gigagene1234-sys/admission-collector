@@ -6,6 +6,8 @@ enum class UnifiedSyncState {
     ADIGA_USER_SCORE_SYNC,
     JINHAK_CAPABILITY_DISCOVERY,
     JINHAK_AUTHORIZED_SYNC,
+    JINHAK_USER_SESSION_MISSION,
+    /** Legacy export compatibility only; new releases do not enter this state. */
     JINHAK_AUTONOMOUS_CRAWL,
     JINHAK_USER_CONSENT_REQUIRED,
     JINHAK_USER_VIEW_FALLBACK,
@@ -37,12 +39,18 @@ object UnifiedSyncTransitions {
         ),
         UnifiedSyncState.JINHAK_CAPABILITY_DISCOVERY to setOf(
             UnifiedSyncState.JINHAK_AUTHORIZED_SYNC,
-            UnifiedSyncState.JINHAK_AUTONOMOUS_CRAWL,
+            UnifiedSyncState.JINHAK_USER_SESSION_MISSION,
             UnifiedSyncState.JINHAK_USER_VIEW_FALLBACK,
             UnifiedSyncState.AUTH_REQUIRED,
             UnifiedSyncState.FAILED
         ),
         UnifiedSyncState.JINHAK_AUTHORIZED_SYNC to setOf(
+            UnifiedSyncState.CANONICAL_MERGE,
+            UnifiedSyncState.AUTH_REQUIRED,
+            UnifiedSyncState.FAILED
+        ),
+        UnifiedSyncState.JINHAK_USER_SESSION_MISSION to setOf(
+            UnifiedSyncState.JINHAK_USER_CONSENT_REQUIRED,
             UnifiedSyncState.CANONICAL_MERGE,
             UnifiedSyncState.AUTH_REQUIRED,
             UnifiedSyncState.FAILED
@@ -54,6 +62,7 @@ object UnifiedSyncTransitions {
             UnifiedSyncState.FAILED
         ),
         UnifiedSyncState.JINHAK_USER_CONSENT_REQUIRED to setOf(
+            UnifiedSyncState.JINHAK_USER_SESSION_MISSION,
             UnifiedSyncState.JINHAK_AUTONOMOUS_CRAWL,
             UnifiedSyncState.CANONICAL_MERGE,
             UnifiedSyncState.AUTH_REQUIRED,
@@ -81,6 +90,7 @@ object UnifiedSyncTransitions {
             UnifiedSyncState.ADIGA_USER_SCORE_SYNC,
             UnifiedSyncState.JINHAK_CAPABILITY_DISCOVERY,
             UnifiedSyncState.JINHAK_AUTHORIZED_SYNC,
+            UnifiedSyncState.JINHAK_USER_SESSION_MISSION,
             UnifiedSyncState.JINHAK_AUTONOMOUS_CRAWL,
             UnifiedSyncState.JINHAK_USER_CONSENT_REQUIRED,
             UnifiedSyncState.JINHAK_USER_VIEW_FALLBACK,
