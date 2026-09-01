@@ -1,0 +1,130 @@
+name: Finalize Admission Collector v0.8.7
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/finalize-admission-collector-v087.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  independent-main-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Verify committed v0.8.7 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          SNAP=app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          AGENT=app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt
+          LEDGER=app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt
+          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          YEAR=app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt
+          STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
+          grep -q 'VERSION = "0.8.7"' "$MAIN"
+          grep -q 'BUILD_CODE = 10870' "$MAIN"
+          grep -q 'versionCode = 10870' app/build.gradle.kts
+          grep -q 'versionName = "0.8.7"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.8.7 Structural Anchor Binding' app/src/main/AndroidManifest.xml
+          test "$(grep -c 'var jinhakCardBindings=\[\];' "$SNAP")" -eq 1
+          test "$(grep -c 'jinhakCardBindings.push({' "$SNAP")" -eq 1
+          grep -q 'applicationUniversity:applicationBinding.university' "$SNAP"
+          grep -q 'applicationDepartment:applicationBinding.department' "$SNAP"
+          grep -q 'explicitUniversity = obj.optString("applicationUniversity")' "$AGENT"
+          grep -q 'explicitDepartment = obj.optString("applicationDepartment")' "$AGENT"
+          grep -q 'jinhakMissionTargetLedger.capture' "$MAIN"
+          grep -q 'fun failAllOutstanding(reason: String): Int' "$LEDGER"
+          grep -q 'jinhakDiagnosticsSummary' "$STORE"
+          grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
+          grep -q 'historical-multi-year-or-unresolved' "$YEAR"
+          grep -q 'applicantAverageGrade' "$ADAPTER"
+          BINDING_BLOCK="$(sed -n '/function applicationBindingForAction(el)/,/function applicationContextForAction(el)/p' "$SNAP")"
+          grep -q 'binding.root.contains(el)' <<< "$BINDING_BLOCK"
+          if grep -q 'previousElementSibling\|nextElementSibling' <<< "$BINDING_BLOCK"; then
+            echo 'v0.8.7 binding helper contains forbidden sibling traversal' >&2
+            exit 1
+          fi
+          if grep -q 'override val supportsBatchCrawl = true' "$ADAPTER"; then
+            echo 'protected broad Jinhak crawl was re-enabled' >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build committed main
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify final v0.8.7 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.8.7-Structural-Anchor-Binding.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10870'" badging.txt
+          grep -q "versionName='0.8.7'" badging.txt
+          grep -q "application-label:'Admission Collector v0.8.7 Structural Anchor Binding'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.8.7-Structural-Anchor-Binding.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.8.7-final
+          path: |
+            Admission-Collector-v0.8.7-Structural-Anchor-Binding.apk
+            Admission-Collector-v0.8.7-Structural-Anchor-Binding.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish v0.8.7 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="Committed-main independent build. versionName 0.8.7 / versionCode 10870. Structural Mission Anchor Binding carries university and department only from the exact containing detected card root into mission actions, then reuses the existing Kotlin identity parser and Persistent Mission Target Ledger. The new binding helper has no sibling traversal. Existing safety gates, historical-year guard, applicant semantic guard, and supportsBatchCrawl=false remain. Build, signature, source-invariant and package checks passed. Real-device E2E remains unverified until a new exported JSON is analyzed. Commit: $SHA"
+          if gh release view v0.8.7 >/dev/null 2>&1; then
+            gh release upload v0.8.7 Admission-Collector-v0.8.7-Structural-Anchor-Binding.apk Admission-Collector-v0.8.7-Structural-Anchor-Binding.sha256 --clobber
+          else
+            gh release create v0.8.7 Admission-Collector-v0.8.7-Structural-Anchor-Binding.apk Admission-Collector-v0.8.7-Structural-Anchor-Binding.sha256 --target "$SHA" --title "Admission Collector v0.8.7 — Structural Anchor Binding" --notes "$NOTES"
+          fi
