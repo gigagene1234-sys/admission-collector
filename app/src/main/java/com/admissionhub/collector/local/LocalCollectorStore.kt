@@ -568,6 +568,16 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         writableDatabase.insertWithOnConflict("provider_entity_mappings", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
+    private fun latestSyncStateDetail(sessionId: String, state: String): JSONObject {
+        return readableDatabase.rawQuery(
+            "SELECT detail_json FROM sync_state_events WHERE session_id=? AND state=? ORDER BY created_at DESC,event_id DESC LIMIT 1",
+            arrayOf(sessionId, state)
+        ).use { c ->
+            if (!c.moveToFirst()) return@use JSONObject()
+            runCatching { JSONObject(c.getString(0)) }.getOrDefault(JSONObject())
+        }
+    }
+
     fun unifiedStatus(sessionId: String): JSONObject {
         val out = JSONObject().put("sessionId", sessionId)
         var adigaRun: String? = null
@@ -614,6 +624,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                 .put("jinhak", "user-viewed-derived-analysis-and-prediction")
                 .put("predictionIsNotHistoricalActual", true))
             .put("observationStore", observationStats(sessionId))
+        out.put("jinhakDiagnosticsSummary", latestSyncStateDetail(sessionId, "JINHAK_CRAWL_DIAGNOSTICS"))
         return out
     }
 

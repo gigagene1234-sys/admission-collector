@@ -39,6 +39,7 @@ import com.admissionhub.collector.jinhak.JinhakApplicationMission
 import com.admissionhub.collector.jinhak.JinhakSlowLanePool
 import com.admissionhub.collector.jinhak.JinhakReportContextBridge
 import com.admissionhub.collector.jinhak.JinhakMissionLaneSequencer
+import com.admissionhub.collector.jinhak.JinhakMissionTargetLedger
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.provider.ProviderCapabilities
 import com.admissionhub.collector.provider.ProviderCapability
@@ -159,6 +160,9 @@ class MainActivity : Activity() {
     private var jinhakApplicationBoundActions = 0
     private var jinhakApplicationMissionReturns = 0
     private val jinhakMissionCoverage = linkedMapOf<String, MutableSet<String>>()
+    private val jinhakMissionTargetLedger = JinhakMissionTargetLedger()
+    private var jinhakActiveMissionTargetId: String? = null
+    private val jinhakSlowLaneMissionTargetIds = linkedMapOf<String, String>()
     private val jinhakMissionAnchorDiscoveredKeys = linkedSetOf<String>()
     private val jinhakMissionAnchorPromotedKeys = linkedSetOf<String>()
     private val jinhakMissionAnchorParsedKeys = linkedSetOf<String>()
@@ -219,11 +223,11 @@ class MainActivity : Activity() {
         private const val JINHAK_HARD_STALL_MS = 24_000L
         private const val JINHAK_SLOW_ESCALATION_MS = 35_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
-        private const val MAX_JINHAK_AGENT_ACTIONS = 180
+        private const val MAX_JINHAK_AGENT_ACTIONS = 260
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.8.5"
-        private const val BUILD_CODE = 10850
+        private const val VERSION = "0.8.6"
+        private const val BUILD_CODE = 10860
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1210,6 +1214,9 @@ class MainActivity : Activity() {
         jinhakApplicationBoundActions = 0
         jinhakApplicationMissionReturns = 0
         jinhakMissionCoverage.clear()
+        jinhakMissionTargetLedger.clear()
+        jinhakActiveMissionTargetId = null
+        jinhakSlowLaneMissionTargetIds.clear()
         jinhakMissionAnchorDiscoveredKeys.clear()
         jinhakMissionAnchorPromotedKeys.clear()
         jinhakMissionAnchorParsedKeys.clear()
@@ -1507,7 +1514,13 @@ class MainActivity : Activity() {
                 reason = "foreground-35s-slow-escalation"
             )
             val accepted = ::slowLanePool.isInitialized && slowLanePool.enqueue(task)
+            val ledgerTargetForSlowLane = jinhakActiveMissionTargetId
             if (accepted) {
+                if (ledgerTargetForSlowLane != null) {
+                    jinhakMissionTargetLedger.markDeferred(ledgerTargetForSlowLane)
+                    jinhakSlowLaneMissionTargetIds[task.id] = ledgerTargetForSlowLane
+                    jinhakActiveMissionTargetId = null
+                }
                 jinhakSlowLaneEscalated += 1
                 recordRuntimeEvent("jinhak-slow-lane-escalated", JSONObject()
                     .put("targetSafePath", runtimeSafePath(target))
@@ -1518,6 +1531,10 @@ class MainActivity : Activity() {
                     .put("missionBound", mission?.identityKey != null))
                 localRunId?.let { runId -> localStore.markDocument(runId, target, "slow-lane", 0, null) }
             } else {
+                if (ledgerTargetForSlowLane != null) {
+                    jinhakMissionTargetLedger.markFailed(ledgerTargetForSlowLane, "slow-lane-queue-full")
+                    if (jinhakActiveMissionTargetId == ledgerTargetForSlowLane) jinhakActiveMissionTargetId = null
+                }
                 jinhakSlowLaneFailed += 1
                 batchErrors.put(JSONObject()
                     .put("type", "jinhak-slow-lane-queue-full")
@@ -1615,6 +1632,12 @@ class MainActivity : Activity() {
             if (missionKey != null && resolvedLane != "reference") {
                 jinhakMissionCoverage.getOrPut(missionKey) { linkedSetOf() }.add(resolvedLane)
             }
+            jinhakSlowLaneMissionTargetIds.remove(task.id)?.let { targetId ->
+                val pageLane = JinhakApplicationMission.laneForPageType(pageType)
+                if (!jinhakMissionTargetLedger.markConfirmed(targetId, missionKey, pageLane)) {
+                    jinhakMissionTargetLedger.markFailed(targetId, "slow-lane-report-unconfirmed")
+                }
+            }
 
             val capturedAt = Instant.now().toString()
             val digest = buildJinhakDigest(snapshot, records, runId, capturedAt)
@@ -1669,6 +1692,9 @@ class MainActivity : Activity() {
         reason: String,
         stats: JinhakSlowLanePool.ResultStats
     ) {
+        jinhakSlowLaneMissionTargetIds.remove(task.id)?.let { targetId ->
+            jinhakMissionTargetLedger.markFailed(targetId, reason)
+        }
         jinhakSlowLaneFailed += 1
         val failureClass = reason.substringBefore(':').take(80)
         jinhakSlowLaneFailureReasons[failureClass] = (jinhakSlowLaneFailureReasons[failureClass] ?: 0) + 1
@@ -2462,6 +2488,18 @@ class MainActivity : Activity() {
                         ).joinToString("|"))
                         if (bridgeMission?.identityKey != null && lane != "reference" && jinhakReportConfirmedKeys.add(confirmationKey)) {
                             jinhakReportBridgeConfirmed += 1
+                            val ledgerConfirmed = jinhakMissionTargetLedger.markConfirmed(
+                                jinhakActiveMissionTargetId,
+                                bridgeMission.identityKey,
+                                lane
+                            )
+                            if (ledgerConfirmed) {
+                                recordRuntimeEvent("jinhak-mission-target-confirmed", JSONObject()
+                                    .put("applicationIdentityHash", bridgeMission.identityKey.take(24))
+                                    .put("lane", lane)
+                                    .put("safePath", runtimeSafePath(snapshot.optString("url"))))
+                                jinhakActiveMissionTargetId = null
+                            }
                         }
                     }
                 }
@@ -2516,7 +2554,16 @@ class MainActivity : Activity() {
                     val key = RecordUtils.sha256(listOf(a.optString("label"), a.optString("contextText")).joinToString("|"))
                     jinhakMissionAnchorPromotedKeys.add(key)
                 }
-                JinhakAgentNavigator.candidates(snapshot).filter { it.promotedMissionAction && it.applicationContext?.identityKey != null }.forEach { candidate ->
+                val parsedMissionCandidates = JinhakAgentNavigator.candidates(snapshot)
+                val ledgerOrigin = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
+                val ledgerAdded = jinhakMissionTargetLedger.capture(ledgerOrigin, parsedMissionCandidates)
+                if (ledgerAdded > 0) {
+                    recordRuntimeEvent("jinhak-mission-targets-captured", JSONObject()
+                        .put("added", ledgerAdded)
+                        .put("pending", jinhakMissionTargetLedger.pendingCount())
+                        .put("safePath", runtimeSafePath(ledgerOrigin)))
+                }
+                parsedMissionCandidates.filter { it.promotedMissionAction && it.applicationContext?.identityKey != null }.forEach { candidate ->
                     val key = RecordUtils.sha256(listOf(candidate.label, candidate.applicationContext?.identityKey ?: "").joinToString("|"))
                     jinhakMissionAnchorParsedKeys.add(key)
                 }
@@ -2797,28 +2844,85 @@ class MainActivity : Activity() {
 
     private fun maybeExecuteJinhakAgentAction(snapshot: JSONObject, expansionStateKey: String?): Boolean {
         if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return false
-        if (jinhakAgentActionInFlight || jinhakAgentActionsExecuted >= MAX_JINHAK_AGENT_ACTIONS) return false
+        if (jinhakAgentActionInFlight) return false
+        if (jinhakAgentActionsExecuted >= MAX_JINHAK_AGENT_ACTIONS) {
+            if (jinhakMissionTargetLedger.hasActionablePending()) {
+                jinhakMissionTargetLedger.failAllPending("agent-action-limit")
+                recordRuntimeEvent("jinhak-mission-target-limit", JSONObject()
+                    .put("limit", MAX_JINHAK_AGENT_ACTIONS)
+                    .put("ledger", jinhakMissionTargetLedger.summary()))
+            }
+            return false
+        }
+
         val route = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
         fun actionKeyFor(action: JinhakAgentNavigator.Candidate): String = RecordUtils.sha256(
             "${expansionStateKey ?: runtimeSafePath(route)}|${JinhakAgentNavigator.key(route, action)}"
         )
-        val candidates = JinhakAgentNavigator.candidates(snapshot).filterNot { jinhakAgentActionSeen.contains(actionKeyFor(it)) }
+
+        val liveCandidates = JinhakAgentNavigator.candidates(snapshot)
+        val candidates = liveCandidates.filterNot { jinhakAgentActionSeen.contains(actionKeyFor(it)) }
         val currentMissionKey = jinhakMissionContext?.identityKey
         val covered = currentMissionKey?.let { jinhakMissionCoverage[it]?.toSet() }.orEmpty()
         val atMissionOrigin = currentMissionKey != null && jinhakMissionOriginRoute.isNotBlank() &&
             canonicalizeBatchUrl(route) == canonicalizeBatchUrl(jinhakMissionOriginRoute)
-        val selection = JinhakMissionLaneSequencer.choose(candidates, currentMissionKey, covered, atMissionOrigin)
-        if (selection.missionExhaustedAtOrigin && currentMissionKey != null) {
+
+        jinhakMissionTargetLedger.reconcileCoveredLanes(currentMissionKey, covered)
+        var ledgerTarget = when {
+            atMissionOrigin && currentMissionKey != null ->
+                jinhakMissionTargetLedger.nextPendingAtOrigin(route, currentMissionKey, covered)
+            currentMissionKey == null ->
+                jinhakMissionTargetLedger.nextPendingAtOrigin(route, null, emptySet())
+            else -> null
+        }
+        var exhaustedCurrentMission = false
+
+        val selection = when {
+            ledgerTarget != null -> JinhakMissionLaneSequencer.Selection(
+                candidate = ledgerTarget!!.candidate(),
+                missionExhaustedAtOrigin = false,
+                requestedLane = ledgerTarget!!.lane
+            )
+            atMissionOrigin && currentMissionKey != null && jinhakMissionTargetLedger.hasMission(currentMissionKey) -> {
+                exhaustedCurrentMission = true
+                ledgerTarget = jinhakMissionTargetLedger.nextPendingAtOrigin(route, null, emptySet())
+                if (ledgerTarget != null) {
+                    JinhakMissionLaneSequencer.Selection(
+                        candidate = ledgerTarget!!.candidate(),
+                        missionExhaustedAtOrigin = true,
+                        requestedLane = ledgerTarget!!.lane
+                    )
+                } else {
+                    // All captured application targets at this origin are resolved. Only now may
+                    // generic read-only navigation resume; application-bound live anchors are not
+                    // re-selected outside the persistent ledger.
+                    val genericPool = candidates.filter { it.applicationContext?.identityKey == null }
+                    val generic = JinhakMissionLaneSequencer.choose(genericPool, null, emptySet(), false)
+                    JinhakMissionLaneSequencer.Selection(generic.candidate, true, generic.requestedLane)
+                }
+            }
+            currentMissionKey == null && jinhakMissionTargetLedger.hasActionablePending() ->
+                JinhakMissionLaneSequencer.Selection(null, false, "reference")
+            else -> JinhakMissionLaneSequencer.choose(candidates, currentMissionKey, covered, atMissionOrigin)
+        }
+
+        if ((selection.missionExhaustedAtOrigin || exhaustedCurrentMission) && currentMissionKey != null) {
             recordRuntimeEvent("jinhak-application-mission-lanes-exhausted", JSONObject()
                 .put("applicationIdentityHash", currentMissionKey.take(24))
                 .put("coverageLanes", covered.size)
+                .put("ledgerOutstanding", jinhakMissionTargetLedger.outstandingCount())
                 .put("safePath", runtimeSafePath(route)))
             jinhakMissionContext = null
             jinhakReportBridgeContext = null
             jinhakMissionOriginRoute = ""
             jinhakMissionNeedsReturn = false
         }
+
         val candidate = selection.candidate ?: return false
+        val ledgerTargetIdForAction = ledgerTarget?.targetId
+        jinhakActiveMissionTargetId = ledgerTargetIdForAction
+        if (ledgerTargetIdForAction != null) jinhakMissionTargetLedger.markAttempted(ledgerTargetIdForAction)
+
         if (candidate.kind == "mission-link-navigation") {
             val selectedKey = RecordUtils.sha256(listOf(candidate.label, candidate.applicationContext?.identityKey ?: "").joinToString("|"))
             jinhakMissionAnchorSelectedKeys.add(selectedKey)
@@ -2830,7 +2934,7 @@ class MainActivity : Activity() {
         if (actionMission?.identityKey != null) {
             if (jinhakMissionContext?.identityKey != actionMission.identityKey) {
                 jinhakMissionContext = actionMission
-                jinhakMissionOriginRoute = route
+                jinhakMissionOriginRoute = ledgerTarget?.originRoute ?: route
             }
             jinhakMissionNeedsReturn = true
             jinhakApplicationBoundActions += 1
@@ -2838,6 +2942,8 @@ class MainActivity : Activity() {
             recordRuntimeEvent("jinhak-application-mission-start", JSONObject()
                 .put("applicationIdentityHash", actionMission.identityKey.take(24))
                 .put("missionPriority", candidate.missionPriority)
+                .put("requestedLane", selection.requestedLane)
+                .put("ledgerTarget", ledgerTargetIdForAction != null)
                 .put("safePath", runtimeSafePath(route)))
         } else if (jinhakMissionContext?.identityKey != null) {
             // A report tab may not repeat the application card. The already-bound mission stays active.
@@ -2861,12 +2967,14 @@ class MainActivity : Activity() {
         jinhakAgentActionsExecuted += 1
         if (candidate.kind == "mission-link-navigation") jinhakMissionAnchorActionsAttempted += 1
         currentBatchTarget = route.ifBlank { currentBatchTarget }
-        status.text = "진학사 지원안 미션 ${jinhakAgentActionsExecuted}/$MAX_JINHAK_AGENT_ACTIONS · ${candidate.label.take(48)}"
+        status.text = "진학사 지원안 미션 ${jinhakAgentActionsExecuted}/$MAX_JINHAK_AGENT_ACTIONS · ${candidate.label.take(48)} · ledger ${jinhakMissionTargetLedger.pendingCount()}대기"
         recordRuntimeEvent("jinhak-agent-action", JSONObject()
             .put("safePath", runtimeSafePath(route))
             .put("label", candidate.label.take(80))
             .put("kind", candidate.kind)
+            .put("ledgerTarget", ledgerTargetIdForAction != null)
             .put("applicationBound", jinhakMissionContext?.identityKey != null))
+
         webView.evaluateJavascript(JinhakAgentNavigator.executionScript(candidate)) { encoded ->
             val result = runCatching { JSONObject(decodeJsString(encoded)) }.getOrNull() ?: JSONObject()
             jinhakAgentActionInFlight = false
@@ -2874,15 +2982,21 @@ class MainActivity : Activity() {
             if (!result.optBoolean("ok", false)) {
                 val rejectReason = result.optString("reason", "unknown-agent-action-failure").take(80)
                 jinhakAnchorRejectReasons[rejectReason] = (jinhakAnchorRejectReasons[rejectReason] ?: 0) + 1
+                if (ledgerTargetIdForAction != null) {
+                    jinhakMissionTargetLedger.markFailed(ledgerTargetIdForAction, rejectReason)
+                    if (jinhakActiveMissionTargetId == ledgerTargetIdForAction) jinhakActiveMissionTargetId = null
+                }
                 recordRuntimeEvent("jinhak-agent-action-rejected", JSONObject()
                     .put("safePath", runtimeSafePath(route))
                     .put("label", candidate.label.take(80))
                     .put("kind", candidate.kind)
+                    .put("ledgerTarget", ledgerTargetIdForAction != null)
                     .put("reason", rejectReason)
                     .put("primaryReason", result.optString("primaryReason").take(80)))
                 if (candidate.kind == "mission-link-navigation") jinhakReportBridgeContext = null
             }
             if (result.optBoolean("ok", false)) {
+                if (ledgerTargetIdForAction != null) jinhakMissionTargetLedger.markClicked(ledgerTargetIdForAction)
                 if (candidate.kind == "mission-link-navigation") {
                     jinhakMissionAnchorActionsExecuted += 1
                     val clickedKey = RecordUtils.sha256(listOf(candidate.label, candidate.applicationContext?.identityKey ?: "").joinToString("|"))
@@ -2892,12 +3006,19 @@ class MainActivity : Activity() {
                     if (!batchRunning || batchPausedForLogin || batchCollecting) return@postDelayed
                     scheduleBatchSnapshot()
                 }, 1100L)
+            } else if (ledgerTargetIdForAction != null) {
+                // Stay on the origin and immediately evaluate the next captured target instead of
+                // falling through to the generic URL frontier.
+                handler.postDelayed({
+                    if (batchRunning && !batchPausedForLogin && !batchCollecting) scheduleBatchSnapshot()
+                }, 160L)
             } else {
                 handler.postDelayed({ loadNextBatchPage() }, 120L)
             }
         }
         return true
     }
+
 
     private fun maybeReturnToJinhakMissionOrigin(snapshot: JSONObject): Boolean {
         val mission = jinhakMissionContext ?: return false
@@ -2910,9 +3031,14 @@ class MainActivity : Activity() {
             .put("fromSafePath", runtimeSafePath(current))
             .put("toSafePath", runtimeSafePath(origin))
             .put("coverageLanes", jinhakMissionCoverage[mission.identityKey]?.size ?: 0))
-        // v0.8.5 keeps the same application mission active while returning to the
-        // saved-application origin. The sequencer then selects the next missing lane;
-        // only an exhausted origin clears the mission before selecting another card.
+        // v0.8.6 keeps the same application mission and its target ledger active while
+        // returning to the saved-application origin. A clicked target that never produced a
+        // confirmed report is closed explicitly so it cannot block the remaining ledger.
+        val returningTargetId = jinhakActiveMissionTargetId
+        if (returningTargetId != null && jinhakMissionTargetLedger.stateOf(returningTargetId) == JinhakMissionTargetLedger.State.CLICKED) {
+            jinhakMissionTargetLedger.markFailed(returningTargetId, "report-unconfirmed")
+        }
+        jinhakActiveMissionTargetId = null
         jinhakReportBridgeContext = null
         jinhakMissionNeedsReturn = false
         currentBatchTarget = origin
@@ -2930,6 +3056,33 @@ class MainActivity : Activity() {
             status.text = "Cloud resume 계획 확인 중: ${batchCloudPlansPending}개 목록"
             handler.postDelayed({ loadNextBatchPage() }, 180)
             return
+        }
+
+        if (provider == ProviderId.JINHAK) {
+            val preferredIdentity = jinhakMissionContext?.identityKey
+            if (jinhakMissionTargetLedger.hasActionablePending()) {
+                val origin = jinhakMissionTargetLedger.originForNextPending(preferredIdentity)
+                if (!origin.isNullOrBlank()) {
+                    val current = canonicalizeBatchUrl(webView.url ?: "")
+                    val canonicalOrigin = canonicalizeBatchUrl(origin)
+                    currentBatchTarget = canonicalOrigin
+                    status.text = "지원안 ledger 우선 처리: ${jinhakMissionTargetLedger.pendingCount()}개 target 대기"
+                    if (current == canonicalOrigin) {
+                        if (!batchCollecting && !jinhakAgentActionInFlight) scheduleBatchSnapshot()
+                    } else {
+                        webView.loadUrl(canonicalOrigin)
+                    }
+                    return
+                }
+            }
+            // Deferred mission targets are still outstanding. Do not let editorial/media/frontier
+            // work overtake them while a slow worker owns the report.
+            if (jinhakMissionTargetLedger.outstandingCount() > 0 && ::slowLanePool.isInitialized && slowLanePool.hasWork()) {
+                val slow = slowLanePool.stats()
+                status.text = "지원안 ledger 병렬 처리 대기: slow ${slow.running} · 대기 ${slow.queued} · outstanding ${jinhakMissionTargetLedger.outstandingCount()}"
+                handler.postDelayed({ if (batchRunning && !batchPausedForLogin) loadNextBatchPage() }, 700L)
+                return
+            }
         }
 
         while (batchPageActions.isNotEmpty()) {
@@ -3405,6 +3558,9 @@ class MainActivity : Activity() {
                             put("fourOrMoreLanes", jinhakMissionCoverage.values.count { it.size >= 4 })
                             put("sixOrMoreLanes", jinhakMissionCoverage.values.count { it.size >= 6 })
                         })
+                        .put("missionTargetLedger", jinhakMissionTargetLedger.summary())
+                        .put("missionTargetLedgerPending", jinhakMissionTargetLedger.pendingCount())
+                        .put("missionTargetLedgerOutstanding", jinhakMissionTargetLedger.outstandingCount())
                         .put("cloudFrontierPublished", cloudFrontierPublished)
                         .put("cloudFrontierClaimed", cloudFrontierClaimed)
                         .put("cloudFrontierCompleted", cloudFrontierCompleted)
@@ -3455,6 +3611,9 @@ class MainActivity : Activity() {
                 .put("jinhakApplicationBoundActions", jinhakApplicationBoundActions)
                 .put("jinhakApplicationMissionReturns", jinhakApplicationMissionReturns)
                 .put("jinhakApplicationMissionIdentities", jinhakMissionCoverage.size)
+                .put("jinhakMissionTargetLedger", jinhakMissionTargetLedger.summary())
+                .put("jinhakMissionTargetLedgerPending", jinhakMissionTargetLedger.pendingCount())
+                .put("jinhakMissionTargetLedgerOutstanding", jinhakMissionTargetLedger.outstandingCount())
                 .put("jinhakApplicationAnchorActionsDiscovered", jinhakMissionAnchorDiscoveredKeys.size)
                 .put("jinhakApplicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
                 .put("jinhakApplicationAnchorActionsExecuted", jinhakMissionAnchorActionsExecuted)
