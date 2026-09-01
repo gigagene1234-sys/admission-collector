@@ -112,12 +112,25 @@ class JinhakMissionTargetLedger {
         return preferred?.originRoute ?: sortedTargets().firstOrNull { it.state == State.PENDING }?.originRoute
     }
 
+    /** Mark already-covered lanes as skipped before choosing another saved-card target. */
+    fun reconcileCoveredLanes(identityKey: String?, coveredLanes: Set<String>) {
+        if (identityKey.isNullOrBlank() || coveredLanes.isEmpty()) return
+        targets.values.filter {
+            it.identityKey == identityKey && it.lane in coveredLanes && it.state == State.PENDING
+        }.forEach {
+            it.state = State.SKIPPED
+            it.failureReason = "lane-already-covered"
+            it.updatedAtMs = System.currentTimeMillis()
+        }
+    }
+
     fun nextPendingAtOrigin(
         originRoute: String,
         preferredIdentityKey: String?,
         coveredLanes: Set<String>
     ): Target? {
         if (originRoute.isBlank()) return null
+        reconcileCoveredLanes(preferredIdentityKey, coveredLanes)
         val sameOrigin = sortedTargets().filter { it.originRoute == originRoute && it.state == State.PENDING }
         val preferred = if (preferredIdentityKey != null) {
             sameOrigin.firstOrNull { it.identityKey == preferredIdentityKey && it.lane !in coveredLanes }
@@ -194,7 +207,7 @@ class JinhakMissionTargetLedger {
     fun summary(): JSONObject {
         val out = JSONObject()
         val stateCounts = JSONObject()
-        for (state in State.entries) stateCounts.put(state.name.lowercase(), targets.values.count { it.state == state })
+        for (state in State.values()) stateCounts.put(state.name.lowercase(), targets.values.count { it.state == state })
         val laneCounts = JSONObject()
         for (lane in laneOrder) {
             val laneTargets = targets.values.filter { it.lane == lane }
