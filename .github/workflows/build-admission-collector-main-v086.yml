@@ -1,0 +1,124 @@
+name: Verify Admission Collector v0.8.6 Committed Source
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-main-v086.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - name: Checkout committed source only
+        uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+
+      - name: Verify committed v0.8.6 architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          LEDGER=app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt
+          SNAP=app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          AGENT=app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt
+          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          YEAR=app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt
+          STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
+
+          grep -q 'VERSION = "0.8.6"' "$MAIN"
+          grep -q 'BUILD_CODE = 10860' "$MAIN"
+          grep -q 'versionCode = 10860' app/build.gradle.kts
+          grep -q 'versionName = "0.8.6"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.8.6 Persistent Mission Ledger' app/src/main/AndroidManifest.xml
+          grep -q 'JinhakMissionTargetLedger' "$MAIN"
+          grep -q 'jinhakMissionTargetLedger.capture' "$MAIN"
+          grep -q 'jinhakMissionTargetLedger.hasActionablePending()' "$MAIN"
+          grep -q 'jinhakMissionTargetLedger.outstandingCount() > 0' "$MAIN"
+          grep -q 'jinhakSlowLaneMissionTargetIds\[task.id\]' "$MAIN"
+          grep -q 'missionTargetLedgerOutstanding' "$MAIN"
+          grep -q 'jinhakDiagnosticsSummary' "$STORE"
+          grep -q 'missionAgentActions' "$SNAP"
+          grep -q 'append("missionAgentActions", promoted = true' "$AGENT"
+          grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
+          grep -q 'sanitizeHistoricalRowYear' "$ADAPTER"
+          grep -q 'historical-multi-year-or-unresolved' "$YEAR"
+          grep -q 'applicantAverageGrade' "$ADAPTER"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          ledger=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          year=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt').read_text()
+          store=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
+          if 'override val supportsBatchCrawl = true' in adapter:
+              raise SystemExit('protected Jinhak broad batch capability re-enabled')
+          if 'previousElementSibling' in ledger or 'nextElementSibling' in ledger:
+              raise SystemExit('ledger contains neighboring-card inference')
+          if any(x in ledger for x in ('document.cookie','localStorage','sessionStorage')):
+              raise SystemExit('ledger contains session material access')
+          if 'markDeferred(ledgerTargetForSlowLane)' not in main:
+              raise SystemExit('slow-lane ledger provenance missing')
+          if 'slow-lane-report-unconfirmed' not in main or 'report-unconfirmed' not in main:
+              raise SystemExit('explicit unconfirmed target failure path missing')
+          if 'jinhakDiagnosticsSummary' not in store:
+              raise SystemExit('front-loaded Jinhak diagnostics missing')
+          if 'year !in 2000 until currentCycle' not in year:
+              raise SystemExit('historical year guard regressed')
+          if 'h.contains("지원자") -> metrics.put("applicants", n)' in adapter:
+              raise SystemExit('applicant grade/count semantic regression')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: '8.7'}
+
+      - name: Build committed source
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify committed APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "versionCode='10860'" /tmp/badging.txt
+          grep -q "versionName='0.8.6'" /tmp/badging.txt
+          grep -q "application-label:'Admission Collector v0.8.6 Persistent Mission Ledger'" /tmp/badging.txt
+          sha256sum "$APK" | tee /tmp/apk.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.8.6-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
