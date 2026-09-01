@@ -33,7 +33,15 @@ object JinhakAgentNavigator {
                     .replace(Regex("\\s+"), " ").trim().take(2400)
                 if (scanIndex < 0 || label.isBlank()) continue
                 if (!isSafeReadNavigationLabel(label)) continue
-                val app = JinhakApplicationMission.parseCard(contextText)
+                val explicitUniversity = obj.optString("applicationUniversity")
+                    .replace(Regex("\\s+"), " ").trim().take(80).takeIf { it.isNotBlank() }
+                val explicitDepartment = obj.optString("applicationDepartment")
+                    .replace(Regex("\\s+"), " ").trim().take(120).takeIf { it.isNotBlank() }
+                val app = JinhakApplicationMission.parseCard(
+                    contextText,
+                    explicitUniversity = explicitUniversity,
+                    explicitDepartment = explicitDepartment
+                )
                 val dedupeKey = listOf(scanIndex.toString(), label, kind, app?.identityKey ?: contextText.take(1000)).joinToString("|")
                 if (!seen.add(dedupeKey)) continue
                 var priority = JinhakSiteTopology.priority(route, label)

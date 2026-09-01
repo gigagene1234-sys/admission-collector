@@ -170,6 +170,7 @@ object SnapshotScript {
   }
 
   var jinhakCards=[];
+  var jinhakCardBindings=[];
   var jinhakCardStats={metricSeeds:0,candidateRoots:0,uniqueRoots:0,universityBoundRoots:0,universityContextRoots:0,universityMissingRoots:0,departmentBoundRoots:0,departmentContextRoots:0,departmentMissingRoots:0};
   var isJinhakHost=/(^|\.)jinhak\.com$/i.test(location.hostname);
   var jinhakBarSignals=(bodyText.match(/[0-9]{1,2}\s*칸/g)||[]).length;
@@ -356,6 +357,14 @@ object SnapshotScript {
       }else{
         jinhakCardStats.departmentMissingRoots++;
       }
+      // v0.8.7: retain the exact DOM root that produced the already-structured
+      // university/department pair. This object is runtime-only and is never exported as raw DOM.
+      jinhakCardBindings.push({
+        root:entry.el,
+        text:entry.text,
+        university:universityCtx.name||'',
+        department:departmentCtx.name||''
+      });
       jinhakCards.push({
         text:entry.text,
         score:entry.score,
@@ -411,6 +420,31 @@ object SnapshotScript {
     var bt=safeCloneText(be,3000);
     if(bt.length<4 || loginSensitive.test(bt.substring(0,200))) continue;
     if(admissionTerms.test(bt)) blocks.push(bt);
+  }
+
+  // v0.8.7: bind an action only to a detected card root that actually contains it.
+  // No previous/next sibling lookup and no page-wide nearest-card inference are permitted.
+  function applicationBindingForAction(el){
+    var result={contextText:'',university:'',department:'',source:'none'};
+    if(!isJinhakHost||!el) return result;
+    var matches=[];
+    for(var bi=0;bi<jinhakCardBindings.length;bi++){
+      var binding=jinhakCardBindings[bi];
+      if(binding&&binding.root&&binding.root.contains&&binding.root.contains(el)) matches.push(binding);
+    }
+    if(matches.length){
+      // Nested roots may contain the same action. Prefer the smallest structured root.
+      matches.sort(function(a,b){return String(a.text||'').length-String(b.text||'').length;});
+      var chosen=matches[0];
+      result.contextText=String(chosen.text||'').slice(0,3000);
+      result.university=String(chosen.university||'').slice(0,80);
+      result.department=String(chosen.department||'').slice(0,120);
+      result.source='same-card-root';
+      return result;
+    }
+    result.contextText=applicationContextForAction(el);
+    if(result.contextText) result.source='ancestor-text';
+    return result;
   }
 
   function applicationContextForAction(el){
@@ -491,7 +525,8 @@ object SnapshotScript {
       var agentBlocked=/(원서\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰|동의|미동의)/i;
       var agentAllowed=/(실제\s*합격자|과거\s*입시결과|입시\s*결과|합격\s*예측\s*리포트|모의\s*지원\s*리포트|지원자\s*분포|대학.?학과별\s*합격\s*예측|합격\s*안정성|상세|보기|조회|검색|리포트|대학\s*정보|전형\s*정보|학과\s*정보|합격\s*예측|모의\s*지원|수시\s*저장소|정시\s*저장소|추천\s*대학|성적\s*분석|성적\s*산출|입시\s*전략|입시\s*지식|경쟁률|모집\s*요강|다음|더보기|결과|탭)/i;
       var role=cleanText(a.getAttribute('role')||'');
-      var applicationContext=applicationContextForAction(a);
+      var applicationBinding=applicationBindingForAction(a);
+      var applicationContext=applicationBinding.contextText||'';
       var missionLink=!!route && String(a.tagName||'').toUpperCase()==='A' && applicationContext.length>0;
 
       // Stage 1: discovery is deliberately broader than promotion so the export can
@@ -499,14 +534,14 @@ object SnapshotScript {
       if(missionLink && missionAnchorDiscovery.length<160){
         var dk=li+'|'+label+'|'+applicationContext.slice(0,1200);
         if(!seenMissionDiscovery[dk]){
-          missionAnchorDiscovery.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:'mission-link-navigation',contextText:applicationContext});
+          missionAnchorDiscovery.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:'mission-link-navigation',contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source});
           seenMissionDiscovery[dk]=1;
         }
       }
 
       var dynamicControl=!route || role==='tab' || a.tagName==='BUTTON' || missionLink;
       if(dynamicControl && label && !agentBlocked.test(label+' '+meta2) && agentAllowed.test(label)){
-        var entry={scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(role==='tab'?'tab-navigation':'read-navigation'),contextText:applicationContext};
+        var entry={scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(role==='tab'?'tab-navigation':'read-navigation'),contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source};
         var ak=li+'|'+label+'|'+String(a.tagName||'')+'|'+role;
         if(missionLink && missionAgentActions.length<120 && !seenMissionAgentAction[ak]){
           missionAgentActions.push(entry);

@@ -226,8 +226,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_AGENT_ACTIONS = 260
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.8.6"
-        private const val BUILD_CODE = 10860
+        private const val VERSION = "0.8.7"
+        private const val BUILD_CODE = 10870
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }

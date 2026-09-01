@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.8.6 Persistent Mission Ledger"
+        android:label="Admission Collector v0.8.7 Structural Anchor Binding"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
