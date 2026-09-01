@@ -1,0 +1,160 @@
+name: Build Admission Collector v0.8.5 Mission Lane Sequencer
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v085.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+
+      - name: Apply v0.8.5 implementation
+        run: python3 scripts/apply_v085_mission_lane_sequencer.py
+
+      - name: Verify v0.8.5 source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          SNAP=app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+          AGENT=app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt
+          SEQ=app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionLaneSequencer.kt
+          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          YEAR=app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt
+
+          grep -q 'VERSION = "0.8.5"' "$MAIN"
+          grep -q 'BUILD_CODE = 10850' "$MAIN"
+          grep -q 'versionCode = 10850' app/build.gradle.kts
+          grep -q 'versionName = "0.8.5"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.8.5 Mission Lane Sequencer' app/src/main/AndroidManifest.xml
+
+          grep -q 'missionAgentActions' "$SNAP"
+          grep -q 'missionAnchorDiscovery' "$SNAP"
+          grep -q 'promotedMissionAction' "$AGENT"
+          grep -q 'append("missionAgentActions"' "$AGENT"
+          grep -q 'JinhakMissionLaneSequencer.choose' "$MAIN"
+          grep -q 'missionExhaustedAtOrigin' "$SEQ"
+          grep -q 'current-prediction' "$SEQ"
+          grep -q 'mock-support' "$SEQ"
+          grep -q 'actual-admit' "$SEQ"
+          grep -q 'score-analysis' "$SEQ"
+
+          grep -q 'applicationAnchorActionsPromoted' "$MAIN"
+          grep -q 'applicationAnchorActionsParsed' "$MAIN"
+          grep -q 'applicationAnchorActionsSelected' "$MAIN"
+          grep -q 'applicationAnchorActionsAttempted' "$MAIN"
+          grep -q 'applicationAnchorActionsClicked' "$MAIN"
+          grep -q 'applicationAnchorReportConfirmed' "$MAIN"
+          grep -q 'reportBridgeConfirmed' "$MAIN"
+          grep -q 'slowLaneFailureReasons' "$MAIN"
+          grep -q 'cloudFrontierOutstanding' "$MAIN"
+
+          grep -q 'applicantAverageGrade' "$ADAPTER"
+          grep -q 'sanitizeHistoricalRowYear' "$ADAPTER"
+          grep -q 'historical-multi-year-or-unresolved' "$YEAR"
+          grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          agent=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text()
+          seq=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionLaneSequencer.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          year=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt').read_text()
+
+          if 'override val supportsBatchCrawl = true' in adapter:
+              raise SystemExit('protected Jinhak broad batch capability re-enabled')
+          if 'h.contains("지원자") -> metrics.put("applicants", n)' in adapter:
+              raise SystemExit('average-grade to applicant-count corruption path remains')
+          if 'missionAgentActions:missionAgentActions' not in snap:
+              raise SystemExit('mission action channel not exported')
+          if snap.index('missionAgentActions:missionAgentActions') > snap.index('resourceLinks:resources'):
+              raise SystemExit('mission action export malformed')
+          if 'append("missionAgentActions", promoted = true' not in agent:
+              raise SystemExit('promoted mission candidates are not parsed first')
+          if 'Generic actions remain bounded, but can no longer evict mission anchors.' not in snap:
+              raise SystemExit('generic pool can still evict mission anchors')
+          if 'only an exhausted origin clears the mission' not in main:
+              raise SystemExit('mission context does not survive report-to-origin return')
+          if 'year !in 2000 until currentCycle' not in year:
+              raise SystemExit('historical current-cycle leakage guard missing')
+          if 'applicantAverageGrade' not in adapter or '지원자수|지원자 수|지원인원' not in adapter:
+              raise SystemExit('explicit applicant metric semantics missing')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: '8.7'}
+
+      - name: Build
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "versionCode='10850'" /tmp/badging.txt
+          grep -q "versionName='0.8.5'" /tmp/badging.txt
+          grep -q "application-label:'Admission Collector v0.8.5 Mission Lane Sequencer'" /tmp/badging.txt
+          sha256sum "$APK" | tee /tmp/apk.sha256
+
+      - name: Commit generated v0.8.5 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
+            app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt \
+            app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt \
+            app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml
+          if ! git diff --cached --quiet; then
+            git commit -m "Implement v0.8.5 mission lane sequencer"
+            git push origin HEAD:main
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-v0.8.5-mission-lane-sequencer
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
