@@ -12,34 +12,46 @@ object JinhakAgentNavigator {
         val kind: String,
         val missionPriority: Int,
         val contextText: String,
-        val applicationContext: JinhakApplicationMission.Context?
+        val applicationContext: JinhakApplicationMission.Context?,
+        val promotedMissionAction: Boolean = false
     )
 
     fun candidates(snapshot: JSONObject): List<Candidate> {
-        val array = snapshot.optJSONArray("agentActions") ?: JSONArray()
         val route = snapshot.optString("url")
         val out = mutableListOf<Candidate>()
-        for (i in 0 until minOf(array.length(), 160)) {
-            val obj = array.optJSONObject(i) ?: continue
-            val scanIndex = obj.optInt("scanIndex", -1)
-            val label = obj.optString("label").replace(Regex("\\s+"), " ").trim().take(120)
-            val tag = obj.optString("tag").take(24)
-            val kind = obj.optString("kind", "read-navigation").take(40)
-            val contextText = obj.optString("contextText")
-                .replace(Regex("\\s+"), " ").trim().take(2400)
-            if (scanIndex < 0 || label.isBlank()) continue
-            if (!isSafeReadNavigationLabel(label)) continue
-            val app = JinhakApplicationMission.parseCard(contextText)
-            var priority = JinhakSiteTopology.priority(route, label)
-            if (app?.identityKey != null) priority += 14
-            if (app != null && Regex("(리포트|실제\\s*합격자|모의\\s*지원|합격\\s*예측)").containsMatchIn(label)) priority += 8
-            // v0.8.3 discovered mission-bound anchors but executed none. Prefer them over
-            // generic same-page controls while preserving the same-card Gate-A identity.
-            if (kind == "mission-link-navigation" && app?.identityKey != null) priority += 35
-            out += Candidate(scanIndex, label, tag, kind, priority.coerceIn(0, 160), contextText, app)
+        val seen = linkedSetOf<String>()
+
+        fun append(arrayName: String, promoted: Boolean, limit: Int) {
+            val array = snapshot.optJSONArray(arrayName) ?: JSONArray()
+            for (i in 0 until minOf(array.length(), limit)) {
+                val obj = array.optJSONObject(i) ?: continue
+                val scanIndex = obj.optInt("scanIndex", -1)
+                val label = obj.optString("label").replace(Regex("\\s+"), " ").trim().take(120)
+                val tag = obj.optString("tag").take(24)
+                val kind = obj.optString("kind", "read-navigation").take(40)
+                val contextText = obj.optString("contextText")
+                    .replace(Regex("\\s+"), " ").trim().take(2400)
+                if (scanIndex < 0 || label.isBlank()) continue
+                if (!isSafeReadNavigationLabel(label)) continue
+                val app = JinhakApplicationMission.parseCard(contextText)
+                val dedupeKey = listOf(scanIndex.toString(), label, kind, app?.identityKey ?: contextText.take(1000)).joinToString("|")
+                if (!seen.add(dedupeKey)) continue
+                var priority = JinhakSiteTopology.priority(route, label)
+                if (app?.identityKey != null) priority += 14
+                if (app != null && Regex("(리포트|실제\\s*합격자|모의\\s*지원|합격\\s*예측)").containsMatchIn(label)) priority += 8
+                if (kind == "mission-link-navigation" && app?.identityKey != null) priority += 35
+                if (promoted && app?.identityKey != null) priority += 45
+                out += Candidate(scanIndex, label, tag, kind, priority.coerceIn(0, 220), contextText, app, promoted)
+            }
         }
+
+        // Dedicated mission anchors cannot be displaced by the generic action cap.
+        append("missionAgentActions", promoted = true, limit = 120)
+        append("agentActions", promoted = false, limit = 160)
+
         return out.sortedWith(
-            compareByDescending<Candidate> { it.kind == "mission-link-navigation" && it.applicationContext?.identityKey != null }
+            compareByDescending<Candidate> { it.promotedMissionAction && it.applicationContext?.identityKey != null }
+                .thenByDescending { it.kind == "mission-link-navigation" && it.applicationContext?.identityKey != null }
                 .thenByDescending { it.applicationContext?.identityKey != null }
                 .thenByDescending { it.missionPriority }
                 .thenBy { it.scanIndex }
@@ -54,9 +66,12 @@ object JinhakAgentNavigator {
             candidate.tag,
             candidate.kind,
             candidate.missionPriority.toString(),
+            candidate.promotedMissionAction.toString(),
             candidate.applicationContext?.identityKey ?: RecordUtils.sha256(candidate.contextText.take(1200))
         ).joinToString("|")
     )
+
+    fun laneForCandidate(candidate: Candidate): String = JinhakMissionLaneSequencer.laneForLabel(candidate.label, candidate.kind)
 
     fun executionScript(candidate: Candidate): String {
         val expected = JSONObject.quote(candidate.label)

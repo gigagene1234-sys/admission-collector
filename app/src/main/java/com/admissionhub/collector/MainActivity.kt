@@ -38,6 +38,7 @@ import com.admissionhub.collector.jinhak.JinhakSiteTopology
 import com.admissionhub.collector.jinhak.JinhakApplicationMission
 import com.admissionhub.collector.jinhak.JinhakSlowLanePool
 import com.admissionhub.collector.jinhak.JinhakReportContextBridge
+import com.admissionhub.collector.jinhak.JinhakMissionLaneSequencer
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.provider.ProviderCapabilities
 import com.admissionhub.collector.provider.ProviderCapability
@@ -159,6 +160,11 @@ class MainActivity : Activity() {
     private var jinhakApplicationMissionReturns = 0
     private val jinhakMissionCoverage = linkedMapOf<String, MutableSet<String>>()
     private val jinhakMissionAnchorDiscoveredKeys = linkedSetOf<String>()
+    private val jinhakMissionAnchorPromotedKeys = linkedSetOf<String>()
+    private val jinhakMissionAnchorParsedKeys = linkedSetOf<String>()
+    private val jinhakMissionAnchorSelectedKeys = linkedSetOf<String>()
+    private val jinhakMissionAnchorClickedKeys = linkedSetOf<String>()
+    private val jinhakReportConfirmedKeys = linkedSetOf<String>()
     private var jinhakMissionAnchorActionsExecuted = 0
     private var jinhakConsentGatePending = false
     private var jinhakConsentResumePending = false
@@ -179,8 +185,10 @@ class MainActivity : Activity() {
     private var jinhakReportBridgeContext: JSONObject? = null
     private var jinhakReportBridgeArmed = 0
     private var jinhakReportBridgeApplied = 0
+    private var jinhakReportBridgeConfirmed = 0
     private var jinhakMissionAnchorActionsAttempted = 0
     private val jinhakAnchorRejectReasons = linkedMapOf<String, Int>()
+    private val jinhakSlowLaneFailureReasons = linkedMapOf<String, Int>()
     private val cloudFrontierTaskIds = linkedMapOf<String, String>()
     private var cloudFrontierClaimInProgress = false
     private var cloudFrontierClaimAttempts = 0
@@ -214,8 +222,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_AGENT_ACTIONS = 180
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.8.4"
-        private const val BUILD_CODE = 10840
+        private const val VERSION = "0.8.5"
+        private const val BUILD_CODE = 10850
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1203,6 +1211,11 @@ class MainActivity : Activity() {
         jinhakApplicationMissionReturns = 0
         jinhakMissionCoverage.clear()
         jinhakMissionAnchorDiscoveredKeys.clear()
+        jinhakMissionAnchorPromotedKeys.clear()
+        jinhakMissionAnchorParsedKeys.clear()
+        jinhakMissionAnchorSelectedKeys.clear()
+        jinhakMissionAnchorClickedKeys.clear()
+        jinhakReportConfirmedKeys.clear()
         jinhakMissionAnchorActionsExecuted = 0
         jinhakConsentGatePending = false
         jinhakConsentResumePending = false
@@ -1223,8 +1236,10 @@ class MainActivity : Activity() {
         jinhakReportBridgeContext = null
         jinhakReportBridgeArmed = 0
         jinhakReportBridgeApplied = 0
+        jinhakReportBridgeConfirmed = 0
         jinhakMissionAnchorActionsAttempted = 0
         jinhakAnchorRejectReasons.clear()
+        jinhakSlowLaneFailureReasons.clear()
         if (::slowLanePool.isInitialized) {
             slowLanePool.cancelAll("new-batch-reset")
             slowLanePool.setMaxActiveWorkers(JinhakSlowLanePool.DEFAULT_MAX_WORKERS)
@@ -1655,6 +1670,8 @@ class MainActivity : Activity() {
         stats: JinhakSlowLanePool.ResultStats
     ) {
         jinhakSlowLaneFailed += 1
+        val failureClass = reason.substringBefore(':').take(80)
+        jinhakSlowLaneFailureReasons[failureClass] = (jinhakSlowLaneFailureReasons[failureClass] ?: 0) + 1
         batchErrors.put(JSONObject()
             .put("type", reason.take(120))
             .put("targetSafePath", runtimeSafePath(task.targetUrl))
@@ -2435,6 +2452,17 @@ class MainActivity : Activity() {
                     snapshot.put("missionApplicationContext", missionJson)
                     if (JinhakReportContextBridge.isReportPageType(pageTypeForBridge) && missionJson.has("reportBridgeActionToken")) {
                         jinhakReportBridgeApplied += 1
+                        val bridgeMission = JinhakApplicationMission.fromJson(missionJson)
+                        val lane = JinhakApplicationMission.laneForPageType(pageTypeForBridge)
+                        val confirmationKey = RecordUtils.sha256(listOf(
+                            bridgeMission?.identityKey ?: "",
+                            lane,
+                            missionJson.optString("reportBridgeActionToken"),
+                            runtimeSafePath(snapshot.optString("url"))
+                        ).joinToString("|"))
+                        if (bridgeMission?.identityKey != null && lane != "reference" && jinhakReportConfirmedKeys.add(confirmationKey)) {
+                            jinhakReportBridgeConfirmed += 1
+                        }
                     }
                 }
             }
@@ -2476,14 +2504,23 @@ class MainActivity : Activity() {
                     }
                     if (populated) jinhakFirstPopulatedStorageAtMs = System.currentTimeMillis()
                 }
-                val actions = snapshot.optJSONArray("agentActions") ?: JSONArray()
-                for (ai in 0 until actions.length()) {
-                    val a = actions.optJSONObject(ai) ?: continue
-                    if (a.optString("kind") != "mission-link-navigation") continue
+                val discoveredAnchors = snapshot.optJSONArray("missionAnchorDiscovery") ?: JSONArray()
+                for (ai in 0 until discoveredAnchors.length()) {
+                    val a = discoveredAnchors.optJSONObject(ai) ?: continue
                     val key = RecordUtils.sha256(listOf(a.optString("label"), a.optString("contextText")).joinToString("|"))
                     jinhakMissionAnchorDiscoveredKeys.add(key)
                 }
-                val mission = jinhakMissionContext
+                val promotedAnchors = snapshot.optJSONArray("missionAgentActions") ?: JSONArray()
+                for (ai in 0 until promotedAnchors.length()) {
+                    val a = promotedAnchors.optJSONObject(ai) ?: continue
+                    val key = RecordUtils.sha256(listOf(a.optString("label"), a.optString("contextText")).joinToString("|"))
+                    jinhakMissionAnchorPromotedKeys.add(key)
+                }
+                JinhakAgentNavigator.candidates(snapshot).filter { it.promotedMissionAction && it.applicationContext?.identityKey != null }.forEach { candidate ->
+                    val key = RecordUtils.sha256(listOf(candidate.label, candidate.applicationContext?.identityKey ?: "").joinToString("|"))
+                    jinhakMissionAnchorParsedKeys.add(key)
+                }
+                val mission = JinhakApplicationMission.fromJson(snapshot.optJSONObject("missionApplicationContext")) ?: jinhakMissionContext
                 val missionKey = mission?.identityKey
                 if (missionKey != null) {
                     val lane = JinhakApplicationMission.laneForPageType(snapshot.optString("providerPageType"))
@@ -2765,14 +2802,27 @@ class MainActivity : Activity() {
         fun actionKeyFor(action: JinhakAgentNavigator.Candidate): String = RecordUtils.sha256(
             "${expansionStateKey ?: runtimeSafePath(route)}|${JinhakAgentNavigator.key(route, action)}"
         )
-        val candidates = JinhakAgentNavigator.candidates(snapshot)
+        val candidates = JinhakAgentNavigator.candidates(snapshot).filterNot { jinhakAgentActionSeen.contains(actionKeyFor(it)) }
         val currentMissionKey = jinhakMissionContext?.identityKey
-        val candidate = candidates.firstOrNull { action ->
-            if (jinhakAgentActionSeen.contains(actionKeyFor(action))) return@firstOrNull false
-            val actionMissionKey = action.applicationContext?.identityKey
-            // While inside a mission report, do not jump directly to a DIFFERENT application card.
-            currentMissionKey == null || actionMissionKey == null || actionMissionKey == currentMissionKey
-        } ?: return false
+        val covered = currentMissionKey?.let { jinhakMissionCoverage[it]?.toSet() }.orEmpty()
+        val atMissionOrigin = currentMissionKey != null && jinhakMissionOriginRoute.isNotBlank() &&
+            canonicalizeBatchUrl(route) == canonicalizeBatchUrl(jinhakMissionOriginRoute)
+        val selection = JinhakMissionLaneSequencer.choose(candidates, currentMissionKey, covered, atMissionOrigin)
+        if (selection.missionExhaustedAtOrigin && currentMissionKey != null) {
+            recordRuntimeEvent("jinhak-application-mission-lanes-exhausted", JSONObject()
+                .put("applicationIdentityHash", currentMissionKey.take(24))
+                .put("coverageLanes", covered.size)
+                .put("safePath", runtimeSafePath(route)))
+            jinhakMissionContext = null
+            jinhakReportBridgeContext = null
+            jinhakMissionOriginRoute = ""
+            jinhakMissionNeedsReturn = false
+        }
+        val candidate = selection.candidate ?: return false
+        if (candidate.kind == "mission-link-navigation") {
+            val selectedKey = RecordUtils.sha256(listOf(candidate.label, candidate.applicationContext?.identityKey ?: "").joinToString("|"))
+            jinhakMissionAnchorSelectedKeys.add(selectedKey)
+        }
         val actionKey = actionKeyFor(candidate)
         jinhakAgentActionSeen.add(actionKey)
 
@@ -2833,7 +2883,11 @@ class MainActivity : Activity() {
                 if (candidate.kind == "mission-link-navigation") jinhakReportBridgeContext = null
             }
             if (result.optBoolean("ok", false)) {
-                if (candidate.kind == "mission-link-navigation") jinhakMissionAnchorActionsExecuted += 1
+                if (candidate.kind == "mission-link-navigation") {
+                    jinhakMissionAnchorActionsExecuted += 1
+                    val clickedKey = RecordUtils.sha256(listOf(candidate.label, candidate.applicationContext?.identityKey ?: "").joinToString("|"))
+                    jinhakMissionAnchorClickedKeys.add(clickedKey)
+                }
                 handler.postDelayed({
                     if (!batchRunning || batchPausedForLogin || batchCollecting) return@postDelayed
                     scheduleBatchSnapshot()
@@ -2856,10 +2910,10 @@ class MainActivity : Activity() {
             .put("fromSafePath", runtimeSafePath(current))
             .put("toSafePath", runtimeSafePath(origin))
             .put("coverageLanes", jinhakMissionCoverage[mission.identityKey]?.size ?: 0))
-        // Clear before navigation so the next storage snapshot cannot inherit the previous application.
-        jinhakMissionContext = null
+        // v0.8.5 keeps the same application mission active while returning to the
+        // saved-application origin. The sequencer then selects the next missing lane;
+        // only an exhausted origin clears the mission before selecting another card.
         jinhakReportBridgeContext = null
-        jinhakMissionOriginRoute = ""
         jinhakMissionNeedsReturn = false
         currentBatchTarget = origin
         status.text = "지원안 리포트 탐색 종료: 수시저장소 카드로 복귀해 다음 미션을 계속합니다."
@@ -3320,11 +3374,17 @@ class MainActivity : Activity() {
                         .put("missionBootstrapAtMs", jinhakMissionBootstrapStartedAtMs)
                         .put("secondsToFirstPopulatedStorage", if (jinhakMissionBootstrapStartedAtMs > 0L && jinhakFirstPopulatedStorageAtMs > 0L) (jinhakFirstPopulatedStorageAtMs - jinhakMissionBootstrapStartedAtMs) / 1000.0 else JSONObject.NULL)
                         .put("applicationAnchorActionsDiscovered", jinhakMissionAnchorDiscoveredKeys.size)
+                        .put("applicationAnchorActionsPromoted", jinhakMissionAnchorPromotedKeys.size)
+                        .put("applicationAnchorActionsParsed", jinhakMissionAnchorParsedKeys.size)
+                        .put("applicationAnchorActionsSelected", jinhakMissionAnchorSelectedKeys.size)
                         .put("applicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
+                        .put("applicationAnchorActionsClicked", jinhakMissionAnchorClickedKeys.size)
                         .put("applicationAnchorActionsExecuted", jinhakMissionAnchorActionsExecuted)
+                        .put("applicationAnchorReportConfirmed", jinhakReportConfirmedKeys.size)
                         .put("applicationAnchorRejectReasons", JSONObject(jinhakAnchorRejectReasons as Map<*, *>))
                         .put("reportBridgeArmed", jinhakReportBridgeArmed)
                         .put("reportBridgeApplied", jinhakReportBridgeApplied)
+                        .put("reportBridgeConfirmed", jinhakReportBridgeConfirmed)
                         .put("consentGatesEncountered", jinhakConsentGatesEncountered)
                         .put("consentGatesResolved", jinhakConsentGatesResolved)
                         .put("unboundSavedApplicationObservations", jinhakUnboundSavedApplicationObservations)
@@ -3333,6 +3393,7 @@ class MainActivity : Activity() {
                         .put("slowLaneAverageCompletedMs", if (jinhakSlowLaneCompleted > 0) jinhakSlowLaneCompletedDurationMs / jinhakSlowLaneCompleted else JSONObject.NULL)
                         .put("slowLaneMaxCompletedMs", jinhakSlowLaneMaxDurationMs)
                         .put("slowLaneFailed", jinhakSlowLaneFailed)
+                        .put("slowLaneFailureReasons", JSONObject(jinhakSlowLaneFailureReasons as Map<*, *>))
                         .put("slowLaneUserActionRequired", jinhakSlowLaneUserActionRequired)
                         .put("slowLaneProgressExtensions", if (::slowLanePool.isInitialized) slowLanePool.stats().progressExtensions else 0)
                         .put("slowLaneReplayAttempts", if (::slowLanePool.isInitialized) slowLanePool.stats().replayAttempts else 0)
@@ -3347,7 +3408,8 @@ class MainActivity : Activity() {
                         .put("cloudFrontierPublished", cloudFrontierPublished)
                         .put("cloudFrontierClaimed", cloudFrontierClaimed)
                         .put("cloudFrontierCompleted", cloudFrontierCompleted)
-                        .put("cloudFrontierCompletionFailed", cloudFrontierCompletionFailed),
+                        .put("cloudFrontierCompletionFailed", cloudFrontierCompletionFailed)
+                        .put("cloudFrontierOutstanding", (cloudFrontierClaimed - cloudFrontierCompleted).coerceAtLeast(0)),
                     false
                 )
             }
@@ -3419,6 +3481,7 @@ class MainActivity : Activity() {
                 .put("cloudFrontierClaimed", cloudFrontierClaimed)
                 .put("cloudFrontierCompleted", cloudFrontierCompleted)
                 .put("cloudFrontierCompletionFailed", cloudFrontierCompletionFailed)
+                        .put("cloudFrontierOutstanding", (cloudFrontierClaimed - cloudFrontierCompleted).coerceAtLeast(0))
                 .put("sessionLease", sessionVault.summary(provider.wireName)?.toJson() ?: JSONObject.NULL))
             .put("localFirst", JSONObject()
                 .put("enabled", LOCAL_FIRST_BETA)

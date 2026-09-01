@@ -435,11 +435,15 @@ object SnapshotScript {
   var resources=[];
   var pageActions=[];
   var agentActions=[];
+  var missionAgentActions=[];
+  var missionAnchorDiscovery=[];
   var linkNodes=document.querySelectorAll('a,button,[role=button],[onclick],[data-href],[data-url],[data-link],[data-path]');
   var seenNav={};
   var seenRes={};
   var seenPageAction={};
   var seenAgentAction={};
+  var seenMissionAgentAction={};
+  var seenMissionDiscovery={};
   var currentParts=location.pathname.split('/').filter(Boolean);
   var prefix=currentParts.slice(0,2).join('/');
   var scriptCandidates=0;
@@ -483,19 +487,36 @@ object SnapshotScript {
     }
 
     var missionLinkBound=false;
-    if(isJinhakHost && agentActions.length<160){
+    if(isJinhakHost){
       var agentBlocked=/(원서\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰|동의|미동의)/i;
-      var agentAllowed=/(실제\s*합격자|과거\s*입시결과|입시\s*결과|합격\s*예측\s*리포트|모의\s*지원\s*리포트|지원자\s*분포|대학.?학과별\s*합격\s*예측|합격\s*안정성|상세|보기|조회|검색|리포트|대학\s*정보|전형\s*정보|학과\s*정보|합격\s*예측|모의\s*지원|수시\s*저장소|정시\s*저장소|추천\s*대학|성적\s*분석|입시\s*전략|입시\s*지식|경쟁률|모집\s*요강|다음|더보기|결과|탭)/i;
+      var agentAllowed=/(실제\s*합격자|과거\s*입시결과|입시\s*결과|합격\s*예측\s*리포트|모의\s*지원\s*리포트|지원자\s*분포|대학.?학과별\s*합격\s*예측|합격\s*안정성|상세|보기|조회|검색|리포트|대학\s*정보|전형\s*정보|학과\s*정보|합격\s*예측|모의\s*지원|수시\s*저장소|정시\s*저장소|추천\s*대학|성적\s*분석|성적\s*산출|입시\s*전략|입시\s*지식|경쟁률|모집\s*요강|다음|더보기|결과|탭)/i;
       var role=cleanText(a.getAttribute('role')||'');
       var applicationContext=applicationContextForAction(a);
       var missionLink=!!route && String(a.tagName||'').toUpperCase()==='A' && applicationContext.length>0;
+
+      // Stage 1: discovery is deliberately broader than promotion so the export can
+      // explain exactly where an anchor was lost before candidate selection.
+      if(missionLink && missionAnchorDiscovery.length<160){
+        var dk=li+'|'+label+'|'+applicationContext.slice(0,1200);
+        if(!seenMissionDiscovery[dk]){
+          missionAnchorDiscovery.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:'mission-link-navigation',contextText:applicationContext});
+          seenMissionDiscovery[dk]=1;
+        }
+      }
+
       var dynamicControl=!route || role==='tab' || a.tagName==='BUTTON' || missionLink;
       if(dynamicControl && label && !agentBlocked.test(label+' '+meta2) && agentAllowed.test(label)){
+        var entry={scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(role==='tab'?'tab-navigation':'read-navigation'),contextText:applicationContext};
         var ak=li+'|'+label+'|'+String(a.tagName||'')+'|'+role;
-        if(!seenAgentAction[ak]){
-          agentActions.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(role==='tab'?'tab-navigation':'read-navigation'),contextText:applicationContext});
+        if(missionLink && missionAgentActions.length<120 && !seenMissionAgentAction[ak]){
+          missionAgentActions.push(entry);
+          seenMissionAgentAction[ak]=1;
+          missionLinkBound=true;
+        }
+        // Generic actions remain bounded, but can no longer evict mission anchors.
+        if(agentActions.length<160 && !seenAgentAction[ak]){
+          agentActions.push(entry);
           seenAgentAction[ak]=1;
-          missionLinkBound=missionLink;
         }
       }
     }
@@ -539,7 +560,7 @@ object SnapshotScript {
     pageState:{isError:pageError,errorType:errorType},
     interactionGate:interactionGate,
     listMeta:{totalItems:isNaN(listTotal)?-1:listTotal,visibleDataRows:visibleDataRows},
-    discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length,agentActions:agentActions.length,jinhakDeepPage:jinhakDeepPage},
+    discovery:{navigationLinks:nav.length,resourceLinks:resources.length,scriptRoutes:scriptCandidates,pageActions:pageActions.length,agentActions:agentActions.length,missionAgentActions:missionAgentActions.length,missionAnchorDiscovery:missionAnchorDiscovery.length,jinhakDeepPage:jinhakDeepPage},
     context:context,
     selectionContext:selectionContext,
     jinhakCards:jinhakCards,
@@ -549,6 +570,8 @@ object SnapshotScript {
     navigationLinks:nav,
     pageActions:pageActions,
     agentActions:agentActions,
+    missionAgentActions:missionAgentActions,
+    missionAnchorDiscovery:missionAnchorDiscovery,
     resourceLinks:resources
   });
 })();
