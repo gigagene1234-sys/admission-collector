@@ -277,11 +277,13 @@ class CloudOffloadCoordinator(context: Context) {
         }
     }
 
-    fun completeFrontier(taskId: String, state: String, errorType: String?) {
-        if (taskId.isBlank() || frontierAvailable != true) return
-        val currentClient = synchronized(lock) { ensureClientLocked(); client } ?: return
+    fun completeFrontier(taskId: String, state: String, errorType: String?, callback: (Boolean) -> Unit = {}) {
+        if (taskId.isBlank() || frontierAvailable != true) { callback(false); return }
+        val currentClient = synchronized(lock) { ensureClientLocked(); client }
+        if (currentClient == null) { callback(false); return }
         currentClient.completeFrontier(taskId, state, errorType) { result ->
             result.onFailure { lastError = it.message }
+            callback(result.isSuccess)
         }
     }
 

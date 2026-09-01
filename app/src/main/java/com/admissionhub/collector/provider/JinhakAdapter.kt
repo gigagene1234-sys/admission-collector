@@ -5,6 +5,7 @@ import com.admissionhub.collector.parser.RecordUtils
 import com.admissionhub.collector.jinhak.JinhakSiteTopology
 import com.admissionhub.collector.jinhak.JinhakStrategyAnalyzer
 import com.admissionhub.collector.jinhak.JinhakApplicationMission
+import com.admissionhub.collector.jinhak.JinhakReportYearGuard
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -13,7 +14,8 @@ import java.time.temporal.ChronoUnit
 
 object JinhakAdapter : ProviderAdapter {
     override val id = ProviderId.JINHAK
-    override val supportsBatchCrawl = true
+    override val supportsBatchCrawl = false
+    override val supportsUserSessionMissionTraversal = true
     private const val TARGET_YEAR = 2027
     private val TABLE_EVIDENCE_PAGE_TYPES = setOf(
         "jinhak-home",
@@ -122,7 +124,12 @@ object JinhakAdapter : ProviderAdapter {
         val missionContext = JinhakApplicationMission.fromJson(snapshot.optJSONObject("missionApplicationContext"))
         val observedAt = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
         val dataScope = dataScope(pageType)
-        val inferredYear = context.year ?: if (dataScope == "current-prediction" || dataScope == "current-admission") TARGET_YEAR else null
+        val inferredYear = JinhakReportYearGuard.resolvePageYear(pageType, text, TARGET_YEAR)
+            ?: when {
+                dataScope == "historical-result" -> null
+                dataScope == "current-prediction" || dataScope == "current-admission" || dataScope == "student-profile" -> TARGET_YEAR
+                else -> context.year
+            }
         val result = JSONArray()
 
         if (pageType == "jinhak-university-admission-info") {
@@ -274,7 +281,11 @@ object JinhakAdapter : ProviderAdapter {
             return result
         }
 
-        val metrics = JinhakApplicationMission.semanticMetrics(text)
+        val metrics = JinhakReportYearGuard.annotate(
+            JinhakApplicationMission.semanticMetrics(text),
+            pageType,
+            inferredYear
+        )
         putNumber(metrics, "universityCalculatedScore", Regex("(?:대학별\\s*)?(?:환산점수|산출점수)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
         putNumber(metrics, "convertedGrade", Regex("(?:반영\\s*평균등급|환산등급|내\\s*등급)\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)").find(text)?.groupValues?.getOrNull(1))
         putInt(metrics, "stabilityBars", Regex("(?:합격안정성|칸수|칸\\s*수)?\\s*[:：]?\\s*([0-9]{1,2})\\s*칸").find(text)?.groupValues?.getOrNull(1))
@@ -328,7 +339,14 @@ object JinhakAdapter : ProviderAdapter {
             row.put("providerPageType", pageType)
                 .put("dataScope", dataScope)
                 .put("observedAt", observedAt)
-            if (row.isNull("year") && inferredYear != null) row.put("year", inferredYear)
+            if (dataScope == "historical-result") {
+                val guardedHistoricalYear = JinhakReportYearGuard.sanitizeHistoricalRowYear(row, TARGET_YEAR)
+                row.put("year", guardedHistoricalYear ?: JSONObject.NULL)
+                val rowMetrics = row.optJSONObject("metrics") ?: JSONObject().also { row.put("metrics", it) }
+                JinhakReportYearGuard.annotate(rowMetrics, pageType, guardedHistoricalYear)
+            } else if (row.isNull("year") && inferredYear != null) {
+                row.put("year", inferredYear)
+            }
             if (missionContext?.identityKey != null) {
                 if (row.isNull("university") || row.optString("university").isBlank()) row.put("university", missionContext.university ?: JSONObject.NULL)
                 if (row.isNull("department") || row.optString("department").isBlank()) row.put("department", missionContext.departmentRaw ?: JSONObject.NULL)
