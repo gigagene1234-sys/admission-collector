@@ -200,6 +200,19 @@ class JinhakMissionTargetLedger {
         }
     }
 
+    /** Terminalize non-terminal targets before final completion. */
+    fun failAllOutstanding(reason: String): Int {
+        val stranded = targets.values.filter {
+            it.state == State.PENDING || it.state == State.CLICKED || it.state == State.DEFERRED
+        }
+        stranded.forEach {
+            it.state = State.FAILED
+            it.failureReason = reason.take(100)
+            it.updatedAtMs = System.currentTimeMillis()
+        }
+        return stranded.size
+    }
+
     fun stateOf(targetId: String?): State? = targetId?.let { targets[it]?.state }
 
     fun target(targetId: String?): Target? = targetId?.let { targets[it] }

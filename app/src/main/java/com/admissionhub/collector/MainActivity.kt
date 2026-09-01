@@ -3165,6 +3165,20 @@ class MainActivity : Activity() {
 
     private fun verifyLocalCompletionOrFinish() {
         if (!batchRunning || batchPausedForLogin) return
+        if (provider == ProviderId.JINHAK && jinhakMissionTargetLedger.outstandingCount() > 0) {
+            val outstanding = jinhakMissionTargetLedger.outstandingCount()
+            val terminalized = jinhakMissionTargetLedger.failAllOutstanding("completion-fence-stranded-target")
+            batchErrors.put(JSONObject()
+                .put("type", "jinhak-mission-ledger-completion-fence")
+                .put("outstandingBeforeFence", outstanding)
+                .put("terminalized", terminalized))
+            recordRuntimeEvent("jinhak-mission-ledger-completion-fence", JSONObject()
+                .put("outstandingBeforeFence", outstanding)
+                .put("terminalized", terminalized)
+                .put("ledger", jinhakMissionTargetLedger.summary()))
+            finishBatch("completed-with-local-errors")
+            return
+        }
         val runId = localRunId
         if (runId == null) {
             finishBatch("completed")
