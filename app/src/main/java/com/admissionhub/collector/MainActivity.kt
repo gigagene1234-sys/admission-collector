@@ -156,6 +156,12 @@ class MainActivity : Activity() {
     private var jinhakAgentActionsExecuted = 0
     private var jinhakMissionActionsExecuted = 0
     private var jinhakGenericActionsExecuted = 0
+    private val jinhakReferenceRouteCaptureCounts = linkedMapOf<String, Int>()
+    private var jinhakReferenceRepeatSkips = 0
+    private var jinhakNoProgressFences = 0
+    private var jinhakLastMeaningfulProgressAtMs = 0L
+    private var jinhakProgressFenceGeneration = 0
+    private var jinhakLastLiveDiagnosticsAtMs = 0L
     private var jinhakMissionContext: JinhakApplicationMission.Context? = null
     private var jinhakMissionOriginRoute = ""
     private var jinhakMissionNeedsReturn = false
@@ -230,10 +236,14 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val MAX_JINHAK_GENERIC_ACTIONS = 180
         private const val MAX_JINHAK_MISSION_ACTIONS = 220
+        private const val MAX_JINHAK_REFERENCE_ROUTE_CAPTURES = 2
+        private const val JINHAK_NO_PROGRESS_FENCE_MS = 60_000L
+        private const val JINHAK_PROGRESS_FENCE_POLL_MS = 15_000L
+        private const val JINHAK_LIVE_DIAGNOSTIC_MIN_INTERVAL_MS = 10_000L
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.8.8"
-        private const val BUILD_CODE = 10880
+        private const val VERSION = "0.8.9"
+        private const val BUILD_CODE = 10890
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -986,7 +996,7 @@ class MainActivity : Activity() {
         batchButton.text = "진학사 자동 탐색 준비"
         diagnosticButton.text = "진학사 전체 분석 전송"
         unifiedButton.text = "통합 수집 종료"
-        status.text = "통합 수집 2/2 · 진학사 목적형 분석 준비: 저장대학→합격예측→모의지원→실제합격자→대학입결→전략 순으로 우선 탐색합니다."
+        status.text = "통합 수집 2/2 · 진학사 목적형 분석 준비: 저장대학→합격예측→모의지원→실제합격자→대학입결→성적/최저 순으로 우선 탐색합니다."
         webView.loadUrl(ProviderId.JINHAK.homeUrl)
     }
 
@@ -1215,6 +1225,12 @@ class MainActivity : Activity() {
         jinhakAgentActionsExecuted = 0
         jinhakMissionActionsExecuted = 0
         jinhakGenericActionsExecuted = 0
+        jinhakReferenceRouteCaptureCounts.clear()
+        jinhakReferenceRepeatSkips = 0
+        jinhakNoProgressFences = 0
+        jinhakLastMeaningfulProgressAtMs = if (provider == ProviderId.JINHAK) System.currentTimeMillis() else 0L
+        jinhakLastLiveDiagnosticsAtMs = 0L
+        ++jinhakProgressFenceGeneration
         jinhakMissionContext = null
         jinhakReportBridgeContext = null
         jinhakMissionOriginRoute = ""
@@ -1317,6 +1333,7 @@ class MainActivity : Activity() {
     }
 
     private fun beginBatchNavigation(runId: String?) {
+        if (provider == ProviderId.JINHAK) armJinhakProgressFence()
         enqueueProviderSeeds()
         cloudOffload.probeFrontier { available ->
             runOnUiThread {
@@ -1383,6 +1400,130 @@ class MainActivity : Activity() {
             "https://www.adiga.kr" + if (familyKey.startsWith("/")) familyKey else "/$familyKey"
         }
         return if (requestedYear != null) withQueryParameter(raw, "searchSyr", requestedYear.toString()) else raw
+    }
+
+    private fun isJinhakLowValueReferencePageType(pageType: String): Boolean = pageType in setOf(
+        "jinhak-recommended-university",
+        "jinhak-admission-strategy",
+        "jinhak-admission-knowledge",
+        "jinhak-admission-feature",
+        "jinhak-editorial-content",
+        "jinhak-media-content",
+        "jinhak-home",
+        "jinhak-other"
+    )
+
+    private fun noteJinhakMeaningfulProgress(reason: String, forceDiagnostics: Boolean = false) {
+        if (provider != ProviderId.JINHAK) return
+        jinhakLastMeaningfulProgressAtMs = System.currentTimeMillis()
+        recordRuntimeEvent("jinhak-meaningful-progress", JSONObject()
+            .put("reason", reason.take(80))
+            .put("safePath", runtimeSafePath(webView.url ?: currentBatchTarget ?: "")))
+        persistLiveJinhakDiagnostics(reason, forceDiagnostics)
+    }
+
+    private fun persistLiveJinhakDiagnostics(trigger: String, force: Boolean = false) {
+        if (provider != ProviderId.JINHAK || !unifiedRunning || unifiedPhase != "jinhak") return
+        val sessionId = unifiedSessionId ?: return
+        val now = System.currentTimeMillis()
+        if (!force && now - jinhakLastLiveDiagnosticsAtMs < JINHAK_LIVE_DIAGNOSTIC_MIN_INTERVAL_MS) return
+        jinhakLastLiveDiagnosticsAtMs = now
+        val slowStats = if (::slowLanePool.isInitialized) slowLanePool.stats() else null
+        val sinceProgress = if (jinhakLastMeaningfulProgressAtMs > 0L) {
+            ((now - jinhakLastMeaningfulProgressAtMs).coerceAtLeast(0L)) / 1000.0
+        } else null
+        localStore.recordSyncState(
+            sessionId,
+            "JINHAK_CRAWL_DIAGNOSTICS",
+            ProviderId.JINHAK.wireName,
+            JSONObject()
+                .put("live", true)
+                .put("trigger", trigger.take(80))
+                .put("attemptedSnapshots", batchPageCount)
+                .put("successfulSnapshots", batchSnapshots.length())
+                .put("errorEvents", batchErrors.length())
+                .put("agentActionsExecuted", jinhakAgentActionsExecuted)
+                .put("missionActionsExecuted", jinhakMissionActionsExecuted)
+                .put("genericActionsExecuted", jinhakGenericActionsExecuted)
+                .put("missionActionLimit", MAX_JINHAK_MISSION_ACTIONS)
+                .put("genericActionLimit", MAX_JINHAK_GENERIC_ACTIONS)
+                .put("applicationAnchorActionsPromoted", jinhakMissionAnchorPromotedKeys.size)
+                .put("applicationAnchorStructuredBindings", jinhakMissionAnchorStructuredKeys.size)
+                .put("applicationAnchorActionsParsed", jinhakMissionAnchorParsedKeys.size)
+                .put("applicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
+                .put("applicationAnchorActionsClicked", jinhakMissionAnchorClickedKeys.size)
+                .put("applicationAnchorReportConfirmed", jinhakReportConfirmedKeys.size)
+                .put("missionTargetLedger", jinhakMissionTargetLedger.summary())
+                .put("missionTargetLedgerPending", jinhakMissionTargetLedger.pendingCount())
+                .put("missionTargetLedgerOutstanding", jinhakMissionTargetLedger.outstandingCount())
+                .put("referenceRoutesTracked", jinhakReferenceRouteCaptureCounts.size)
+                .put("referenceRepeatSkips", jinhakReferenceRepeatSkips)
+                .put("noProgressFences", jinhakNoProgressFences)
+                .put("secondsSinceMeaningfulProgress", sinceProgress ?: JSONObject.NULL)
+                .put("activeMissionTarget", jinhakActiveMissionTargetId != null)
+                .put("slowLaneRunning", slowStats?.running ?: 0)
+                .put("slowLaneQueued", slowStats?.queued ?: 0)
+                .put("safePath", runtimeSafePath(webView.url ?: currentBatchTarget ?: "")),
+            false,
+            updateOrchestrator = false
+        )
+    }
+
+    private fun armJinhakProgressFence() {
+        if (provider != ProviderId.JINHAK) return
+        if (jinhakLastMeaningfulProgressAtMs == 0L) jinhakLastMeaningfulProgressAtMs = System.currentTimeMillis()
+        val generation = ++jinhakProgressFenceGeneration
+        val poller = object : Runnable {
+            override fun run() {
+                if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK || generation != jinhakProgressFenceGeneration) return
+                val now = System.currentTimeMillis()
+                val elapsed = now - jinhakLastMeaningfulProgressAtMs
+                if (elapsed >= JINHAK_NO_PROGRESS_FENCE_MS) {
+                    val slowWork = ::slowLanePool.isInitialized && slowLanePool.hasWork()
+                    val ledgerOutstanding = jinhakMissionTargetLedger.outstandingCount()
+                    if (ledgerOutstanding == 0 && !slowWork && !jinhakAgentActionInFlight && !batchCollecting) {
+                        val stalled = canonicalizeBatchUrl(webView.url ?: currentBatchTarget ?: "")
+                        jinhakNoProgressFences += 1
+                        batchErrors.put(JSONObject()
+                            .put("type", "jinhak-no-progress-fence")
+                            .put("safePath", runtimeSafePath(stalled))
+                            .put("elapsedMs", elapsed))
+                        localRunId?.let { runId ->
+                            if (stalled.isNotBlank()) localStore.markDocument(runId, stalled, "error", 0, "jinhak-no-progress-fence")
+                        }
+                        if (stalled.isNotBlank()) {
+                            batchVisited.add(stalled)
+                            batchQueued.remove(stalled)
+                        }
+                        currentBatchTarget = null
+                        pendingBatchPageAction = null
+                        activeBatchPageAction = null
+                        batchCollecting = false
+                        batchNavigationWatchdogRecovery = false
+                        jinhakAbsoluteTargetKey = ""
+                        ++jinhakAbsoluteTargetGeneration
+                        ++jinhakStallWatchdogGeneration
+                        runCatching { webView.stopLoading() }
+                        jinhakLastMeaningfulProgressAtMs = now
+                        recordRuntimeEvent("jinhak-no-progress-fence", JSONObject()
+                            .put("safePath", runtimeSafePath(stalled))
+                            .put("elapsedMs", elapsed)
+                            .put("referencePageType", lastJinhakDigest.optString("pageType")))
+                        persistLiveJinhakDiagnostics("no-progress-fence", force = true)
+                        status.text = "60초 동안 새 수집 진전이 없어 현재 일반 탐색 페이지를 종료하고 다음 대상으로 진행합니다."
+                        handler.postDelayed({ if (batchRunning && !batchPausedForLogin) loadNextBatchPage() }, 220L)
+                    } else {
+                        // Mission/slow-worker work owns the target. Existing 35s slow-lane fences
+                        // remain authoritative; expose the stalled state without stealing ownership.
+                        persistLiveJinhakDiagnostics("progress-wait-mission", force = true)
+                    }
+                } else {
+                    persistLiveJinhakDiagnostics("progress-heartbeat")
+                }
+                handler.postDelayed(this, JINHAK_PROGRESS_FENCE_POLL_MS)
+            }
+        }
+        handler.postDelayed(poller, JINHAK_PROGRESS_FENCE_POLL_MS)
     }
 
     private fun armBatchNavigationWatchdog(expectedUrl: String) {
@@ -1681,6 +1822,7 @@ class MainActivity : Activity() {
             batchSnapshots.put(snapshotForLocalExport(snapshot))
             batchPageCount += 1
             jinhakSlowLaneCompleted += 1
+            noteJinhakMeaningfulProgress("slow-lane-completed", forceDiagnostics = true)
             jinhakSlowLaneCompletedDurationMs += stats.elapsedMs
             if (stats.elapsedMs > jinhakSlowLaneMaxDurationMs) jinhakSlowLaneMaxDurationMs = stats.elapsedMs
             recordRuntimeEvent("jinhak-slow-lane-completed", JSONObject()
@@ -2088,6 +2230,7 @@ class MainActivity : Activity() {
                             payload = lastJinhakDigest
                         )
                         localStore.updateUnifiedSession(sessionId, "jinhak", "running", null)
+                    persistLiveJinhakDiagnostics("capture")
                         unifiedJinhakCapturedPages.add(localPageKey)
                         // The bundle is already privacy-sanitized by buildJinhakDigest.
                         // One explicit unified-session start authorizes these user-viewed page captures.
@@ -2505,6 +2648,7 @@ class MainActivity : Activity() {
                                 lane
                             )
                             if (ledgerConfirmed) {
+                                noteJinhakMeaningfulProgress("mission-target-confirmed", forceDiagnostics = true)
                                 recordRuntimeEvent("jinhak-mission-target-confirmed", JSONObject()
                                     .put("applicationIdentityHash", bridgeMission.identityKey.take(24))
                                     .put("lane", lane)
@@ -2577,8 +2721,16 @@ class MainActivity : Activity() {
                 }
                 val parsedMissionCandidates = JinhakAgentNavigator.candidates(snapshot)
                 val ledgerOrigin = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
-                val ledgerAdded = jinhakMissionTargetLedger.capture(ledgerOrigin, parsedMissionCandidates)
+                val ledgerAdded = if (pageTypeNow == "jinhak-recommended-university") {
+                    recordRuntimeEvent("jinhak-recommendation-ledger-suppressed", JSONObject()
+                        .put("safePath", runtimeSafePath(ledgerOrigin))
+                        .put("candidateCount", parsedMissionCandidates.size))
+                    0
+                } else {
+                    jinhakMissionTargetLedger.capture(ledgerOrigin, parsedMissionCandidates)
+                }
                 if (ledgerAdded > 0) {
+                    noteJinhakMeaningfulProgress("mission-target-captured", forceDiagnostics = true)
                     recordRuntimeEvent("jinhak-mission-targets-captured", JSONObject()
                         .put("added", ledgerAdded)
                         .put("pending", jinhakMissionTargetLedger.pendingCount())
@@ -2608,6 +2760,7 @@ class MainActivity : Activity() {
             }
             var jinhakExpansionStateKey: String? = null
             var jinhakExpandOutgoingLinks = true
+            var jinhakAllowAgentAction = true
             if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
                 val sessionId = unifiedSessionId
                 val runId = localRunId ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION).also { localRunId = it }
@@ -2625,8 +2778,25 @@ class MainActivity : Activity() {
                     )
                     jinhakExpansionStateKey = expansionIdentity.observationId
                     jinhakExpandOutgoingLinks = jinhakExpandedNavigationStates.add(expansionIdentity.observationId)
+                    val routeCaptureCount = (jinhakReferenceRouteCaptureCounts[safeRoute] ?: 0) + 1
+                    jinhakReferenceRouteCaptureCounts[safeRoute] = routeCaptureCount
+                    val lowValueReference = isJinhakLowValueReferencePageType(snapshot.optString("providerPageType"))
+                    if (snapshot.optString("providerPageType") == "jinhak-recommended-university") {
+                        jinhakAllowAgentAction = false
+                    }
+                    if (lowValueReference && routeCaptureCount > MAX_JINHAK_REFERENCE_ROUTE_CAPTURES &&
+                        jinhakMissionTargetLedger.outstandingCount() == 0 && jinhakMissionContext?.identityKey == null) {
+                        jinhakExpandOutgoingLinks = false
+                        jinhakAllowAgentAction = false
+                        jinhakReferenceRepeatSkips += 1
+                        recordRuntimeEvent("jinhak-reference-route-repeat-skip", JSONObject()
+                            .put("safePath", safeRoute)
+                            .put("pageType", snapshot.optString("providerPageType"))
+                            .put("captureCount", routeCaptureCount))
+                    }
                     if (jinhakExpandOutgoingLinks) {
                         jinhakUniqueNavigationStates += 1
+                        noteJinhakMeaningfulProgress("unique-navigation-state")
                     } else {
                         jinhakRepeatedNavigationStateSkips += 1
                         recordRuntimeEvent("jinhak-repeat-state-expansion-skip", JSONObject()
@@ -2719,7 +2889,7 @@ class MainActivity : Activity() {
                 activeBatchPageAction = null
             }
 
-            if (provider == ProviderId.JINHAK && activeAction == null && maybeExecuteJinhakAgentAction(snapshot, jinhakExpansionStateKey)) {
+            if (provider == ProviderId.JINHAK && activeAction == null && jinhakAllowAgentAction && maybeExecuteJinhakAgentAction(snapshot, jinhakExpansionStateKey)) {
                 return@collectSnapshot
             }
             if (provider == ProviderId.JINHAK && activeAction == null && maybeReturnToJinhakMissionOrigin(snapshot)) {
@@ -3023,6 +3193,7 @@ class MainActivity : Activity() {
             }
             if (result.optBoolean("ok", false)) {
                 if (ledgerTargetIdForAction != null) jinhakMissionTargetLedger.markClicked(ledgerTargetIdForAction)
+                noteJinhakMeaningfulProgress("agent-click", forceDiagnostics = true)
                 if (candidate.kind == "mission-link-navigation") {
                     jinhakMissionAnchorActionsExecuted += 1
                     val clickedKey = RecordUtils.sha256(listOf(candidate.label, candidate.applicationContext?.identityKey ?: "").joinToString("|"))
@@ -3565,6 +3736,10 @@ class MainActivity : Activity() {
                         .put("genericActionsExecuted", jinhakGenericActionsExecuted)
                         .put("missionActionLimit", MAX_JINHAK_MISSION_ACTIONS)
                         .put("genericActionLimit", MAX_JINHAK_GENERIC_ACTIONS)
+                        .put("referenceRoutesTracked", jinhakReferenceRouteCaptureCounts.size)
+                        .put("referenceRepeatSkips", jinhakReferenceRepeatSkips)
+                        .put("noProgressFences", jinhakNoProgressFences)
+                        .put("secondsSinceMeaningfulProgress", if (jinhakLastMeaningfulProgressAtMs > 0L) (System.currentTimeMillis() - jinhakLastMeaningfulProgressAtMs).coerceAtLeast(0L) / 1000.0 else JSONObject.NULL)
                         .put("applicationBoundAgentActions", jinhakApplicationBoundActions)
                         .put("applicationMissionReturns", jinhakApplicationMissionReturns)
                         .put("applicationMissionIdentities", jinhakMissionCoverage.size)
@@ -3656,6 +3831,8 @@ class MainActivity : Activity() {
                 .put("jinhakAgentActionsExecuted", jinhakAgentActionsExecuted)
                 .put("jinhakMissionActionsExecuted", jinhakMissionActionsExecuted)
                 .put("jinhakGenericActionsExecuted", jinhakGenericActionsExecuted)
+                .put("jinhakReferenceRepeatSkips", jinhakReferenceRepeatSkips)
+                .put("jinhakNoProgressFences", jinhakNoProgressFences)
                 .put("jinhakApplicationBoundActions", jinhakApplicationBoundActions)
                 .put("jinhakApplicationMissionReturns", jinhakApplicationMissionReturns)
                 .put("jinhakApplicationMissionIdentities", jinhakMissionCoverage.size)

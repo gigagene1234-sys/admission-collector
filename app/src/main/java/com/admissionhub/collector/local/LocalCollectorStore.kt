@@ -488,7 +488,8 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         state: String,
         provider: String?,
         detail: JSONObject,
-        requiresUserAction: Boolean
+        requiresUserAction: Boolean,
+        updateOrchestrator: Boolean = true
     ) {
         val now = Instant.now().toString()
         val eventId = RecordUtils.sha256("$sessionId|$state|${provider ?: ""}|$now|${detail.toString()}")
@@ -503,8 +504,10 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         }
         writableDatabase.insertOrThrow("sync_state_events", null, cv)
         val session = ContentValues().apply {
-            put("orchestrator_state", state)
-            put("requires_user_action", if (requiresUserAction) 1 else 0)
+            if (updateOrchestrator) {
+                put("orchestrator_state", state)
+                put("requires_user_action", if (requiresUserAction) 1 else 0)
+            }
             put("updated_at", now)
         }
         writableDatabase.update("unified_sessions", session, "session_id=?", arrayOf(sessionId))

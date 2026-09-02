@@ -9,7 +9,7 @@ enum class JinhakMissionLane(val wireName: String, val basePriority: Int) {
     ACTUAL_ADMIT("actual-admit", 98),
     UNIVERSITY_RESULT("university-result", 92),
     SCORE_ANALYSIS("score-analysis", 88),
-    RECOMMENDATION("recommendation", 82),
+    RECOMMENDATION("recommendation", 48),
     STRATEGY("strategy", 68),
     ADMISSION_KNOWLEDGE("admission-knowledge", 64),
     REFERENCE("reference", 35),
@@ -22,8 +22,8 @@ enum class JinhakMissionLane(val wireName: String, val basePriority: Int) {
  *
  * v0.8.2 keeps discovery breadth, but treats the application as the unit of work:
  * saved application -> current prediction -> mock support -> actual admit -> university
- * result/criteria -> relevant strategy/knowledge. Low-value media stays reachable evidence,
- * but never outranks an unfinished application mission.
+ * result/criteria -> relevant strategy/knowledge. Recommendation discovery is retained as
+ * optional evidence, but is no longer a core mission route and never outranks saved applications.
  */
 object JinhakSiteTopology {
     private const val ROOT = "https://www.jinhak.com"
