@@ -1,0 +1,259 @@
+name: Build Admission Collector v0.9.1 Mission Bootstrap Recovery
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v091.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    outputs:
+      source_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.9.1 source patch
+        run: python3 .github/scripts/patch_v091.py
+
+      - name: Verify v0.9.1 source invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          main = Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          snap = Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          nav = Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text()
+          adapter = Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          year = Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt').read_text()
+          vault = Path('app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt').read_text()
+          gradle = Path('app/build.gradle.kts').read_text()
+          manifest = Path('app/src/main/AndroidManifest.xml').read_text()
+
+          required = {
+              'version': 'private const val VERSION = "0.9.1"' in main,
+              'build': 'private const val BUILD_CODE = 10910' in main,
+              'gradle-code': 'versionCode = 10910' in gradle,
+              'gradle-name': 'versionName = "0.9.1"' in gradle,
+              'label': 'Admission Collector v0.9.1 Mission Bootstrap Recovery' in manifest,
+              'auto-login': 'AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = true' in main,
+              'login-sequence': 'startAutomaticLoginAndCollectionSequence("app-launch")' in main,
+              'precheck-login-telemetry': '.put("loginPreflight", JSONObject()' in main,
+              'no-credential-storage-flag': '.put("credentialStored", false)' in main,
+              'mission-bound-control-js': 'missionBoundControl=' in snap and "'mission-bound-control'" in snap,
+              'binding-provenance': 'applicationBindingSource' in nav,
+              'normalized-seed': 'normalizedApplicationIdentitySeeds' in main,
+              'normalized-bind': 'bindJinhakCandidatesFromNormalizedRecords' in main,
+              'batch-start-count': 'jinhakBatchStartCount' in main,
+              'reentry-preserve': 'preserveJinhakMissionState' in main,
+              'jinhak-broad-crawl-off': 'override val supportsBatchCrawl = false' in adapter,
+              'historical-year-guard': 'historical-multi-year-or-unresolved' in year,
+              'applicant-average-semantic': 'applicantAverageGrade' in adapter,
+              'vault-no-password': 'never stores a password, form value' in vault,
+              'vault-no-cloud-export': '.put("cloudExportAllowed", false)' in vault,
+          }
+          failed = [name for name, ok in required.items() if not ok]
+          if failed:
+              raise SystemExit('Missing invariant(s): ' + ', '.join(failed))
+
+          login_start = main.index('    private fun startAutomaticLoginAndCollectionSequence')
+          login_end = main.index('    private fun startUnifiedCollection()', login_start)
+          login_block = main[login_start:login_end]
+          forbidden = ['localStorage', 'sessionStorage', 'document.cookie', 'setAttribute("value"', "setAttribute('value'", 'input.value =', 'password.value =']
+          hits = [x for x in forbidden if x in login_block]
+          if hits:
+              raise SystemExit('Login orchestrator credential/storage regression: ' + ', '.join(hits))
+
+          bind_start = snap.index('  function applicationBindingForAction(el)')
+          bind_end = snap.index('  function applicationContextForAction(el)', bind_start)
+          bind_block = snap[bind_start:bind_end]
+          if 'previousElementSibling' in bind_block or 'nextElementSibling' in bind_block:
+              raise SystemExit('Protected same-card binding helper regressed to sibling traversal')
+          if 'binding.root.contains(el)' not in bind_block or 'unique-card-container' not in bind_block:
+              raise SystemExit('Protected same-card binding gates missing')
+
+          if 'override val supportsBatchCrawl = true' in adapter:
+              raise SystemExit('Broad Jinhak batch crawl was re-enabled')
+          print('v0.9.1 source invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test and build patched v0.9.1 source
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Verify patched v0.9.1 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee patched-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='10910'" patched-badging.txt
+          grep -q "versionName='0.9.1'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.1 Mission Bootstrap Recovery'" patched-badging.txt
+
+      - name: Commit v0.9.1 source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+                  app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
+                  app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt \
+                  app/build.gradle.kts app/src/main/AndroidManifest.xml
+          if git diff --cached --quiet; then
+            echo "No v0.9.1 source changes to commit" >&2
+            exit 1
+          fi
+          git commit -m "Implement v0.9.1 mission bootstrap recovery"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  independent-main-build:
+    needs: patch-build-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Refresh exact committed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          echo "Committed main: $(git rev-parse HEAD)"
+          echo "Expected source commit: ${{ needs.patch-build-commit.outputs.source_sha }}"
+          test "$(git rev-parse HEAD)" = "${{ needs.patch-build-commit.outputs.source_sha }}"
+
+      - name: Reverify committed v0.9.1 source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          nav=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          assert 'private const val VERSION = "0.9.1"' in main
+          assert 'private const val BUILD_CODE = 10910' in main
+          assert 'normalizedApplicationIdentitySeeds' in main
+          assert 'normalizedApplicationCandidateBindings' in main
+          assert 'jinhakBatchStartCount' in main
+          assert 'preserveJinhakMissionState' in main
+          assert 'loginPreflight' in main
+          assert 'missionBoundControl=' in snap and "'mission-bound-control'" in snap
+          assert 'applicationBindingSource' in nav
+          assert 'override val supportsBatchCrawl = false' in adapter
+          print('committed v0.9.1 source verified')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build committed main
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify final v0.9.1 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.1-Mission-Bootstrap-Recovery.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10910'" badging.txt
+          grep -q "versionName='0.9.1'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.1 Mission Bootstrap Recovery'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.1-Mission-Bootstrap-Recovery.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.1-final
+          path: |
+            Admission-Collector-v0.9.1-Mission-Bootstrap-Recovery.apk
+            Admission-Collector-v0.9.1-Mission-Bootstrap-Recovery.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish v0.9.1 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="Real-device v0.9.0 showed 30 normalized saved-application identities on the first early-storage page while the final mission ledger remained empty. v0.9.1 promotes safe same-card SPA report controls even when they have no href, uses already-normalized saved-application records as a unique same-card identity fallback, preserves mission ledger/coverage across re-entrant Jinhak batch initialization in the same unified session, and exports non-secret login-preflight telemetry. Existing automatic ADIGA -> Jinhak login/session verification -> unified collection remains enabled. Passwords, form values, browser storage values, CAPTCHA material, and credentials are not captured or exported. Existing same-card binding, historical-year, applicant-average semantic, mission/generic budget, completion fence, and supportsBatchCrawl=false protections remain. Patched build/test/signature checks and a fresh committed-main rebuild passed. Real-device v0.9.1 E2E remains unverified until tested on the Galaxy Tab. Commit: $SHA"
+          if gh release view v0.9.1 >/dev/null 2>&1; then
+            gh release upload v0.9.1 Admission-Collector-v0.9.1-Mission-Bootstrap-Recovery.apk Admission-Collector-v0.9.1-Mission-Bootstrap-Recovery.sha256 --clobber
+          else
+            gh release create v0.9.1 Admission-Collector-v0.9.1-Mission-Bootstrap-Recovery.apk Admission-Collector-v0.9.1-Mission-Bootstrap-Recovery.sha256 --target "$SHA" --title "Admission Collector v0.9.1 — Mission Bootstrap Recovery" --notes "$NOTES"
+          fi
