@@ -221,6 +221,12 @@ class MainActivity : Activity() {
     private var jinhakAbsoluteTargetGeneration = 0
     private var unifiedFinishInProgress = false
     private var pendingUnifiedExportSessionId: String? = null
+    private var startupLoginPreflightActive = false
+    private var startupLoginPreflightVerified = false
+    private var startupLoginStage = "idle"
+    private var startupLoginOpenAttempted = false
+    private var startupLoginPollGeneration = 0
+    private var startupLoginTrigger = ""
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -240,10 +246,13 @@ class MainActivity : Activity() {
         private const val JINHAK_NO_PROGRESS_FENCE_MS = 60_000L
         private const val JINHAK_PROGRESS_FENCE_POLL_MS = 15_000L
         private const val JINHAK_LIVE_DIAGNOSTIC_MIN_INTERVAL_MS = 10_000L
+        private const val AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = true
+        private const val LOGIN_PREFLIGHT_DOM_SETTLE_MS = 300L
+        private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.8.9"
-        private const val BUILD_CODE = 10890
+        private const val VERSION = "0.9.0"
+        private const val BUILD_CODE = 10900
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -270,7 +279,13 @@ class MainActivity : Activity() {
         })
         configureWebView()
         val resumed = resumeInterruptedUnifiedSessionIfNeeded()
-        if (!resumed) openProvider(ProviderId.JINHAK)
+        if (!resumed) {
+            if (AUTO_LOGIN_AND_COLLECT_ON_LAUNCH) {
+                handler.postDelayed({ startAutomaticLoginAndCollectionSequence("app-launch") }, 350L)
+            } else {
+                openProvider(ProviderId.JINHAK)
+            }
+        }
         handler.postDelayed({ sendPendingRuntimeEvents() }, 1200L)
     }
 
@@ -393,9 +408,13 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         unifiedButton = Button(this).apply {
-            text = "두 사이트 통합 수집 시작"
+            text = "자동 로그인 + 통합 수집"
             setOnClickListener {
-                if (unifiedRunning) finishUnifiedCollection("user-finish") else startUnifiedCollection()
+                when {
+                    startupLoginPreflightActive -> cancelStartupLoginPreflight("user-cancel")
+                    unifiedRunning -> finishUnifiedCollection("user-finish")
+                    else -> startUnifiedCollection()
+                }
             }
         }
         diagnosticButton = Button(this).apply {
@@ -504,6 +523,10 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
+                if (startupLoginPreflightActive) {
+                    handleStartupLoginPreflightPageFinished(url)
+                    return
+                }
                 if (unifiedRunning && unifiedPhase == "adiga" && unifiedPendingAdigaStart && provider == ProviderId.ADIGA && !batchRunning) {
                     unifiedPendingAdigaStart = false
                     handler.postDelayed({
@@ -668,6 +691,10 @@ class MainActivity : Activity() {
     private fun currentAdapter(): ProviderAdapter = ProviderRegistry.adapter(provider)
 
     private fun openProvider(which: ProviderId) {
+        if (startupLoginPreflightActive) {
+            Toast.makeText(this, "자동 로그인 준비 중에는 사이트 전환을 로그인 오케스트레이터가 관리합니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (unifiedRunning) {
             Toast.makeText(this, "통합 수집 중에는 서비스 전환을 수집 엔진이 관리합니다.", Toast.LENGTH_SHORT).show()
             return
@@ -936,7 +963,200 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun startAutomaticLoginAndCollectionSequence(trigger: String) {
+        if (startupLoginPreflightActive) return
+        if (unifiedRunning || batchRunning) {
+            Toast.makeText(this, "진행 중인 수집이 있어 자동 로그인 준비를 시작할 수 없습니다.", Toast.LENGTH_LONG).show()
+            return
+        }
+        startupLoginPreflightActive = true
+        startupLoginPreflightVerified = false
+        startupLoginStage = "adiga-check"
+        startupLoginOpenAttempted = false
+        startupLoginTrigger = trigger.take(40)
+        startupLoginPollGeneration += 1
+        unifiedButton.text = "자동 로그인 취소"
+        recordRuntimeEvent("startup-login-sequence-start", JSONObject()
+            .put("trigger", startupLoginTrigger)
+            .put("credentialStorage", false)
+            .put("providerOrder", JSONArray().put("adiga").put("jinhak")))
+        beginStartupLoginProvider(ProviderId.ADIGA)
+    }
+
+    private fun cancelStartupLoginPreflight(reason: String) {
+        if (!startupLoginPreflightActive) return
+        startupLoginPreflightActive = false
+        startupLoginPreflightVerified = false
+        startupLoginStage = "cancelled"
+        startupLoginOpenAttempted = false
+        startupLoginPollGeneration += 1
+        unifiedButton.text = "자동 로그인 + 통합 수집"
+        status.text = "자동 로그인 준비가 취소되었습니다. 다시 시작하면 어디가→진학사 로그인 확인 후 수집합니다."
+        recordRuntimeEvent("startup-login-sequence-cancel", JSONObject().put("reason", reason.take(80)))
+    }
+
+    private fun beginStartupLoginProvider(which: ProviderId) {
+        if (!startupLoginPreflightActive) return
+        provider = which
+        startupLoginStage = if (which == ProviderId.ADIGA) "adiga-check" else "jinhak-check"
+        startupLoginOpenAttempted = false
+        startupLoginPollGeneration += 1
+        val generation = startupLoginPollGeneration
+        localRunId = localStore.latestResumableRun(which.wireName)
+        CookieManager.getInstance().flush()
+        val lease = runCatching { sessionVault.restore(which.wireName) }.getOrNull()
+        sessionState.text = if (lease?.restored == true) {
+            "● ${which.displayName} 암호화 세션 복원 · 유효성 확인 중"
+        } else {
+            "○ ${which.displayName} 로그인 확인 중"
+        }
+        status.text = if (which == ProviderId.ADIGA) {
+            "자동 준비 1/3 · 어디가 로그인 세션을 확인합니다. 만료 시 로그인 화면을 자동으로 엽니다."
+        } else {
+            "자동 준비 2/3 · 진학사 로그인 세션을 확인합니다. 만료 시 로그인 화면을 자동으로 엽니다."
+        }
+        recordRuntimeEvent("startup-login-provider-begin", JSONObject()
+            .put("provider", which.wireName)
+            .put("restoredLease", lease?.restored == true)
+            .put("generation", generation))
+        webView.loadUrl(which.homeUrl)
+    }
+
+    private fun handleStartupLoginPreflightPageFinished(url: String) {
+        if (!startupLoginPreflightActive) return
+        val expectedProvider = provider
+        val generation = startupLoginPollGeneration
+        runtimeLastSafePath = runtimeSafePath(url)
+        handler.postDelayed({
+            if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@postDelayed
+            evaluateStartupLoginState(expectedProvider, generation)
+        }, LOGIN_PREFLIGHT_DOM_SETTLE_MS)
+    }
+
+    private fun evaluateStartupLoginState(expectedProvider: ProviderId, generation: Int) {
+        if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return
+        checkSessionState { needsLogin, authenticated ->
+            if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@checkSessionState
+            if (authenticated) {
+                onStartupProviderAuthenticated(expectedProvider, generation)
+                return@checkSessionState
+            }
+            if (!startupLoginOpenAttempted) {
+                startupLoginOpenAttempted = true
+                startupLoginStage = if (expectedProvider == ProviderId.ADIGA) "adiga-wait-login" else "jinhak-wait-login"
+                status.text = "${expectedProvider.displayName} 로그인 화면을 자동으로 엽니다. 인증이 필요하면 완료만 해주세요. 완료 감지 후 다음 단계로 자동 진행합니다."
+                openStartupLoginPage(expectedProvider, generation)
+            } else {
+                sessionState.text = if (needsLogin) "○ ${expectedProvider.displayName} 로그인 완료 대기" else "△ ${expectedProvider.displayName} 로그인 상태 확정 대기"
+                scheduleStartupLoginPoll(expectedProvider, generation)
+            }
+        }
+    }
+
+    private fun openStartupLoginPage(expectedProvider: ProviderId, generation: Int) {
+        if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return
+        val js = """
+            (function(){
+              function visible(el){
+                if(!el) return false;
+                var s=getComputedStyle(el);
+                if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false;
+                var r=el.getBoundingClientRect();
+                return r.width>0 && r.height>0;
+              }
+              var nodes=document.querySelectorAll('a,button,[role=button]');
+              for(var i=0;i<nodes.length;i++){
+                var el=nodes[i];
+                if(!visible(el)) continue;
+                var t=(el.innerText||el.textContent||el.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim();
+                if(!/(로그인|log\\s*in|sign\\s*in)/i.test(t) || t.length>80) continue;
+                if(el.tagName==='A' && el.href){
+                  try{
+                    var u=new URL(el.href,location.href);
+                    if(/^https:$/.test(u.protocol)) return JSON.stringify({action:'url',url:u.href});
+                  }catch(e){}
+                }
+                try{ el.click(); return JSON.stringify({action:'clicked'}); }catch(e2){}
+              }
+              return JSON.stringify({action:'not-found'});
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) { encoded ->
+            if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@evaluateJavascript
+            val action = runCatching { JSONObject(decodeJsString(encoded)) }.getOrNull()
+            when (action?.optString("action")) {
+                "url" -> {
+                    val target = action.optString("url")
+                    if (target.startsWith("https://")) webView.loadUrl(target)
+                    else webView.loadUrl(expectedProvider.homeUrl)
+                }
+                "clicked" -> sessionState.text = "○ ${expectedProvider.displayName} 로그인 화면 열림"
+                else -> {
+                    sessionState.text = "○ ${expectedProvider.displayName} 로그인 메뉴를 직접 선택할 수 있습니다. 완료되면 자동 감지합니다."
+                }
+            }
+            scheduleStartupLoginPoll(expectedProvider, generation)
+        }
+    }
+
+    private fun scheduleStartupLoginPoll(expectedProvider: ProviderId, generation: Int) {
+        handler.postDelayed({
+            if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@postDelayed
+            checkSessionState { _, authenticated ->
+                if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@checkSessionState
+                if (authenticated) {
+                    onStartupProviderAuthenticated(expectedProvider, generation)
+                } else {
+                    scheduleStartupLoginPoll(expectedProvider, generation)
+                }
+            }
+        }, LOGIN_PREFLIGHT_POLL_MS)
+    }
+
+    private fun onStartupProviderAuthenticated(expectedProvider: ProviderId, generation: Int) {
+        if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return
+        startupLoginPollGeneration += 1
+        startupLoginOpenAttempted = false
+        val currentUrl = webView.url.orEmpty()
+        if (currentUrl.isNotBlank()) runCatching { sessionVault.captureAuthenticated(expectedProvider.wireName, currentUrl, VERSION) }
+        recordRuntimeEvent("startup-login-provider-authenticated", JSONObject()
+            .put("provider", expectedProvider.wireName)
+            .put("credentialStored", false))
+        if (expectedProvider == ProviderId.ADIGA) {
+            sessionState.text = "● 어디가 로그인 확인 완료"
+            status.text = "자동 준비 1/3 완료 · 진학사 로그인 확인으로 이동합니다."
+            handler.postDelayed({
+                if (startupLoginPreflightActive) beginStartupLoginProvider(ProviderId.JINHAK)
+            }, 250L)
+        } else {
+            sessionState.text = "● 진학사 로그인 확인 완료"
+            startupLoginPreflightActive = false
+            startupLoginPreflightVerified = true
+            startupLoginStage = "verified"
+            startupLoginPollGeneration += 1
+            unifiedButton.text = "통합 수집 시작 중"
+            status.text = "자동 준비 3/3 · 어디가·진학사 로그인 확인 완료. 통합 수집을 자동 시작합니다."
+            recordRuntimeEvent("startup-login-sequence-verified", JSONObject()
+                .put("trigger", startupLoginTrigger)
+                .put("bothProvidersAuthenticated", true)
+                .put("credentialStored", false))
+            handler.postDelayed({
+                if (!unifiedRunning && !batchRunning && startupLoginPreflightVerified) {
+                    startUnifiedCollectionAuthenticated()
+                }
+            }, 300L)
+        }
+    }
+
     private fun startUnifiedCollection() {
+        if (!startupLoginPreflightVerified) {
+            startAutomaticLoginAndCollectionSequence("manual-start")
+            return
+        }
+        startUnifiedCollectionAuthenticated()
+    }
+
+    private fun startUnifiedCollectionAuthenticated() {
         if (batchRunning) {
             Toast.makeText(this, "현재 개별 수집을 먼저 종료한 뒤 통합 수집을 시작하세요.", Toast.LENGTH_LONG).show()
             return
@@ -1032,11 +1252,15 @@ class MainActivity : Activity() {
             unifiedPendingJinhakStart = false
             unifiedAutoCaptureScheduled = false
             unifiedPhase = "completed"
+            startupLoginPreflightVerified = false
+            startupLoginPreflightActive = false
+            startupLoginStage = "idle"
+            startupLoginPollGeneration += 1
             jinhakAbsoluteTargetKey = ""
             ++jinhakAbsoluteTargetGeneration
 
             if (sessionId == null) {
-                unifiedButton.text = "두 사이트 통합 수집 시작"
+                unifiedButton.text = "자동 로그인 + 통합 수집"
                 status.text = "종료할 통합 수집 세션이 없습니다."
                 return
             }
@@ -1052,7 +1276,7 @@ class MainActivity : Activity() {
                 .put("fullExport", "Use JSON 저장; records are streamed from SQLite to the destination file.")
                 .toString(2)
             showPreview(lastJson)
-            unifiedButton.text = "두 사이트 통합 수집 시작"
+            unifiedButton.text = "자동 로그인 + 통합 수집"
             pendingUnifiedExportSessionId = sessionId
             cloudOffload.sendDiagnostic(
                 "unified", VERSION,
@@ -1155,6 +1379,10 @@ class MainActivity : Activity() {
     }
 
     private fun startBatch() {
+        if (startupLoginPreflightActive) {
+            Toast.makeText(this, "로그인 준비가 끝난 뒤 수집이 자동 시작됩니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
         val url = webView.url
         if (url.isNullOrBlank() || !isProviderUrl(url)) {
             Toast.makeText(this, "먼저 어디가 또는 진학사에서 수집 시작 위치를 여세요.", Toast.LENGTH_LONG).show()
