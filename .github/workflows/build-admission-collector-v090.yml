@@ -1,0 +1,249 @@
+name: Build Admission Collector v0.9.0 Auto Login Orchestrator
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v090.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    outputs:
+      source_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.9.0 source patch
+        run: python3 .github/scripts/patch_v090.py
+
+      - name: Verify v0.9.0 source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          VAULT=app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt
+          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          YEAR=app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt
+          SNAP=app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+
+          grep -q 'VERSION = "0.9.0"' "$MAIN"
+          grep -q 'BUILD_CODE = 10900' "$MAIN"
+          grep -q 'versionCode = 10900' app/build.gradle.kts
+          grep -q 'versionName = "0.9.0"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.9.0 Auto Login Orchestrator' app/src/main/AndroidManifest.xml
+
+          grep -q 'AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = true' "$MAIN"
+          grep -q 'startAutomaticLoginAndCollectionSequence("app-launch")' "$MAIN"
+          grep -q 'beginStartupLoginProvider(ProviderId.ADIGA)' "$MAIN"
+          grep -q 'beginStartupLoginProvider(ProviderId.JINHAK)' "$MAIN"
+          grep -q 'startupLoginPreflightVerified = true' "$MAIN"
+          grep -q 'startUnifiedCollectionAuthenticated()' "$MAIN"
+          grep -q 'handleStartupLoginPreflightPageFinished(url)' "$MAIN"
+          grep -q '자동 로그인 + 통합 수집' "$MAIN"
+          grep -q 'credentialStored", false' "$MAIN"
+
+          LOGIN_BLOCK="$(sed -n '/private fun startAutomaticLoginAndCollectionSequence/,/private fun startUnifiedCollection()/p' "$MAIN")"
+          grep -q 'sessionVault.restore' <<< "$LOGIN_BLOCK"
+          grep -q 'sessionVault.captureAuthenticated' <<< "$LOGIN_BLOCK"
+          grep -q '로그인 화면을 자동으로 엽니다' <<< "$LOGIN_BLOCK"
+          if grep -Eqi 'localStorage|sessionStorage|document\.cookie|\.value[[:space:]]*=|setAttribute\(["'"']value|password[^\n]{0,80}value' <<< "$LOGIN_BLOCK"; then
+            echo 'Login orchestrator must not read/store credentials or browser storage values' >&2
+            exit 1
+          fi
+
+          grep -q 'never stores a password, form value' "$VAULT"
+          grep -q 'cloudExportAllowed", false' "$VAULT"
+          grep -q 'MAX_JINHAK_GENERIC_ACTIONS = 180' "$MAIN"
+          grep -q 'MAX_JINHAK_MISSION_ACTIONS = 220' "$MAIN"
+          grep -q 'MAX_JINHAK_REFERENCE_ROUTE_CAPTURES = 2' "$MAIN"
+          grep -q 'JINHAK_NO_PROGRESS_FENCE_MS = 60_000L' "$MAIN"
+          grep -q 'applicationAnchorStructuredBindings' "$MAIN"
+          grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
+          grep -q 'historical-multi-year-or-unresolved' "$YEAR"
+          grep -q 'applicantAverageGrade' "$ADAPTER"
+          BINDING_BLOCK="$(sed -n '/function applicationBindingForAction(el)/,/function applicationContextForAction(el)/p' "$SNAP")"
+          grep -q 'unique-card-container' <<< "$BINDING_BLOCK"
+          if grep -q 'previousElementSibling\|nextElementSibling' <<< "$BINDING_BLOCK"; then
+            echo 'Protected v0.8.8 binding helper regressed' >&2
+            exit 1
+          fi
+          if grep -q 'override val supportsBatchCrawl = true' "$ADAPTER"; then
+            echo 'Protected broad Jinhak crawl was re-enabled' >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test and build patched v0.9.0 source
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Verify patched v0.9.0 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee patched-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='10900'" patched-badging.txt
+          grep -q "versionName='0.9.0'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.0 Auto Login Orchestrator'" patched-badging.txt
+
+      - name: Commit v0.9.0 source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+                  app/build.gradle.kts app/src/main/AndroidManifest.xml
+          if git diff --cached --quiet; then
+            echo "No v0.9.0 source changes to commit" >&2
+            exit 1
+          fi
+          git commit -m "Implement v0.9.0 automatic login collection orchestration"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  independent-main-build:
+    needs: patch-build-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Refresh committed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          echo "Committed main: $(git rev-parse HEAD)"
+          echo "Expected source commit: ${{ needs.patch-build-commit.outputs.source_sha }}"
+          test "$(git rev-parse HEAD)" = "${{ needs.patch-build-commit.outputs.source_sha }}"
+
+      - name: Verify committed v0.9.0 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          grep -q 'VERSION = "0.9.0"' "$MAIN"
+          grep -q 'BUILD_CODE = 10900' "$MAIN"
+          grep -q 'versionCode = 10900' app/build.gradle.kts
+          grep -q 'versionName = "0.9.0"' app/build.gradle.kts
+          grep -q 'Admission Collector v0.9.0 Auto Login Orchestrator' app/src/main/AndroidManifest.xml
+          grep -q 'AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = true' "$MAIN"
+          grep -q 'beginStartupLoginProvider(ProviderId.ADIGA)' "$MAIN"
+          grep -q 'beginStartupLoginProvider(ProviderId.JINHAK)' "$MAIN"
+          grep -q 'startUnifiedCollectionAuthenticated()' "$MAIN"
+          grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build committed main
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify final v0.9.0 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.0-Auto-Login-Orchestrator.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10900'" badging.txt
+          grep -q "versionName='0.9.0'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.0 Auto Login Orchestrator'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.0-Auto-Login-Orchestrator.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.0-final
+          path: |
+            Admission-Collector-v0.9.0-Auto-Login-Orchestrator.apk
+            Admission-Collector-v0.9.0-Auto-Login-Orchestrator.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish v0.9.0 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="Committed-main independent build. versionName 0.9.0 / versionCode 10900. New default lifecycle: app launch -> restore/check ADIGA encrypted WebView session -> automatically open ADIGA login UI if needed -> detect authenticated state -> restore/check Jinhak session -> automatically open Jinhak login UI if needed -> detect authenticated state -> automatically start unified ADIGA then Jinhak collection. Passwords, form values, localStorage/sessionStorage, CAPTCHA data, and credentials are not captured or exported; existing Android Keystore-protected session-cookie lease behavior is reused. The same login preflight also runs before every new manual unified collection. The preflight can be cancelled from the primary button. Existing v0.8.9 stall fence, v0.8.8 binding protections, mission/generic budgets, persistent ledger, year guard, semantic guard, and supportsBatchCrawl=false remain. Build, test task, signature, source-invariant and package checks passed. Real-device login-to-collection E2E remains unverified until tested on the Galaxy Tab. Commit: $SHA"
+          if gh release view v0.9.0 >/dev/null 2>&1; then
+            gh release upload v0.9.0 Admission-Collector-v0.9.0-Auto-Login-Orchestrator.apk Admission-Collector-v0.9.0-Auto-Login-Orchestrator.sha256 --clobber
+          else
+            gh release create v0.9.0 Admission-Collector-v0.9.0-Auto-Login-Orchestrator.apk Admission-Collector-v0.9.0-Auto-Login-Orchestrator.sha256 --target "$SHA" --title "Admission Collector v0.9.0 — Auto Login Orchestrator" --notes "$NOTES"
+          fi
