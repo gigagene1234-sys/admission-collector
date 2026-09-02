@@ -227,6 +227,17 @@ class MainActivity : Activity() {
     private var startupLoginOpenAttempted = false
     private var startupLoginPollGeneration = 0
     private var startupLoginTrigger = ""
+    private var startupLoginAdigaRestoredLease = false
+    private var startupLoginJinhakRestoredLease = false
+    private var startupLoginAdigaAuthenticated = false
+    private var startupLoginJinhakAuthenticated = false
+    private var startupLoginUiOpenCount = 0
+    private var startupLoginVerifiedAtMs = 0L
+    private var jinhakBatchStartCount = 0
+    private val jinhakNormalizedMissionSeedContexts = linkedMapOf<String, JinhakApplicationMission.Context>()
+    private val jinhakNormalizedIdentitySeedKeys = linkedSetOf<String>()
+    private val jinhakNormalizedCandidateBindingKeys = linkedSetOf<String>()
+    private var jinhakNormalizedAmbiguousBindings = 0
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -251,8 +262,8 @@ class MainActivity : Activity() {
         private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.0"
-        private const val BUILD_CODE = 10900
+        private const val VERSION = "0.9.1"
+        private const val BUILD_CODE = 10910
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -974,6 +985,12 @@ class MainActivity : Activity() {
         startupLoginStage = "adiga-check"
         startupLoginOpenAttempted = false
         startupLoginTrigger = trigger.take(40)
+        startupLoginAdigaRestoredLease = false
+        startupLoginJinhakRestoredLease = false
+        startupLoginAdigaAuthenticated = false
+        startupLoginJinhakAuthenticated = false
+        startupLoginUiOpenCount = 0
+        startupLoginVerifiedAtMs = 0L
         startupLoginPollGeneration += 1
         unifiedButton.text = "자동 로그인 취소"
         recordRuntimeEvent("startup-login-sequence-start", JSONObject()
@@ -1005,6 +1022,11 @@ class MainActivity : Activity() {
         localRunId = localStore.latestResumableRun(which.wireName)
         CookieManager.getInstance().flush()
         val lease = runCatching { sessionVault.restore(which.wireName) }.getOrNull()
+        if (which == ProviderId.ADIGA) {
+            startupLoginAdigaRestoredLease = lease?.restored == true
+        } else {
+            startupLoginJinhakRestoredLease = lease?.restored == true
+        }
         sessionState.text = if (lease?.restored == true) {
             "● ${which.displayName} 암호화 세션 복원 · 유효성 확인 중"
         } else {
@@ -1084,6 +1106,9 @@ class MainActivity : Activity() {
         webView.evaluateJavascript(js) { encoded ->
             if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@evaluateJavascript
             val action = runCatching { JSONObject(decodeJsString(encoded)) }.getOrNull()
+            if (action?.optString("action") == "url" || action?.optString("action") == "clicked") {
+                startupLoginUiOpenCount += 1
+            }
             when (action?.optString("action")) {
                 "url" -> {
                     val target = action.optString("url")
@@ -1115,6 +1140,7 @@ class MainActivity : Activity() {
 
     private fun onStartupProviderAuthenticated(expectedProvider: ProviderId, generation: Int) {
         if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return
+        if (expectedProvider == ProviderId.ADIGA) startupLoginAdigaAuthenticated = true else startupLoginJinhakAuthenticated = true
         startupLoginPollGeneration += 1
         startupLoginOpenAttempted = false
         val currentUrl = webView.url.orEmpty()
@@ -1132,6 +1158,7 @@ class MainActivity : Activity() {
             sessionState.text = "● 진학사 로그인 확인 완료"
             startupLoginPreflightActive = false
             startupLoginPreflightVerified = true
+            startupLoginVerifiedAtMs = System.currentTimeMillis()
             startupLoginStage = "verified"
             startupLoginPollGeneration += 1
             unifiedButton.text = "통합 수집 시작 중"
@@ -1172,7 +1199,21 @@ class MainActivity : Activity() {
         unifiedAutoCaptureScheduled = false
         unifiedButton.text = "통합 수집 종료"
         localStore.updateUnifiedSession(sessionId, "adiga", "running", "user-start")
-        localStore.recordSyncState(sessionId, UnifiedSyncState.PRECHECK.name, null, JSONObject().put("collectorVersion", VERSION), false)
+        localStore.recordSyncState(
+            sessionId, UnifiedSyncState.PRECHECK.name, null,
+            JSONObject()
+                .put("collectorVersion", VERSION)
+                .put("loginPreflight", JSONObject()
+                    .put("verified", startupLoginPreflightVerified)
+                    .put("adigaAuthenticated", startupLoginAdigaAuthenticated)
+                    .put("jinhakAuthenticated", startupLoginJinhakAuthenticated)
+                    .put("adigaRestoredLease", startupLoginAdigaRestoredLease)
+                    .put("jinhakRestoredLease", startupLoginJinhakRestoredLease)
+                    .put("loginUiOpenCount", startupLoginUiOpenCount)
+                    .put("verifiedAtMs", startupLoginVerifiedAtMs)
+                    .put("credentialStored", false)),
+            false
+        )
         localStore.recordSyncState(sessionId, UnifiedSyncState.ADIGA_PUBLIC_SYNC.name, ProviderId.ADIGA.wireName, JSONObject().put("mode", "legacy-local-first-until-deterministic-planner-activation"), false)
         persistRuntimeCheckpoint(forceResume = true)
 
@@ -1202,6 +1243,11 @@ class MainActivity : Activity() {
         unifiedJinhakAutoCapture = false
         unifiedAutoCaptureScheduled = false
         unifiedJinhakCapturedPages.clear()
+        jinhakBatchStartCount = 0
+        jinhakNormalizedMissionSeedContexts.clear()
+        jinhakNormalizedIdentitySeedKeys.clear()
+        jinhakNormalizedCandidateBindingKeys.clear()
+        jinhakNormalizedAmbiguousBindings = 0
 
         provider = ProviderId.JINHAK
         localRunId = localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
@@ -1383,6 +1429,13 @@ class MainActivity : Activity() {
             Toast.makeText(this, "로그인 준비가 끝난 뒤 수집이 자동 시작됩니다.", Toast.LENGTH_SHORT).show()
             return
         }
+        val preserveJinhakMissionState = provider == ProviderId.JINHAK && unifiedRunning && jinhakBatchStartCount > 0
+        if (provider == ProviderId.JINHAK) {
+            jinhakBatchStartCount += 1
+            recordRuntimeEvent("jinhak-batch-start", JSONObject()
+                .put("count", jinhakBatchStartCount)
+                .put("preserveMissionState", preserveJinhakMissionState))
+        }
         val url = webView.url
         if (url.isNullOrBlank() || !isProviderUrl(url)) {
             Toast.makeText(this, "먼저 어디가 또는 진학사에서 수집 시작 위치를 여세요.", Toast.LENGTH_LONG).show()
@@ -1465,8 +1518,10 @@ class MainActivity : Activity() {
         jinhakMissionNeedsReturn = false
         jinhakApplicationBoundActions = 0
         jinhakApplicationMissionReturns = 0
-        jinhakMissionCoverage.clear()
-        jinhakMissionTargetLedger.clear()
+        if (!preserveJinhakMissionState) {
+            jinhakMissionCoverage.clear()
+            jinhakMissionTargetLedger.clear()
+        }
         jinhakActiveMissionTargetId = null
         jinhakSlowLaneMissionTargetIds.clear()
         jinhakMissionAnchorDiscoveredKeys.clear()
@@ -1477,7 +1532,7 @@ class MainActivity : Activity() {
         jinhakMissionBindingSourceCounts.clear()
         jinhakMissionAnchorSelectedKeys.clear()
         jinhakMissionAnchorClickedKeys.clear()
-        jinhakReportConfirmedKeys.clear()
+        if (!preserveJinhakMissionState) jinhakReportConfirmedKeys.clear()
         jinhakMissionAnchorActionsExecuted = 0
         jinhakConsentGatePending = false
         jinhakConsentResumePending = false
@@ -1677,6 +1732,10 @@ class MainActivity : Activity() {
                 .put("genericActionLimit", MAX_JINHAK_GENERIC_ACTIONS)
                 .put("applicationAnchorActionsPromoted", jinhakMissionAnchorPromotedKeys.size)
                 .put("applicationAnchorStructuredBindings", jinhakMissionAnchorStructuredKeys.size)
+                .put("normalizedApplicationIdentitySeeds", jinhakNormalizedIdentitySeedKeys.size)
+                .put("normalizedApplicationCandidateBindings", jinhakNormalizedCandidateBindingKeys.size)
+                .put("normalizedApplicationAmbiguousBindings", jinhakNormalizedAmbiguousBindings)
+                .put("jinhakBatchStartCount", jinhakBatchStartCount)
                 .put("applicationAnchorActionsParsed", jinhakMissionAnchorParsedKeys.size)
                 .put("applicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
                 .put("applicationAnchorActionsClicked", jinhakMissionAnchorClickedKeys.size)
@@ -2947,7 +3006,20 @@ class MainActivity : Activity() {
                         jinhakMissionAnchorStructuredKeys.add(key)
                     }
                 }
-                val parsedMissionCandidates = JinhakAgentNavigator.candidates(snapshot)
+                val rawMissionCandidates = JinhakAgentNavigator.candidates(snapshot)
+                val normalizedMissionSeeds = jinhakMissionContextsFromNormalizedRecords(pageRecords)
+                normalizedMissionSeeds.forEach { context ->
+                    val identity = context.identityKey ?: return@forEach
+                    jinhakNormalizedMissionSeedContexts[identity] = context
+                    jinhakNormalizedIdentitySeedKeys.add(identity)
+                    if (pageTypeNow == "jinhak-early-storage") {
+                        jinhakMissionCoverage.getOrPut(identity) { linkedSetOf() }.add("saved-application")
+                    }
+                }
+                val parsedMissionCandidates = bindJinhakCandidatesFromNormalizedRecords(
+                    rawMissionCandidates,
+                    jinhakNormalizedMissionSeedContexts.values.toList()
+                )
                 val ledgerOrigin = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
                 val ledgerAdded = if (pageTypeNow == "jinhak-recommended-university") {
                     recordRuntimeEvent("jinhak-recommendation-ledger-suppressed", JSONObject()
@@ -3976,6 +4048,14 @@ class MainActivity : Activity() {
                         .put("applicationAnchorActionsDiscovered", jinhakMissionAnchorDiscoveredKeys.size)
                         .put("applicationAnchorActionsPromoted", jinhakMissionAnchorPromotedKeys.size)
                         .put("applicationAnchorStructuredBindings", jinhakMissionAnchorStructuredKeys.size)
+                        .put("normalizedApplicationIdentitySeeds", jinhakNormalizedIdentitySeedKeys.size)
+                        .put("normalizedApplicationCandidateBindings", jinhakNormalizedCandidateBindingKeys.size)
+                        .put("normalizedApplicationAmbiguousBindings", jinhakNormalizedAmbiguousBindings)
+                        .put("jinhakBatchStartCount", jinhakBatchStartCount)
+                .put("normalizedApplicationIdentitySeeds", jinhakNormalizedIdentitySeedKeys.size)
+                .put("normalizedApplicationCandidateBindings", jinhakNormalizedCandidateBindingKeys.size)
+                .put("normalizedApplicationAmbiguousBindings", jinhakNormalizedAmbiguousBindings)
+                .put("jinhakBatchStartCount", jinhakBatchStartCount)
                         .put("applicationAnchorBindingSources", JSONObject(jinhakMissionBindingSourceCounts as Map<*, *>))
                         .put("applicationAnchorActionsParsed", jinhakMissionAnchorParsedKeys.size)
                         .put("applicationAnchorActionsSelected", jinhakMissionAnchorSelectedKeys.size)
@@ -4135,6 +4215,92 @@ class MainActivity : Activity() {
         }
     }
 
+
+    private fun jinhakMissionContextsFromNormalizedRecords(records: JSONArray): List<JinhakApplicationMission.Context> {
+        val out = linkedMapOf<String, JinhakApplicationMission.Context>()
+        for (i in 0 until records.length()) {
+            val record = records.optJSONObject(i) ?: continue
+            if (record.optString("recordType") != "jinhak-saved-application-prediction") continue
+            val identity = record.optString("applicationIdentityKey").takeIf { it.isNotBlank() && it != "null" } ?: continue
+            val university = record.optString("university").takeIf { it.isNotBlank() && it != "null" } ?: continue
+            val department = record.optString("department").takeIf { it.isNotBlank() && it != "null" } ?: continue
+            val admission = record.optString("admission").takeIf { it.isNotBlank() && it != "null" }
+            val metrics = record.optJSONObject("metrics") ?: JSONObject()
+            val category = metrics.optString("admissionCategory").takeIf { it.isNotBlank() && it != "null" }
+            val campus = metrics.optString("campus").takeIf { it.isNotBlank() && it != "null" }
+            val capacity = if (metrics.has("capacity") && !metrics.isNull("capacity")) metrics.optInt("capacity").takeIf { it >= 0 } else null
+            out.putIfAbsent(
+                identity,
+                JinhakApplicationMission.Context(
+                    year = record.optInt("year", 2027),
+                    university = university,
+                    admissionCategory = category,
+                    admission = admission,
+                    campus = campus,
+                    departmentRaw = department,
+                    capacity = capacity,
+                    identityKey = identity,
+                    parseSource = "normalized-saved-application-record",
+                    confidence = record.optString("confidence", "medium").ifBlank { "medium" },
+                    rawCombinedLabel = null
+                )
+            )
+        }
+        return out.values.toList()
+    }
+
+    private fun jinhakMissionMatchToken(value: String?): String =
+        value.orEmpty().lowercase()
+            .replace(" ", "")
+            .replace("\t", "")
+            .replace("\n", "")
+            .replace("·", "")
+            .replace("・", "")
+            .replace("ㆍ", "")
+            .replace("[", "")
+            .replace("]", "")
+            .replace("(", "")
+            .replace(")", "")
+            .replace("-", "")
+            .replace("_", "")
+            .replace(".", "")
+            .replace("|", "")
+            .replace(":", "")
+
+    private fun bindJinhakCandidatesFromNormalizedRecords(
+        candidates: List<JinhakAgentNavigator.Candidate>,
+        seeds: List<JinhakApplicationMission.Context>
+    ): List<JinhakAgentNavigator.Candidate> {
+        if (seeds.isEmpty()) return candidates
+        return candidates.map { candidate ->
+            if (candidate.applicationContext?.identityKey != null || !candidate.promotedMissionAction) return@map candidate
+            if (candidate.applicationBindingSource != "same-card-root" && candidate.applicationBindingSource != "unique-card-container") return@map candidate
+            val haystack = jinhakMissionMatchToken(candidate.contextText)
+            if (haystack.isBlank()) return@map candidate
+            val matches = seeds.filter { context ->
+                val university = jinhakMissionMatchToken(context.university)
+                val department = jinhakMissionMatchToken(context.departmentRaw)
+                val admission = jinhakMissionMatchToken(context.admission)
+                university.isNotBlank() && department.isNotBlank() &&
+                    haystack.contains(university) && haystack.contains(department) &&
+                    (admission.isBlank() || haystack.contains(admission))
+            }.distinctBy { it.identityKey }
+            if (matches.size != 1) {
+                if (matches.size > 1) jinhakNormalizedAmbiguousBindings += 1
+                return@map candidate
+            }
+            val context = matches.single()
+            val identity = context.identityKey ?: return@map candidate
+            jinhakNormalizedCandidateBindingKeys.add(
+                RecordUtils.sha256(listOf(identity, candidate.label, candidate.scanIndex.toString()).joinToString("|"))
+            )
+            candidate.copy(
+                applicationContext = context,
+                missionPriority = maxOf(candidate.missionPriority, 210),
+                promotedMissionAction = true
+            )
+        }
+    }
 
     private fun normalizeSnapshot(snapshot: JSONObject): JSONArray =
         currentAdapter().normalize(snapshot)

@@ -13,7 +13,8 @@ object JinhakAgentNavigator {
         val missionPriority: Int,
         val contextText: String,
         val applicationContext: JinhakApplicationMission.Context?,
-        val promotedMissionAction: Boolean = false
+        val promotedMissionAction: Boolean = false,
+        val applicationBindingSource: String = ""
     )
 
     fun candidates(snapshot: JSONObject): List<Candidate> {
@@ -37,6 +38,8 @@ object JinhakAgentNavigator {
                     .replace(Regex("\\s+"), " ").trim().take(80).takeIf { it.isNotBlank() }
                 val explicitDepartment = obj.optString("applicationDepartment")
                     .replace(Regex("\\s+"), " ").trim().take(120).takeIf { it.isNotBlank() }
+                val applicationBindingSource = obj.optString("applicationBindingSource")
+                    .replace(Regex("\\s+"), " ").trim().take(40)
                 val app = JinhakApplicationMission.parseCard(
                     contextText,
                     explicitUniversity = explicitUniversity,
@@ -48,8 +51,9 @@ object JinhakAgentNavigator {
                 if (app?.identityKey != null) priority += 14
                 if (app != null && Regex("(리포트|실제\\s*합격자|모의\\s*지원|합격\\s*예측)").containsMatchIn(label)) priority += 8
                 if (kind == "mission-link-navigation" && app?.identityKey != null) priority += 35
+                if (kind == "mission-bound-control" && app?.identityKey != null) priority += 35
                 if (promoted && app?.identityKey != null) priority += 45
-                out += Candidate(scanIndex, label, tag, kind, priority.coerceIn(0, 220), contextText, app, promoted)
+                out += Candidate(scanIndex, label, tag, kind, priority.coerceIn(0, 220), contextText, app, promoted, applicationBindingSource)
             }
         }
 

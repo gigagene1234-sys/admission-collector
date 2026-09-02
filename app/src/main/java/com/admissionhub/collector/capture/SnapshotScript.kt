@@ -562,22 +562,23 @@ object SnapshotScript {
       var applicationBinding=applicationBindingForAction(a);
       var applicationContext=applicationBinding.contextText||'';
       var missionLink=!!route && String(a.tagName||'').toUpperCase()==='A' && applicationContext.length>0;
+      var missionBoundControl=applicationContext.length>0 && !!label && !agentBlocked.test(label+' '+meta2) && agentAllowed.test(label);
 
       // Stage 1: discovery is deliberately broader than promotion so the export can
       // explain exactly where an anchor was lost before candidate selection.
-      if(missionLink && missionAnchorDiscovery.length<160){
+      if(missionBoundControl && missionAnchorDiscovery.length<160){
         var dk=li+'|'+label+'|'+applicationContext.slice(0,1200);
         if(!seenMissionDiscovery[dk]){
-          missionAnchorDiscovery.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:'mission-link-navigation',contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source});
+          missionAnchorDiscovery.push({scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':'mission-bound-control',contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source});
           seenMissionDiscovery[dk]=1;
         }
       }
 
       var dynamicControl=!route || role==='tab' || a.tagName==='BUTTON' || missionLink;
       if(dynamicControl && label && !agentBlocked.test(label+' '+meta2) && agentAllowed.test(label)){
-        var entry={scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(role==='tab'?'tab-navigation':'read-navigation'),contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source};
+        var entry={scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(missionBoundControl?'mission-bound-control':(role==='tab'?'tab-navigation':'read-navigation')),contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source};
         var ak=li+'|'+label+'|'+String(a.tagName||'')+'|'+role;
-        if(missionLink && missionAgentActions.length<120 && !seenMissionAgentAction[ak]){
+        if(missionBoundControl && missionAgentActions.length<120 && !seenMissionAgentAction[ak]){
           missionAgentActions.push(entry);
           seenMissionAgentAction[ak]=1;
           missionLinkBound=true;
