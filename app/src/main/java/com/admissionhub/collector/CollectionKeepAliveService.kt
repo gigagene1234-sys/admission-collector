@@ -32,7 +32,7 @@ class CollectionKeepAliveService : Service() {
         val notification = android.app.Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle("Admission Collector 수집 중")
-            .setContentText("백그라운드 수집을 유지하고 있습니다. 로그인 만료 시 앱에서 갱신하세요.")
+            .setContentText("백그라운드 수집·세션 연장을 유지하며 만료 시 target을 보존해 자동 재인증합니다.")
             .setOngoing(true)
             .setCategory(android.app.Notification.CATEGORY_PROGRESS)
             .build()

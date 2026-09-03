@@ -628,6 +628,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                 .put("predictionIsNotHistoricalActual", true))
             .put("observationStore", observationStats(sessionId))
         out.put("jinhakDiagnosticsSummary", latestSyncStateDetail(sessionId, "JINHAK_CRAWL_DIAGNOSTICS"))
+            .put("jinhakAuthDiagnosticsSummary", latestSyncStateDetail(sessionId, "JINHAK_AUTH_DIAGNOSTICS"))
         return out
     }
 
