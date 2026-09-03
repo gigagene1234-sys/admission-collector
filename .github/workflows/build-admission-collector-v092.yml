@@ -1,0 +1,271 @@
+name: Build Admission Collector v0.9.2 Persistent Session Bundle
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v092.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    outputs:
+      source_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.9.2 source patch
+        run: python3 .github/scripts/patch_v092.py
+
+      - name: Verify v0.9.2 source invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          main = Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          snap = Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          nav = Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text()
+          adapter = Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          year = Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt').read_text()
+          vault = Path('app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt').read_text()
+          gradle = Path('app/build.gradle.kts').read_text()
+          manifest = Path('app/src/main/AndroidManifest.xml').read_text()
+
+          required = {
+              'version': 'private const val VERSION = "0.9.2"' in main,
+              'build': 'private const val BUILD_CODE = 10920' in main,
+              'gradle-code': 'versionCode = 10920' in gradle,
+              'gradle-name': 'versionName = "0.9.2"' in gradle,
+              'label': 'Admission Collector v0.9.2 Persistent Session Bundle' in manifest,
+              'auto-start': 'AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = true' in main,
+              'direct-session-bypass': 'startup-stored-session-direct' in main and 'stored-session-direct' in main,
+              'preflight-bypass-diagnostic': 'bypassedByStoredSession' in main,
+              'session-button': '로그인 세션 저장/갱신' in main,
+              'vault-v2-prefs': 'admission_secure_session_bundle_v2' in vault,
+              'vault-v2-key': 'admission_collector_session_bundle_v2' in vault,
+              'vault-legacy-migration': 'migrateLegacy' in vault and 'admission_secure_session_v1' in vault,
+              'vault-multi-origin': 'val entries: LinkedHashMap<String, String>' in vault,
+              'vault-session-secret-honesty': '.put("containsSessionSecret", true)' in vault,
+              'vault-no-cloud-export': '.put("cloudExportAllowed", false)' in vault,
+              'vault-no-password': 'never stores a password, form value' in vault,
+              'mission-bound-control-js': 'missionBoundControl=' in snap and "'mission-bound-control'" in snap,
+              'binding-provenance': 'applicationBindingSource' in nav,
+              'normalized-seed': 'normalizedApplicationIdentitySeeds' in main,
+              'normalized-bind': 'bindJinhakCandidatesFromNormalizedRecords' in main,
+              'reentry-preserve': 'preserveJinhakMissionState' in main,
+              'jinhak-broad-crawl-off': 'override val supportsBatchCrawl = false' in adapter,
+              'historical-year-guard': 'historical-multi-year-or-unresolved' in year,
+              'applicant-average-semantic': 'applicantAverageGrade' in adapter,
+          }
+          failed = [name for name, ok in required.items() if not ok]
+          if failed:
+              raise SystemExit('Missing invariant(s): ' + ', '.join(failed))
+
+          # The startup/session code may use CookieManager only through SecureSessionVault.
+          # It must not inspect DOM storage or form credentials.
+          login_start = main.index('    private fun startAutomaticLoginAndCollectionSequence')
+          login_end = main.index('    private fun startUnifiedCollection()', login_start)
+          login_block = main[login_start:login_end]
+          forbidden = ['localStorage', 'sessionStorage', 'document.cookie', 'password.value =', 'input.value =']
+          hits = [x for x in forbidden if x in login_block]
+          if hits:
+              raise SystemExit('Login/session bootstrap credential-storage regression: ' + ', '.join(hits))
+
+          # Session secrets must never be serialized into metadata JSON.
+          tojson_start = vault.index('        fun toJson(): JSONObject')
+          tojson_end = vault.index('    }\n\n    private data class Bundle', tojson_start)
+          tojson_block = vault[tojson_start:tojson_end]
+          if 'cookieHeader' in tojson_block:
+              raise SystemExit('Raw cookie leaked into SessionLeaseSummary JSON')
+
+          bind_start = snap.index('  function applicationBindingForAction(el)')
+          bind_end = snap.index('  function applicationContextForAction(el)', bind_start)
+          bind_block = snap[bind_start:bind_end]
+          if 'previousElementSibling' in bind_block or 'nextElementSibling' in bind_block:
+              raise SystemExit('Protected same-card binding helper regressed to sibling traversal')
+          if 'binding.root.contains(el)' not in bind_block or 'unique-card-container' not in bind_block:
+              raise SystemExit('Protected same-card binding gates missing')
+
+          if 'override val supportsBatchCrawl = true' in adapter:
+              raise SystemExit('Broad Jinhak batch crawl was re-enabled')
+          print('v0.9.2 source invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test and build patched v0.9.2 source
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Verify patched v0.9.2 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee patched-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='10920'" patched-badging.txt
+          grep -q "versionName='0.9.2'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.2 Persistent Session Bundle'" patched-badging.txt
+
+      - name: Commit v0.9.2 source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+                  app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt \
+                  app/build.gradle.kts app/src/main/AndroidManifest.xml
+          if git diff --cached --quiet; then
+            echo "No v0.9.2 source changes to commit" >&2
+            exit 1
+          fi
+          git commit -m "Implement v0.9.2 persistent session bundle"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  independent-main-build:
+    needs: patch-build-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Refresh exact committed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          echo "Committed main: $(git rev-parse HEAD)"
+          echo "Expected source commit: ${{ needs.patch-build-commit.outputs.source_sha }}"
+          test "$(git rev-parse HEAD)" = "${{ needs.patch-build-commit.outputs.source_sha }}"
+
+      - name: Reverify committed v0.9.2 source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          vault=Path('app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          assert 'private const val VERSION = "0.9.2"' in main
+          assert 'private const val BUILD_CODE = 10920' in main
+          assert 'startup-stored-session-direct' in main
+          assert 'bypassedByStoredSession' in main
+          assert 'admission_secure_session_bundle_v2' in vault
+          assert 'migrateLegacy' in vault
+          assert 'containsSessionSecret' in vault
+          assert 'cloudExportAllowed' in vault
+          assert 'normalizedApplicationIdentitySeeds' in main
+          assert 'preserveJinhakMissionState' in main
+          assert 'override val supportsBatchCrawl = false' in adapter
+          print('committed v0.9.2 source verified')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build committed main
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify final v0.9.2 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.2-Persistent-Session-Bundle.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10920'" badging.txt
+          grep -q "versionName='0.9.2'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.2 Persistent Session Bundle'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.2-Persistent-Session-Bundle.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.2-final
+          path: |
+            Admission-Collector-v0.9.2-Persistent-Session-Bundle.apk
+            Admission-Collector-v0.9.2-Persistent-Session-Bundle.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish v0.9.2 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="v0.9.2 replaces the fragile startup login-preflight dependency with a device-local persistent session bundle. Authenticated first-party WebView session cookies are stored per provider and per captured HTTPS origin, AES-GCM encrypted with a non-exportable Android Keystore key, and never included in JSON exports, logs, cloud sync, or GitHub. Existing v0.9.1 single-origin leases are migrated locally on first restore. When both ADIGA and Jinhak session bundles restore, startup bypasses DOM login preflight and begins the existing unified collection directly; if a server-side session has expired, the existing login-pause/manual-refresh path remains available and a successful authentication refreshes the local bundle. Passwords, form values, DOM storage and CAPTCHA material are not stored. Mission-bootstrap recovery, same-card binding, historical-year guard, applicant-average semantics, mission/generic budgets, completion fence and supportsBatchCrawl=false remain. Patched tests/build/signature checks and a fresh committed-main rebuild passed. Real-device v0.9.2 E2E remains unverified until Galaxy Tab testing. Commit: $SHA"
+          if gh release view v0.9.2 >/dev/null 2>&1; then
+            gh release upload v0.9.2 Admission-Collector-v0.9.2-Persistent-Session-Bundle.apk Admission-Collector-v0.9.2-Persistent-Session-Bundle.sha256 --clobber
+          else
+            gh release create v0.9.2 Admission-Collector-v0.9.2-Persistent-Session-Bundle.apk Admission-Collector-v0.9.2-Persistent-Session-Bundle.sha256 --target "$SHA" --title "Admission Collector v0.9.2 — Persistent Session Bundle" --notes "$NOTES"
+          fi
