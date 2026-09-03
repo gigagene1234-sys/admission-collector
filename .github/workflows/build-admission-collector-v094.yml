@@ -1,0 +1,154 @@
+name: Build Admission Collector v0.9.4 Auth Guard Web Bridge
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v094.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    outputs:
+      source_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: main, fetch-depth: 0}
+      - name: Apply v0.9.4 patch
+        run: python3 .github/scripts/patch_v094.py
+      - name: Verify source invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          c=Path('app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt').read_text()
+          cv=Path('app/src/main/java/com/admissionhub/collector/session/CredentialVault.kt').read_text()
+          a=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          s=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          y=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text(); mf=Path('app/src/main/AndroidManifest.xml').read_text()
+          req={
+            'version':'private const val VERSION = "0.9.4"' in m,
+            'build':'private const val BUILD_CODE = 10940' in m,
+            'gradle':'versionCode = 10940' in g and 'versionName = "0.9.4"' in g,
+            'label':'Admission Collector v0.9.4 Auth Guard Web Bridge' in mf,
+            'three-state':'if (!needsLogin)' in m and '현재 화면 유지' in m,
+            'credential-auto-login':'attemptSavedCredentialLogin' in m,
+            'credential-vault':'admission_collector_credentials_v1' in cv and 'AES/GCM/NoPadding' in cv,
+            'web-button':'text = "Live 웹"' in m,
+            'fragment-bridge':'/#token=' in c and 'Uri.encode(secret)' in c,
+            'no-backup':'android:allowBackup="false"' in mf,
+            'mission-bootstrap':'normalizedApplicationIdentitySeeds' in m,
+            'same-card':'unique-card-container' in s,
+            'broad-off':'override val supportsBatchCrawl = false' in a,
+            'year-guard':'historical-multi-year-or-unresolved' in y,
+            'semantic-guard':'applicantAverageGrade' in a,
+          }
+          bad=[k for k,v in req.items() if not v]
+          if bad: raise SystemExit('Missing: '+', '.join(bad))
+          if '.put("username", credentials.username)' in m or '.put("password", credentials.password)' in m: raise SystemExit('credential telemetry leak')
+          print('v0.9.4 invariants passed')
+          PY
+      - uses: actions/setup-java@v5
+        with: {distribution: temurin, java-version: '17'}
+      - name: Restore signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: '8.7'}
+      - name: Test and build
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+      - name: Verify APK
+        shell: bash
+        run: |
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10940'" badging.txt
+          grep -q "versionName='0.9.4'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.4 Auth Guard Web Bridge'" badging.txt
+      - name: Commit source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.9.4 auth guard and web bridge"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  final-build:
+    needs: patch-build-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.patch-build-commit.outputs.source_sha }}
+          fetch-depth: 1
+      - name: Verify exact source commit
+        run: test "$(git rev-parse HEAD)" = "${{ needs.patch-build-commit.outputs.source_sha }}"
+      - uses: actions/setup-java@v5
+        with: {distribution: temurin, java-version: '17'}
+      - name: Restore signing key
+        shell: bash
+        run: |
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: '8.7'}
+      - name: Build exact committed source
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+      - name: Verify and package
+        shell: bash
+        run: |
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.4-Auth-Guard-Web-Bridge.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10940'" badging.txt
+          grep -q "versionName='0.9.4'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.4-Auth-Guard-Web-Bridge.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-v0.9.4-final
+          path: |
+            Admission-Collector-v0.9.4-Auth-Guard-Web-Bridge.apk
+            Admission-Collector-v0.9.4-Auth-Guard-Web-Bridge.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+      - name: Publish release
+        env: {GH_TOKEN: '${{ github.token }}'}
+        shell: bash
+        run: |
+          SHA=$(git rev-parse HEAD)
+          gh release create v0.9.4 Admission-Collector-v0.9.4-Auth-Guard-Web-Bridge.apk Admission-Collector-v0.9.4-Auth-Guard-Web-Bridge.sha256 --target "$SHA" --title "Admission Collector v0.9.4 — Auth Guard + Web Bridge" --notes "v0.9.4 fixes the forced-login regression by treating authentication as a three-state decision: authenticated continues, explicit needsLogin triggers local encrypted credential auto-login, and indeterminate state keeps the current page and polls again. It also adds a Live Web button that opens the production website with the existing Cloudflare collector token in a URL fragment; the website consumes the fragment into tab-scoped sessionStorage and removes it from the visible URL. ADIGA/Jinhak account credentials remain device-local AES-GCM Android Keystore data and are never sent to the website. Existing session bundle, mission bootstrap, same-card binding, historical-year and applicant-average semantic guards remain. Exact source commit: $SHA. Real-device E2E remains to be verified." 
