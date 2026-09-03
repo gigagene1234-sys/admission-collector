@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.4 Auth Guard Web Bridge"
+        android:label="Admission Collector v0.9.5 Passive Login Surface Auto Login"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

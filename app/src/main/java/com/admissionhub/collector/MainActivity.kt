@@ -242,6 +242,13 @@ class MainActivity : Activity() {
     private var credentialAutoLoginLastAttemptAtMs = 0L
     private var credentialAutoLoginAttempts = 0
     private var startupCredentialPromptedProvider: ProviderId? = null
+    private var credentialLoginSurfaceGeneration = 0
+    private var credentialLoginSurfaceKey = ""
+    private var credentialLoginSurfaceAttempts = 0
+    private var credentialAwaitingLoginExitProvider: ProviderId? = null
+    private var credentialLoginSurfaceSeenProvider: ProviderId? = null
+    private var credentialLoginSurfaceSeenAtMs = 0L
+    private var startupAuthIndeterminatePolls = 0
     private var jinhakBatchStartCount = 0
     private val jinhakNormalizedMissionSeedContexts = linkedMapOf<String, JinhakApplicationMission.Context>()
     private val jinhakNormalizedIdentitySeedKeys = linkedSetOf<String>()
@@ -271,8 +278,8 @@ class MainActivity : Activity() {
         private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.4"
-        private const val BUILD_CODE = 10940
+        private const val VERSION = "0.9.5"
+        private const val BUILD_CODE = 10950
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -558,9 +565,9 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
-                if (isProviderLoginUrl(provider, url) && credentialVault.has(provider.wireName)) {
-                    handler.postDelayed({ attemptSavedCredentialLogin(provider, "page-finished") }, 220L)
-                }
+                // v0.9.5: never navigate to login proactively. Probe the rendered DOM after
+                // every navigation and auto-login only when an actual login surface is visible.
+                scheduleLoginSurfaceDetection(provider, "page-finished")
                 if (startupLoginPreflightActive) {
                     handleStartupLoginPreflightPageFinished(url)
                     return
@@ -760,56 +767,20 @@ class MainActivity : Activity() {
     }
 
     private fun refreshSessionOrOpenLogin() {
-        checkSessionState { needsLogin, hasAuthenticatedUi ->
-            if (!needsLogin && hasAuthenticatedUi) {
+        checkSessionState { needsLogin, authenticated ->
+            if (authenticated) {
                 sessionState.text = "● 로그인 유지됨"
-                if (batchRunning && batchPausedForLogin) {
-                    resumeAfterLogin()
-                } else {
-                    Toast.makeText(this, "로그인 세션이 유지되고 있습니다.", Toast.LENGTH_SHORT).show()
-                }
+                if (batchRunning && batchPausedForLogin) resumeAfterLogin()
                 return@checkSessionState
             }
-
-            val js = """
-                (function(){
-                  function visible(el){
-                    if(!el) return false;
-                    var s=getComputedStyle(el);
-                    if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false;
-                    var r=el.getBoundingClientRect();
-                    return r.width>0 && r.height>0;
-                  }
-                  var nodes=document.querySelectorAll('a,button,[role=button]');
-                  for(var i=0;i<nodes.length;i++){
-                    var el=nodes[i];
-                    if(!visible(el)) continue;
-                    var t=(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();
-                    if(!/^(로그인|log\s*in|sign\s*in)$/i.test(t)) continue;
-                    if(el.tagName==='A' && el.href){
-                      try{
-                        var u=new URL(el.href,location.href);
-                        if(u.origin===location.origin) return JSON.stringify({action:'url',url:u.origin+u.pathname+u.hash});
-                      }catch(e){}
-                    }
-                    try{ el.click(); return JSON.stringify({action:'clicked'}); }catch(e2){}
-                  }
-                  return JSON.stringify({action:'home'});
-                })();
-            """.trimIndent()
-
-            webView.evaluateJavascript(js) { encoded ->
-                try {
-                    val raw = decodeJsString(encoded)
-                    val obj = JSONObject(raw)
-                    when (obj.optString("action")) {
-                        "url" -> webView.loadUrl(obj.optString("url"))
-                        "clicked" -> sessionState.text = "○ 로그인 갱신 화면 열림"
-                        else -> webView.loadUrl(provider.homeUrl)
-                    }
-                } catch (_: Exception) {
-                    webView.loadUrl(provider.homeUrl)
-                }
+            // v0.9.5: refresh means re-probe only. It must never click a login link,
+            // navigate to a login URL, or bounce the user back to provider.homeUrl.
+            scheduleLoginSurfaceDetection(provider, "session-refresh")
+            sessionState.text = if (needsLogin) "○ 로그인 필요 감지 · 로그인 화면 대기" else "△ 로그인 상태 재확인 중 · 현재 화면 유지"
+            status.text = if (needsLogin) {
+                "로그인이 필요한 상태가 감지되었습니다. 현재 화면을 유지하며 로그인 폼이 렌더링되면 저장 계정으로 자동 로그인합니다."
+            } else {
+                "로그인 상태가 확정되지 않았습니다. 화면 이동 없이 현재 페이지에서 다시 확인합니다."
             }
         }
     }
@@ -824,22 +795,51 @@ class MainActivity : Activity() {
                 var r=el.getBoundingClientRect();
                 return r.width>0 && r.height>0;
               }
-              var pass=false;
-              var pw=document.querySelectorAll('input[type=password]');
-              for(var i=0;i<pw.length;i++){ if(visible(pw[i])) { pass=true; break; } }
-              var text=(document.body && document.body.innerText ? document.body.innerText : '').slice(0,12000);
-              var logoutControl=false;
-              var controls=document.querySelectorAll('a,button,[role=button]');
-              for(var j=0;j<controls.length;j++){
-                var node=controls[j];
-                if(!visible(node)) continue;
-                var label=(node.innerText||node.textContent||node.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim();
-                if(/^(로그아웃|log\s*out|sign\s*out)$/i.test(label)){ logoutControl=true; break; }
+              function roots(doc){
+                var out=[doc];
+                try{
+                  var all=doc.querySelectorAll('*');
+                  for(var i=0;i<all.length;i++) if(all[i].shadowRoot) out.push(all[i].shadowRoot);
+                }catch(e){}
+                return out;
               }
-              var loginUrl=/(\/mbs\/log\/|login|signin|sign-in|member\/login|loginForm)/i.test(location.href);
-              var loginRequired=/(로그인이\s*필요|로그인\s*후\s*(?:이용|사용)|로그인해\s*주세요|로그인해주세요|회원만\s*이용|서비스\s*이용을\s*위해\s*로그인)/i.test(text);
-              var authenticated=logoutControl;
-              return JSON.stringify({needsLogin:(pass||loginUrl||loginRequired)&&!authenticated,authenticated:authenticated});
+              var docs=[document];
+              try{
+                var frames=document.querySelectorAll('iframe,frame');
+                for(var f=0;f<frames.length;f++) try{ if(frames[f].contentDocument) docs.push(frames[f].contentDocument); }catch(e){}
+              }catch(e){}
+              var loginSurface=false;
+              var bodyText='';
+              var logoutControl=false;
+              for(var d=0;d<docs.length;d++){
+                var doc=docs[d];
+                try{ bodyText += ' ' + ((doc.body&&doc.body.innerText)||''); }catch(e){}
+                var rs=roots(doc);
+                var visiblePassword=false;
+                var visibleUser=false;
+                for(var r=0;r<rs.length;r++){
+                  var root=rs[r];
+                  try{
+                    var pw=root.querySelectorAll('input[type=password]');
+                    for(var p=0;p<pw.length;p++) if(visible(pw[p])) { visiblePassword=true; break; }
+                    var us=root.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])');
+                    for(var u=0;u<us.length;u++){
+                      if(!visible(us[u])) continue;
+                      var meta=((us[u].name||'')+' '+(us[u].id||'')+' '+(us[u].placeholder||'')+' '+(us[u].autocomplete||'')).toLowerCase();
+                      if(/아이디|user|login|member|email|account|id/.test(meta) && !/search|검색/.test(meta)) { visibleUser=true; break; }
+                    }
+                    var controls=root.querySelectorAll('a,button,[role=button],input[type=submit],input[type=button]');
+                    for(var c=0;c<controls.length;c++){
+                      var node=controls[c]; if(!visible(node)) continue;
+                      var label=(node.innerText||node.value||node.textContent||node.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim();
+                      if(/^(로그아웃|log\s*out|sign\s*out)$/i.test(label)){ logoutControl=true; break; }
+                    }
+                  }catch(e){}
+                }
+                if(visiblePassword && visibleUser) loginSurface=true;
+              }
+              var loginRequired=/(로그인이\s*필요|로그인\s*후\s*(?:이용|사용)|로그인해\s*주세요|로그인해주세요|회원만\s*이용|서비스\s*이용을\s*위해\s*로그인)/i.test(bodyText.slice(0,24000));
+              return JSON.stringify({needsLogin:(loginSurface||loginRequired)&&!logoutControl,authenticated:logoutControl,loginSurface:loginSurface,loginRequired:loginRequired,urlLooksLogin:/(\/member\/login|\/mbs\/log\/|mbslogview)/i.test(location.href)});
             })();
         """.trimIndent()
 
@@ -847,21 +847,34 @@ class MainActivity : Activity() {
             try {
                 val obj = JSONObject(decodeJsString(encoded))
                 val needsLogin = obj.optBoolean("needsLogin", false)
-                val authenticated = obj.optBoolean("authenticated", false)
+                var authenticated = obj.optBoolean("authenticated", false)
+                val loginSurface = obj.optBoolean("loginSurface", false)
+                val now = System.currentTimeMillis()
+                if (loginSurface) {
+                    credentialLoginSurfaceSeenProvider = provider
+                    credentialLoginSurfaceSeenAtMs = now
+                }
+                // A submitted credential login is considered successful only after the
+                // actual login surface disappears and no explicit login-required state remains.
+                if (!authenticated && !needsLogin && !loginSurface && credentialAwaitingLoginExitProvider == provider) {
+                    authenticated = true
+                    credentialAwaitingLoginExitProvider = null
+                    credentialLoginSurfaceKey = ""
+                    credentialLoginSurfaceAttempts = 0
+                }
                 sessionState.text = when {
                     authenticated -> "● 로그인 유지됨 · 보안 세션 lease 갱신"
-                    needsLogin -> "○ 로그인 갱신 필요"
-                    else -> "△ 로그인 상태 미확정"
+                    loginSurface -> "○ 로그인 화면 감지 · 자동 로그인 준비"
+                    needsLogin -> "○ 로그인 필요 상태 감지"
+                    else -> "△ 로그인 상태 미확정 · 현재 화면 유지"
                 }
                 if (authenticated) {
                     val currentUrl = webView.url.orEmpty()
-                    if (currentUrl.isNotBlank()) {
-                        runCatching { sessionVault.captureAuthenticated(provider.wireName, currentUrl, VERSION) }
-                    }
+                    if (currentUrl.isNotBlank()) runCatching { sessionVault.captureAuthenticated(provider.wireName, currentUrl, VERSION) }
                 }
                 callback?.invoke(needsLogin, authenticated)
             } catch (_: Exception) {
-                sessionState.text = "△ 로그인 상태 확인 불가"
+                sessionState.text = "△ 로그인 상태 확인 불가 · 현재 화면 유지"
                 callback?.invoke(false, false)
             }
         }
@@ -1061,7 +1074,10 @@ class MainActivity : Activity() {
                         if (continueAfterSave) {
                             credentialAutoLoginInFlight = false
                             credentialAutoLoginLastAttemptAtMs = 0L
-                            webView.loadUrl(providerLoginUrl(which))
+                            credentialLoginSurfaceAttempts = 0
+                            // Do not force a login URL. If the site has already rendered a login
+                            // surface, the passive detector will fill and submit it immediately.
+                            scheduleLoginSurfaceDetection(which, "credential-saved")
                         }
                     }
                     .onFailure { Toast.makeText(this, "암호화 저장 실패: ${it.javaClass.simpleName}", Toast.LENGTH_LONG).show() }
@@ -1070,74 +1086,180 @@ class MainActivity : Activity() {
         dialog.show()
     }
 
+    private fun probeLoginSurface(which: ProviderId, callback: (JSONObject) -> Unit) {
+        if (provider != which) { callback(JSONObject().put("detected", false)); return }
+        val js = """
+            (function(){
+              try{
+                function visible(el){ if(!el) return false; var s=getComputedStyle(el); if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false; var r=el.getBoundingClientRect(); return r.width>0&&r.height>0; }
+                function roots(doc){ var out=[doc]; try{var all=doc.querySelectorAll('*'); for(var i=0;i<all.length;i++) if(all[i].shadowRoot) out.push(all[i].shadowRoot);}catch(e){} return out; }
+                var docs=[document]; try{var fs=document.querySelectorAll('iframe,frame'); for(var f=0;f<fs.length;f++) try{if(fs[f].contentDocument) docs.push(fs[f].contentDocument);}catch(e){}}catch(e){}
+                var best=null;
+                for(var d=0;d<docs.length;d++){
+                  var rs=roots(docs[d]);
+                  for(var r=0;r<rs.length;r++){
+                    var root=rs[r], passes=[]; try{passes=Array.from(root.querySelectorAll('input[type=password]')).filter(visible);}catch(e){}
+                    for(var p=0;p<passes.length;p++){
+                      var pass=passes[p], form=pass.form||pass.closest('form'), candidates=[];
+                      var base=form||root;
+                      try{candidates=Array.from(base.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);}catch(e){}
+                      if(!candidates.length) try{candidates=Array.from(root.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);}catch(e){}
+                      function score(el){ var meta=((el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')+' '+(el.autocomplete||'')).toLowerCase(); var n=0; if(/아이디|user|login|member|email|account/.test(meta)) n+=50; if(/\bid\b/.test(meta)) n+=25; if((el.autocomplete||'').toLowerCase()==='username') n+=80; if((el.type||'').toLowerCase()==='email') n+=10; if(/search|검색/.test(meta)) n-=120; if(form&&el.form===form) n+=100; return n; }
+                      candidates.sort(function(a,b){return score(b)-score(a);});
+                      var user=candidates[0]||null;
+                      var controls=[]; try{controls=Array.from((form||root).querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')).filter(visible);}catch(e){}
+                      if(!controls.length) try{controls=Array.from(root.querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')).filter(visible);}catch(e){}
+                      function label(el){return ((el.innerText||el.value||el.textContent||el.getAttribute('aria-label')||'')+'').replace(/\s+/g,' ').trim();}
+                      var submit=controls.find(function(el){return /^(로그인|로그인하기|log\s*in|sign\s*in)$/i.test(label(el));})||null;
+                      if(user){ best={user:true,pass:true,submit:!!submit,form:!!form}; break; }
+                    }
+                    if(best) break;
+                  }
+                  if(best) break;
+                }
+                var text=(document.body&&document.body.innerText?document.body.innerText:'').slice(0,20000);
+                var credentialError=/(아이디\s*(?:또는|나)\s*비밀번호.*(?:확인|일치|오류)|비밀번호.*일치하지|잘못된\s*비밀번호|로그인에\s*실패)/i.test(text);
+                return JSON.stringify({detected:!!best,hasUser:!!(best&&best.user),hasPassword:!!(best&&best.pass),hasSubmit:!!(best&&best.submit),hasForm:!!(best&&best.form),credentialError:credentialError,urlLooksLogin:/(\/member\/login|\/mbs\/log\/|mbslogview)/i.test(location.href)});
+              }catch(e){return JSON.stringify({detected:false,error:'probe-error'});}
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) { encoded ->
+            val obj = runCatching { JSONObject(decodeJsString(encoded)) }.getOrElse { JSONObject().put("detected", false).put("error", "decode-error") }
+            if (obj.optBoolean("detected", false)) {
+                credentialLoginSurfaceSeenProvider = which
+                credentialLoginSurfaceSeenAtMs = System.currentTimeMillis()
+            }
+            callback(obj)
+        }
+    }
+
+    private fun scheduleLoginSurfaceDetection(which: ProviderId, reason: String) {
+        if (provider != which) return
+        val generation = ++credentialLoginSurfaceGeneration
+        val delays = longArrayOf(100L, 420L, 1_050L, 2_300L)
+        delays.forEach { delay ->
+            handler.postDelayed({
+                if (provider != which || generation != credentialLoginSurfaceGeneration) return@postDelayed
+                probeLoginSurface(which) { probe ->
+                    if (provider != which || generation != credentialLoginSurfaceGeneration) return@probeLoginSurface
+                    if (!probe.optBoolean("detected", false)) return@probeLoginSurface
+                    sessionState.text = "○ ${which.displayName} 로그인 화면 감지"
+                    status.text = "${which.displayName} 로그인 폼을 실제 DOM에서 감지했습니다. 저장된 계정이 있으면 현재 화면에서 자동 로그인합니다."
+                    if (credentialVault.has(which.wireName)) {
+                        attemptSavedCredentialLogin(which, reason)
+                    } else if (startupCredentialPromptedProvider != which) {
+                        startupCredentialPromptedProvider = which
+                        showCredentialDialog(which, continueAfterSave = true)
+                    }
+                }
+            }, delay)
+        }
+    }
+
     private fun attemptSavedCredentialLogin(which: ProviderId, reason: String) {
         if (provider != which) return
         val now = System.currentTimeMillis()
         if (credentialAutoLoginInFlight && now - credentialAutoLoginLastAttemptAtMs < 6_000L) return
-        if (now - credentialAutoLoginLastAttemptAtMs < 1_500L) return
+        if (now - credentialAutoLoginLastAttemptAtMs < 900L) return
         val credentials = runCatching { credentialVault.load(which.wireName) }.getOrNull() ?: return
-        val current = webView.url.orEmpty()
-        if (!isProviderLoginUrl(which, current)) return
 
-        credentialAutoLoginInFlight = true
-        credentialAutoLoginLastAttemptAtMs = now
-        credentialAutoLoginAttempts += 1
-        val userJs = JSONObject.quote(credentials.username)
-        val passJs = JSONObject.quote(credentials.password)
-        val script = """
-            (function(){
-              try {
-                function visible(el){ if(!el) return false; var s=getComputedStyle(el); if(s.display==='none'||s.visibility==='hidden') return false; var r=el.getBoundingClientRect(); return r.width>0&&r.height>0; }
-                function setValue(el,value){
-                  var d=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');
-                  if(d&&d.set) d.set.call(el,value); else el.value=value;
-                  ['input','change','blur'].forEach(function(t){el.dispatchEvent(new Event(t,{bubbles:true}));});
-                }
-                var pass=Array.from(document.querySelectorAll('input[type=password]')).find(visible);
-                var users=Array.from(document.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio])')).filter(visible);
-                function score(el){
-                  var meta=((el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')+' '+(el.autocomplete||'')).toLowerCase();
-                  var n=0;
-                  if(/아이디|user|login|member|email|account/.test(meta)) n+=20;
-                  if((el.type||'').toLowerCase()==='email') n+=5;
-                  return n;
-                }
-                users.sort(function(a,b){return score(b)-score(a);});
-                var user=users[0];
-                if(!user||!pass) return 'fields-not-found';
-                setValue(user,$userJs); setValue(pass,$passJs);
-                var form=pass.form||user.form||pass.closest('form')||user.closest('form');
-                var controls=Array.from(document.querySelectorAll('button,input[type=submit],a[role=button]')).filter(visible);
-                var submit=controls.find(function(el){var t=((el.innerText||el.value||el.textContent||'')+'').replace(/\\s+/g,'').trim(); return /^(로그인|로그인하기|login|signin)$/i.test(t);});
-                if(form&&typeof form.requestSubmit==='function'){ if(submit&&submit.form===form) form.requestSubmit(submit); else form.requestSubmit(); return 'submitted-form'; }
-                if(submit){ submit.click(); return 'submitted-click'; }
-                if(form){ form.submit(); return 'submitted-native'; }
-                return 'submit-not-found';
-              } catch(e) { return 'error'; }
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(script) { encoded ->
-            credentialAutoLoginInFlight = false
-            val result = decodeJsString(encoded).take(80)
-            recordRuntimeEvent("credential-auto-login-attempt", JSONObject()
-                .put("provider", which.wireName)
-                .put("reason", reason.take(40))
-                .put("result", result)
-                .put("credentialStored", true)
-                .put("credentialExported", false))
-            sessionState.text = if (result.startsWith("submitted")) "● ${which.displayName} 자동 로그인 제출됨" else "△ ${which.displayName} 자동 로그인: $result"
-            handler.postDelayed({
-                checkSessionState { needsLogin, authenticated ->
-                    if (authenticated) {
-                        val url = webView.url.orEmpty()
-                        if (url.isNotBlank()) runCatching { sessionVault.captureAuthenticated(which.wireName, url, VERSION) }
-                        if (batchRunning && batchPausedForLogin) resumeAfterLogin()
-                    } else if (needsLogin && startupLoginPreflightActive) {
-                        val generation = startupLoginPollGeneration
-                        scheduleStartupLoginPoll(which, generation)
+        probeLoginSurface(which) { probe ->
+            if (!probe.optBoolean("detected", false)) return@probeLoginSurface
+            val surfaceKey = which.wireName + "|" + runtimeSafePath(webView.url)
+            if (surfaceKey != credentialLoginSurfaceKey) {
+                credentialLoginSurfaceKey = surfaceKey
+                credentialLoginSurfaceAttempts = 0
+            }
+            if (probe.optBoolean("credentialError", false) && credentialLoginSurfaceAttempts > 0) {
+                sessionState.text = "△ ${which.displayName} 저장 계정 로그인 오류 감지"
+                status.text = "저장된 계정으로 로그인한 뒤 오류 문구가 감지되어 반복 제출을 중지했습니다. 계정 설정을 확인해주세요."
+                return@probeLoginSurface
+            }
+            if (credentialLoginSurfaceAttempts >= 2) {
+                sessionState.text = "△ ${which.displayName} 자동 로그인 재시도 한도 도달"
+                return@probeLoginSurface
+            }
+
+            credentialAutoLoginInFlight = true
+            credentialAutoLoginLastAttemptAtMs = System.currentTimeMillis()
+            credentialAutoLoginAttempts += 1
+            credentialLoginSurfaceAttempts += 1
+            credentialAwaitingLoginExitProvider = which
+            val userJs = JSONObject.quote(credentials.username)
+            val passJs = JSONObject.quote(credentials.password)
+            val script = """
+                (function(){
+                  try {
+                    function visible(el){ if(!el) return false; var s=getComputedStyle(el); if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false; var r=el.getBoundingClientRect(); return r.width>0&&r.height>0; }
+                    function setValue(el,value){
+                      var proto=Object.getPrototypeOf(el), d=null;
+                      while(proto&&!d){d=Object.getOwnPropertyDescriptor(proto,'value');proto=Object.getPrototypeOf(proto);}
+                      if(d&&d.set) d.set.call(el,value); else el.value=value;
+                      el.focus();
+                      ['input','change','keyup','blur'].forEach(function(t){el.dispatchEvent(new Event(t,{bubbles:true}));});
                     }
-                }
-            }, 900L)
+                    function roots(doc){var out=[doc];try{var all=doc.querySelectorAll('*');for(var i=0;i<all.length;i++)if(all[i].shadowRoot)out.push(all[i].shadowRoot);}catch(e){}return out;}
+                    var docs=[document]; try{var fs=document.querySelectorAll('iframe,frame');for(var f=0;f<fs.length;f++)try{if(fs[f].contentDocument)docs.push(fs[f].contentDocument);}catch(e){}}catch(e){}
+                    var selected=null;
+                    for(var d=0;d<docs.length&&!selected;d++){
+                      var rs=roots(docs[d]);
+                      for(var r=0;r<rs.length&&!selected;r++){
+                        var root=rs[r], passes=[];try{passes=Array.from(root.querySelectorAll('input[type=password]')).filter(visible);}catch(e){}
+                        for(var p=0;p<passes.length&&!selected;p++){
+                          var pass=passes[p], form=pass.form||pass.closest('form'), base=form||root, users=[];
+                          try{users=Array.from(base.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);}catch(e){}
+                          if(!users.length)try{users=Array.from(root.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);}catch(e){}
+                          function score(el){var meta=((el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')+' '+(el.autocomplete||'')).toLowerCase(),n=0;if(/아이디|user|login|member|email|account/.test(meta))n+=50;if(/\bid\b/.test(meta))n+=25;if((el.autocomplete||'').toLowerCase()==='username')n+=80;if(/search|검색/.test(meta))n-=120;if(form&&el.form===form)n+=100;return n;}
+                          users.sort(function(a,b){return score(b)-score(a);}); var user=users[0]||null; if(!user)continue;
+                          var controls=[];try{controls=Array.from((form||root).querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')).filter(visible);}catch(e){}
+                          if(!controls.length)try{controls=Array.from(root.querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')).filter(visible);}catch(e){}
+                          function label(el){return ((el.innerText||el.value||el.textContent||el.getAttribute('aria-label')||'')+'').replace(/\s+/g,' ').trim();}
+                          var submit=controls.find(function(el){return /^(로그인|로그인하기|log\s*in|sign\s*in)$/i.test(label(el));})||null;
+                          selected={user:user,pass:pass,form:form,submit:submit};
+                        }
+                      }
+                    }
+                    if(!selected) return 'fields-not-found';
+                    setValue(selected.user,$userJs); setValue(selected.pass,$passJs);
+                    // Jinhak's current login is UI-driven; prefer the rendered login control
+                    // before native form submission so framework click handlers execute.
+                    if(selected.submit){ selected.submit.focus(); selected.submit.click(); return 'submitted-click'; }
+                    if(selected.form&&typeof selected.form.requestSubmit==='function'){ selected.form.requestSubmit(); return 'submitted-form'; }
+                    try{selected.pass.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));selected.pass.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));return 'submitted-enter';}catch(e){}
+                    return 'submit-not-found';
+                  } catch(e) { return 'error'; }
+                })();
+            """.trimIndent()
+            webView.evaluateJavascript(script) { encoded ->
+                credentialAutoLoginInFlight = false
+                val result = decodeJsString(encoded).take(80)
+                recordRuntimeEvent("credential-auto-login-attempt", JSONObject()
+                    .put("provider", which.wireName)
+                    .put("reason", reason.take(40))
+                    .put("result", result)
+                    .put("loginSurfaceDetected", true)
+                    .put("attemptOnSurface", credentialLoginSurfaceAttempts)
+                    .put("credentialStored", true)
+                    .put("credentialExported", false))
+                sessionState.text = if (result.startsWith("submitted")) "● ${which.displayName} 자동 로그인 제출됨" else "△ ${which.displayName} 자동 로그인: $result"
+                if (!result.startsWith("submitted")) credentialAwaitingLoginExitProvider = null
+                handler.postDelayed({
+                    checkSessionState { needsLogin, authenticated ->
+                        if (authenticated) {
+                            credentialLoginSurfaceAttempts = 0
+                            val url = webView.url.orEmpty()
+                            if (url.isNotBlank()) runCatching { sessionVault.captureAuthenticated(which.wireName, url, VERSION) }
+                            if (batchRunning && batchPausedForLogin) resumeAfterLogin()
+                            if (startupLoginPreflightActive && provider == which) {
+                                val generation = startupLoginPollGeneration
+                                onStartupProviderAuthenticated(which, generation)
+                            }
+                        } else if (needsLogin) {
+                            scheduleLoginSurfaceDetection(which, "post-submit")
+                        }
+                    }
+                }, 1_100L)
+            }
         }
     }
 
@@ -1220,6 +1342,7 @@ class MainActivity : Activity() {
         provider = which
         startupLoginStage = if (which == ProviderId.ADIGA) "adiga-check" else "jinhak-check"
         startupLoginOpenAttempted = false
+        startupAuthIndeterminatePolls = 0
         startupLoginPollGeneration += 1
         val generation = startupLoginPollGeneration
         localRunId = localStore.latestResumableRun(which.wireName)
@@ -1266,108 +1389,59 @@ class MainActivity : Activity() {
                 onStartupProviderAuthenticated(expectedProvider, generation)
                 return@checkSessionState
             }
-            // v0.9.4: an indeterminate DOM/auth check must never be treated as logout.
-            // Preserve the user's current page unless the adapter explicitly sees a login-required state.
-            if (!needsLogin) {
-                sessionState.text = "△ ${expectedProvider.displayName} 로그인 상태 확인 중 · 현재 화면 유지"
-                status.text = "${expectedProvider.displayName} 로그인 여부가 아직 확정되지 않았습니다. 현재 화면을 유지하고 다시 확인합니다. 로그인 필요가 명시적으로 감지될 때만 자동 로그인합니다."
-                scheduleStartupLoginPoll(expectedProvider, generation)
-                return@checkSessionState
-            }
-            if (credentialVault.has(expectedProvider.wireName)) {
-                if (!startupLoginOpenAttempted) {
-                    startupLoginOpenAttempted = true
-                    startupLoginStage = if (expectedProvider == ProviderId.ADIGA) "adiga-auto-login" else "jinhak-auto-login"
-                    sessionState.text = "● ${expectedProvider.displayName} 저장 계정으로 자동 로그인"
-                    status.text = "${expectedProvider.displayName} 세션이 만료되어 저장된 계정으로 자동 로그인합니다."
-                    webView.loadUrl(providerLoginUrl(expectedProvider))
-                } else if (isProviderLoginUrl(expectedProvider, webView.url.orEmpty())) {
-                    attemptSavedCredentialLogin(expectedProvider, "startup-preflight")
+            probeLoginSurface(expectedProvider) { probe ->
+                if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@probeLoginSurface
+                if (probe.optBoolean("detected", false)) {
+                    startupAuthIndeterminatePolls = 0
+                    sessionState.text = "○ ${expectedProvider.displayName} 로그인 화면 감지"
+                    if (credentialVault.has(expectedProvider.wireName)) {
+                        status.text = "${expectedProvider.displayName} 로그인 화면이 실제로 감지되어 저장 계정으로 자동 로그인합니다."
+                        attemptSavedCredentialLogin(expectedProvider, "startup-login-surface")
+                    } else if (startupCredentialPromptedProvider != expectedProvider) {
+                        startupCredentialPromptedProvider = expectedProvider
+                        status.text = "${expectedProvider.displayName} 로그인 화면이 감지되었습니다. 자동로그인 정보를 한 번 저장해주세요."
+                        showCredentialDialog(expectedProvider, continueAfterSave = true)
+                    }
+                    scheduleStartupLoginPoll(expectedProvider, generation)
+                    return@probeLoginSurface
                 }
-                scheduleStartupLoginPoll(expectedProvider, generation)
-                return@checkSessionState
-            }
-            if (!startupLoginOpenAttempted && startupCredentialPromptedProvider != expectedProvider) {
-                startupLoginOpenAttempted = true
-                startupCredentialPromptedProvider = expectedProvider
-                sessionState.text = "○ ${expectedProvider.displayName} 자동로그인 정보 필요"
-                status.text = "${expectedProvider.displayName} 계정정보를 한 번 저장하면 이후 로그인은 자동 처리됩니다."
-                showCredentialDialog(expectedProvider, continueAfterSave = true)
-                scheduleStartupLoginPoll(expectedProvider, generation)
-                return@checkSessionState
-            }
-            if (!startupLoginOpenAttempted) {
-                startupLoginOpenAttempted = true
-                startupLoginStage = if (expectedProvider == ProviderId.ADIGA) "adiga-wait-login" else "jinhak-wait-login"
-                status.text = "${expectedProvider.displayName} 로그인 화면을 자동으로 엽니다. 인증이 필요하면 완료만 해주세요. 완료 감지 후 다음 단계로 자동 진행합니다."
-                openStartupLoginPage(expectedProvider, generation)
-            } else {
-                sessionState.text = if (needsLogin) "○ ${expectedProvider.displayName} 로그인 완료 대기" else "△ ${expectedProvider.displayName} 로그인 상태 확정 대기"
-                scheduleStartupLoginPoll(expectedProvider, generation)
-            }
-        }
-    }
 
-    private fun openStartupLoginPage(expectedProvider: ProviderId, generation: Int) {
-        if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return
-        val js = """
-            (function(){
-              function visible(el){
-                if(!el) return false;
-                var s=getComputedStyle(el);
-                if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false;
-                var r=el.getBoundingClientRect();
-                return r.width>0 && r.height>0;
-              }
-              var nodes=document.querySelectorAll('a,button,[role=button]');
-              for(var i=0;i<nodes.length;i++){
-                var el=nodes[i];
-                if(!visible(el)) continue;
-                var t=(el.innerText||el.textContent||el.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim();
-                if(!/(로그인|log\\s*in|sign\\s*in)/i.test(t) || t.length>80) continue;
-                if(el.tagName==='A' && el.href){
-                  try{
-                    var u=new URL(el.href,location.href);
-                    if(/^https:$/.test(u.protocol)) return JSON.stringify({action:'url',url:u.href});
-                  }catch(e){}
+                // No rendered login surface: never navigate to login just because the auth
+                // classifier is uncertain. After two stable probes, continue bootstrap and
+                // let protected pages naturally redirect; the global surface detector then logs in.
+                startupAuthIndeterminatePolls += 1
+                if (!needsLogin && startupAuthIndeterminatePolls >= 2) {
+                    recordRuntimeEvent("startup-login-provider-deferred", JSONObject()
+                        .put("provider", expectedProvider.wireName)
+                        .put("reason", "no-rendered-login-surface")
+                        .put("forcedNavigation", false))
+                    startupLoginPollGeneration += 1
+                    startupLoginOpenAttempted = false
+                    if (expectedProvider == ProviderId.ADIGA) {
+                        sessionState.text = "△ 어디가 로그인 화면 없음 · 현재 화면 유지"
+                        status.text = "어디가 로그인 화면을 강제로 열지 않고 진학사 확인으로 넘어갑니다. 보호 페이지에서 로그인 화면이 나타나면 자동 로그인합니다."
+                        handler.postDelayed({ if (startupLoginPreflightActive) beginStartupLoginProvider(ProviderId.JINHAK) }, 200L)
+                    } else {
+                        sessionState.text = "△ 진학사 로그인 화면 없음 · 수집 중 감지 대기"
+                        startupLoginPreflightActive = false
+                        startupLoginPreflightVerified = true
+                        startupLoginStage = "passive-login-surface-ready"
+                        status.text = "로그인 화면 강제 이동 없이 통합 수집을 시작합니다. 수집 중 로그인 화면이 감지되는 즉시 자동 로그인합니다."
+                        handler.postDelayed({ if (!unifiedRunning && !batchRunning) startUnifiedCollectionAuthenticated() }, 250L)
+                    }
+                    return@probeLoginSurface
                 }
-                try{ el.click(); return JSON.stringify({action:'clicked'}); }catch(e2){}
-              }
-              return JSON.stringify({action:'not-found'});
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js) { encoded ->
-            if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@evaluateJavascript
-            val action = runCatching { JSONObject(decodeJsString(encoded)) }.getOrNull()
-            if (action?.optString("action") == "url" || action?.optString("action") == "clicked") {
-                startupLoginUiOpenCount += 1
+                sessionState.text = if (needsLogin) "○ 로그인 필요 신호 감지 · 로그인 폼 렌더링 대기" else "△ 로그인 상태 확인 중 · 현재 화면 유지"
+                status.text = "${expectedProvider.displayName} 현재 화면을 유지합니다. 실제 로그인 폼이 감지될 때만 자동 로그인을 실행합니다."
+                scheduleStartupLoginPoll(expectedProvider, generation)
             }
-            when (action?.optString("action")) {
-                "url" -> {
-                    val target = action.optString("url")
-                    if (target.startsWith("https://")) webView.loadUrl(target)
-                    else webView.loadUrl(expectedProvider.homeUrl)
-                }
-                "clicked" -> sessionState.text = "○ ${expectedProvider.displayName} 로그인 화면 열림"
-                else -> {
-                    sessionState.text = "○ ${expectedProvider.displayName} 로그인 메뉴를 직접 선택할 수 있습니다. 완료되면 자동 감지합니다."
-                }
-            }
-            scheduleStartupLoginPoll(expectedProvider, generation)
         }
     }
 
     private fun scheduleStartupLoginPoll(expectedProvider: ProviderId, generation: Int) {
         handler.postDelayed({
             if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@postDelayed
-            checkSessionState { _, authenticated ->
-                if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@checkSessionState
-                if (authenticated) {
-                    onStartupProviderAuthenticated(expectedProvider, generation)
-                } else {
-                    scheduleStartupLoginPoll(expectedProvider, generation)
-                }
-            }
+            evaluateStartupLoginState(expectedProvider, generation)
         }, LOGIN_PREFLIGHT_POLL_MS)
     }
 
