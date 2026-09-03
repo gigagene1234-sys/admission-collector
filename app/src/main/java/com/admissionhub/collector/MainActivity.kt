@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -20,6 +21,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -41,6 +43,7 @@ import com.admissionhub.collector.jinhak.JinhakReportContextBridge
 import com.admissionhub.collector.jinhak.JinhakMissionLaneSequencer
 import com.admissionhub.collector.jinhak.JinhakMissionTargetLedger
 import com.admissionhub.collector.session.SecureSessionVault
+import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
 import com.admissionhub.collector.provider.ProviderCapability
 import com.admissionhub.collector.sync.UnifiedSyncState
@@ -64,6 +67,7 @@ class MainActivity : Activity() {
     private lateinit var cloudOffload: CloudOffloadCoordinator
     private lateinit var localStore: LocalCollectorStore
     private lateinit var sessionVault: SecureSessionVault
+    private lateinit var credentialVault: CredentialVault
     private lateinit var slowLaneHost: FrameLayout
     private lateinit var slowLanePool: JinhakSlowLanePool
 
@@ -234,6 +238,10 @@ class MainActivity : Activity() {
     private var startupLoginUiOpenCount = 0
     private var startupLoginVerifiedAtMs = 0L
     private var startupSessionPreflightBypassed = false
+    private var credentialAutoLoginInFlight = false
+    private var credentialAutoLoginLastAttemptAtMs = 0L
+    private var credentialAutoLoginAttempts = 0
+    private var startupCredentialPromptedProvider: ProviderId? = null
     private var jinhakBatchStartCount = 0
     private val jinhakNormalizedMissionSeedContexts = linkedMapOf<String, JinhakApplicationMission.Context>()
     private val jinhakNormalizedIdentitySeedKeys = linkedSetOf<String>()
@@ -263,8 +271,8 @@ class MainActivity : Activity() {
         private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.2"
-        private const val BUILD_CODE = 10920
+        private const val VERSION = "0.9.3"
+        private const val BUILD_CODE = 10930
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -275,6 +283,7 @@ class MainActivity : Activity() {
         cloudOffload = CloudOffloadCoordinator(this)
         localStore = LocalCollectorStore(this)
         sessionVault = SecureSessionVault(this)
+        credentialVault = CredentialVault(this)
         buildUi()
         slowLanePool = JinhakSlowLanePool(this, slowLaneHost, object : JinhakSlowLanePool.Listener {
             override fun onSlowLaneCompleted(task: JinhakSlowLanePool.Task, snapshot: JSONObject, stats: JinhakSlowLanePool.ResultStats) {
@@ -355,8 +364,8 @@ class MainActivity : Activity() {
             setPadding(8, 8, 8, 8)
         }
         val sessionButton = Button(this).apply {
-            text = "로그인 세션 저장/갱신"
-            setOnClickListener { refreshSessionOrOpenLogin() }
+            text = "계정 자동로그인 설정"
+            setOnClickListener { showCredentialDialog(provider, continueAfterSave = false) }
         }
         sessionRow.addView(sessionState, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         sessionRow.addView(sessionButton)
@@ -535,6 +544,9 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
+                if (isProviderLoginUrl(provider, url) && credentialVault.has(provider.wireName)) {
+                    handler.postDelayed({ attemptSavedCredentialLogin(provider, "page-finished") }, 220L)
+                }
                 if (startupLoginPreflightActive) {
                     handleStartupLoginPreflightPageFinished(url)
                     return
@@ -975,6 +987,146 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun providerLoginUrl(which: ProviderId): String = when (which) {
+        ProviderId.JINHAK -> "https://www.jinhak.com/jh/member/login"
+        ProviderId.ADIGA -> "https://www.adiga.kr/mbs/log/mbsLogView.do?menuId=PCMBSLOG1000"
+    }
+
+    private fun isProviderLoginUrl(which: ProviderId, rawUrl: String): Boolean {
+        val url = rawUrl.lowercase()
+        if (url.isBlank()) return false
+        return when (which) {
+            ProviderId.JINHAK -> url.contains("jinhak.com/") && (url.contains("/member/login") || url.contains("signin") || url.contains("login"))
+            ProviderId.ADIGA -> url.contains("adiga.kr/") && (url.contains("/mbs/log/") || url.contains("mbslogview") || url.contains("login"))
+        }
+    }
+
+    private fun showCredentialDialog(which: ProviderId, continueAfterSave: Boolean) {
+        val existing = runCatching { credentialVault.load(which.wireName) }.getOrNull()
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val p = (18 * resources.displayMetrics.density).toInt()
+            setPadding(p, p / 2, p, 0)
+        }
+        val username = EditText(this).apply {
+            hint = "${which.displayName} 아이디"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(existing?.username.orEmpty())
+            setSelection(text.length)
+        }
+        val password = EditText(this).apply {
+            hint = if (existing != null) "비밀번호 변경 시에만 다시 입력" else "비밀번호"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        layout.addView(username)
+        layout.addView(password)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("${which.displayName} 자동로그인")
+            .setMessage("이 기기 안에 Android Keystore로 암호화 저장합니다. 계정정보는 수집 JSON·로그·Cloud·웹 대시보드로 전송하지 않습니다.")
+            .setView(layout)
+            .setNeutralButton("저장정보 삭제") { _, _ ->
+                credentialVault.clear(which.wireName)
+                sessionState.text = "○ ${which.displayName} 자동로그인 정보 삭제됨"
+            }
+            .setNegativeButton("취소", null)
+            .setPositiveButton("저장") { _, _ ->
+                val u = username.text.toString().trim()
+                val p = password.text.toString().ifBlank { existing?.password.orEmpty() }
+                if (u.isBlank() || p.isBlank()) {
+                    Toast.makeText(this, "아이디와 비밀번호를 모두 입력해야 합니다.", Toast.LENGTH_LONG).show()
+                    return@setPositiveButton
+                }
+                runCatching { credentialVault.save(which.wireName, u, p) }
+                    .onSuccess {
+                        sessionState.text = "● ${which.displayName} 자동로그인 정보 저장됨"
+                        recordRuntimeEvent("credential-vault-updated", JSONObject()
+                            .put("provider", which.wireName)
+                            .put("credentialStored", true)
+                            .put("credentialExported", false))
+                        if (continueAfterSave) {
+                            credentialAutoLoginInFlight = false
+                            credentialAutoLoginLastAttemptAtMs = 0L
+                            webView.loadUrl(providerLoginUrl(which))
+                        }
+                    }
+                    .onFailure { Toast.makeText(this, "암호화 저장 실패: ${it.javaClass.simpleName}", Toast.LENGTH_LONG).show() }
+            }
+            .create()
+        dialog.show()
+    }
+
+    private fun attemptSavedCredentialLogin(which: ProviderId, reason: String) {
+        if (provider != which) return
+        val now = System.currentTimeMillis()
+        if (credentialAutoLoginInFlight && now - credentialAutoLoginLastAttemptAtMs < 6_000L) return
+        if (now - credentialAutoLoginLastAttemptAtMs < 1_500L) return
+        val credentials = runCatching { credentialVault.load(which.wireName) }.getOrNull() ?: return
+        val current = webView.url.orEmpty()
+        if (!isProviderLoginUrl(which, current)) return
+
+        credentialAutoLoginInFlight = true
+        credentialAutoLoginLastAttemptAtMs = now
+        credentialAutoLoginAttempts += 1
+        val userJs = JSONObject.quote(credentials.username)
+        val passJs = JSONObject.quote(credentials.password)
+        val script = """
+            (function(){
+              try {
+                function visible(el){ if(!el) return false; var s=getComputedStyle(el); if(s.display==='none'||s.visibility==='hidden') return false; var r=el.getBoundingClientRect(); return r.width>0&&r.height>0; }
+                function setValue(el,value){
+                  var d=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');
+                  if(d&&d.set) d.set.call(el,value); else el.value=value;
+                  ['input','change','blur'].forEach(function(t){el.dispatchEvent(new Event(t,{bubbles:true}));});
+                }
+                var pass=Array.from(document.querySelectorAll('input[type=password]')).find(visible);
+                var users=Array.from(document.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio])')).filter(visible);
+                function score(el){
+                  var meta=((el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')+' '+(el.autocomplete||'')).toLowerCase();
+                  var n=0;
+                  if(/아이디|user|login|member|email|account/.test(meta)) n+=20;
+                  if((el.type||'').toLowerCase()==='email') n+=5;
+                  return n;
+                }
+                users.sort(function(a,b){return score(b)-score(a);});
+                var user=users[0];
+                if(!user||!pass) return 'fields-not-found';
+                setValue(user,$userJs); setValue(pass,$passJs);
+                var form=pass.form||user.form||pass.closest('form')||user.closest('form');
+                var controls=Array.from(document.querySelectorAll('button,input[type=submit],a[role=button]')).filter(visible);
+                var submit=controls.find(function(el){var t=((el.innerText||el.value||el.textContent||'')+'').replace(/\\s+/g,'').trim(); return /^(로그인|로그인하기|login|signin)$/i.test(t);});
+                if(form&&typeof form.requestSubmit==='function'){ if(submit&&submit.form===form) form.requestSubmit(submit); else form.requestSubmit(); return 'submitted-form'; }
+                if(submit){ submit.click(); return 'submitted-click'; }
+                if(form){ form.submit(); return 'submitted-native'; }
+                return 'submit-not-found';
+              } catch(e) { return 'error'; }
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(script) { encoded ->
+            credentialAutoLoginInFlight = false
+            val result = decodeJsString(encoded).take(80)
+            recordRuntimeEvent("credential-auto-login-attempt", JSONObject()
+                .put("provider", which.wireName)
+                .put("reason", reason.take(40))
+                .put("result", result)
+                .put("credentialStored", true)
+                .put("credentialExported", false))
+            sessionState.text = if (result.startsWith("submitted")) "● ${which.displayName} 자동 로그인 제출됨" else "△ ${which.displayName} 자동 로그인: $result"
+            handler.postDelayed({
+                checkSessionState { needsLogin, authenticated ->
+                    if (authenticated) {
+                        val url = webView.url.orEmpty()
+                        if (url.isNotBlank()) runCatching { sessionVault.captureAuthenticated(which.wireName, url, VERSION) }
+                        if (batchRunning && batchPausedForLogin) resumeAfterLogin()
+                    } else if (needsLogin && startupLoginPreflightActive) {
+                        val generation = startupLoginPollGeneration
+                        scheduleStartupLoginPoll(which, generation)
+                    }
+                }
+            }, 900L)
+        }
+    }
+
     private fun startAutomaticLoginAndCollectionSequence(trigger: String) {
         if (startupLoginPreflightActive) return
         if (unifiedRunning || batchRunning) {
@@ -1097,6 +1249,28 @@ class MainActivity : Activity() {
             if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@checkSessionState
             if (authenticated) {
                 onStartupProviderAuthenticated(expectedProvider, generation)
+                return@checkSessionState
+            }
+            if (credentialVault.has(expectedProvider.wireName)) {
+                if (!startupLoginOpenAttempted) {
+                    startupLoginOpenAttempted = true
+                    startupLoginStage = if (expectedProvider == ProviderId.ADIGA) "adiga-auto-login" else "jinhak-auto-login"
+                    sessionState.text = "● ${expectedProvider.displayName} 저장 계정으로 자동 로그인"
+                    status.text = "${expectedProvider.displayName} 세션이 만료되어 저장된 계정으로 자동 로그인합니다."
+                    webView.loadUrl(providerLoginUrl(expectedProvider))
+                } else if (isProviderLoginUrl(expectedProvider, webView.url.orEmpty())) {
+                    attemptSavedCredentialLogin(expectedProvider, "startup-preflight")
+                }
+                scheduleStartupLoginPoll(expectedProvider, generation)
+                return@checkSessionState
+            }
+            if (!startupLoginOpenAttempted && startupCredentialPromptedProvider != expectedProvider) {
+                startupLoginOpenAttempted = true
+                startupCredentialPromptedProvider = expectedProvider
+                sessionState.text = "○ ${expectedProvider.displayName} 자동로그인 정보 필요"
+                status.text = "${expectedProvider.displayName} 계정정보를 한 번 저장하면 이후 로그인은 자동 처리됩니다."
+                showCredentialDialog(expectedProvider, continueAfterSave = true)
+                scheduleStartupLoginPoll(expectedProvider, generation)
                 return@checkSessionState
             }
             if (!startupLoginOpenAttempted) {
@@ -1251,7 +1425,10 @@ class MainActivity : Activity() {
                     .put("verifiedAtMs", startupLoginVerifiedAtMs)
                     .put("passwordStored", false)
                     .put("sessionSecretStoredLocally", startupLoginAdigaRestoredLease || startupLoginJinhakRestoredLease)
-                    .put("sessionSecretExported", false)),
+                    .put("sessionSecretExported", false)
+                    .put("adigaCredentialStored", credentialVault.has(ProviderId.ADIGA.wireName))
+                    .put("jinhakCredentialStored", credentialVault.has(ProviderId.JINHAK.wireName))
+                    .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)),
             false
         )
         localStore.recordSyncState(sessionId, UnifiedSyncState.ADIGA_PUBLIC_SYNC.name, ProviderId.ADIGA.wireName, JSONObject().put("mode", "legacy-local-first-until-deterministic-planner-activation"), false)
