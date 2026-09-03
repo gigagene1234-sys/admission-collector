@@ -303,6 +303,8 @@ class MainActivity : Activity() {
     private var jinhakSessionKeepAliveTicks = 0
     private var jinhakSessionKeepAliveBackgroundTicks = 0
     private var jinhakSessionExtensionClicks = 0
+    private var jinhakOriginInferredMissionTargets = 0
+    private var jinhakExternalNavigationsBlocked = 0
     private var jinhakBatchStartCount = 0
     private val jinhakNormalizedMissionSeedContexts = linkedMapOf<String, JinhakApplicationMission.Context>()
     private val jinhakNormalizedIdentitySeedKeys = linkedSetOf<String>()
@@ -334,8 +336,8 @@ class MainActivity : Activity() {
         private const val JINHAK_CORE_AUTH_STABLE_PASSES = 2
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.8"
-        private const val BUILD_CODE = 10980
+        private const val VERSION = "0.9.9"
+        private const val BUILD_CODE = 10990
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -602,7 +604,17 @@ class MainActivity : Activity() {
         }
 
         webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val target = request.url?.toString().orEmpty()
+                if (batchRunning && provider == ProviderId.JINHAK && target.isNotBlank() && !ProviderRegistry.adapter(ProviderId.JINHAK).accepts(target)) {
+                    jinhakExternalNavigationsBlocked += 1
+                    recordRuntimeEvent("jinhak-external-navigation-blocked", JSONObject()
+                        .put("targetSafePath", runtimeSafePath(target))
+                        .put("currentTargetSafePath", runtimeSafePath(currentBatchTarget)))
+                    return true
+                }
+                return false
+            }
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 runtimeLastSafePath = runtimeSafePath(url)
@@ -1424,6 +1436,8 @@ class MainActivity : Activity() {
         jinhakSessionKeepAliveTicks = 0
         jinhakSessionKeepAliveBackgroundTicks = 0
         jinhakSessionExtensionClicks = 0
+        jinhakOriginInferredMissionTargets = 0
+        jinhakExternalNavigationsBlocked = 0
 
         // v0.9.2: restore the encrypted provider session bundles first. When both are
         // present, do not navigate through the login-preflight UI at all. Server-side
@@ -2481,6 +2495,8 @@ class MainActivity : Activity() {
                 .put("normalizedApplicationIdentitySeeds", jinhakNormalizedIdentitySeedKeys.size)
                 .put("normalizedApplicationCandidateBindings", jinhakNormalizedCandidateBindingKeys.size)
                 .put("normalizedApplicationAmbiguousBindings", jinhakNormalizedAmbiguousBindings)
+                        .put("originInferredMissionTargets", jinhakOriginInferredMissionTargets)
+                        .put("externalNavigationsBlocked", jinhakExternalNavigationsBlocked)
                 .put("jinhakBatchStartCount", jinhakBatchStartCount)
                 .put("applicationAnchorActionsParsed", jinhakMissionAnchorParsedKeys.size)
                 .put("applicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
@@ -3873,13 +3889,19 @@ class MainActivity : Activity() {
                     jinhakNormalizedMissionSeedContexts.values.toList()
                 )
                 val ledgerOrigin = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
+                val originInferred = parsedMissionCandidates.count { candidate ->
+                    JinhakMissionLaneSequencer.laneForLabel(candidate.label, candidate.kind) == "reference" &&
+                        JinhakMissionLaneSequencer.laneForCandidateAtOrigin(candidate.label, candidate.kind, ledgerOrigin, pageTypeNow) != "reference" &&
+                        candidate.applicationContext?.identityKey != null
+                }
+                if (originInferred > 0) jinhakOriginInferredMissionTargets += originInferred
                 val ledgerAdded = if (pageTypeNow == "jinhak-recommended-university") {
                     recordRuntimeEvent("jinhak-recommendation-ledger-suppressed", JSONObject()
                         .put("safePath", runtimeSafePath(ledgerOrigin))
                         .put("candidateCount", parsedMissionCandidates.size))
                     0
                 } else {
-                    jinhakMissionTargetLedger.capture(ledgerOrigin, parsedMissionCandidates)
+                    jinhakMissionTargetLedger.capture(ledgerOrigin, parsedMissionCandidates, pageTypeNow)
                 }
                 if (ledgerAdded > 0) {
                     noteJinhakMeaningfulProgress("mission-target-captured", forceDiagnostics = true)
@@ -4938,10 +4960,14 @@ class MainActivity : Activity() {
                         .put("normalizedApplicationIdentitySeeds", jinhakNormalizedIdentitySeedKeys.size)
                         .put("normalizedApplicationCandidateBindings", jinhakNormalizedCandidateBindingKeys.size)
                         .put("normalizedApplicationAmbiguousBindings", jinhakNormalizedAmbiguousBindings)
+                        .put("originInferredMissionTargets", jinhakOriginInferredMissionTargets)
+                        .put("externalNavigationsBlocked", jinhakExternalNavigationsBlocked)
                         .put("jinhakBatchStartCount", jinhakBatchStartCount)
                 .put("normalizedApplicationIdentitySeeds", jinhakNormalizedIdentitySeedKeys.size)
                 .put("normalizedApplicationCandidateBindings", jinhakNormalizedCandidateBindingKeys.size)
                 .put("normalizedApplicationAmbiguousBindings", jinhakNormalizedAmbiguousBindings)
+                        .put("originInferredMissionTargets", jinhakOriginInferredMissionTargets)
+                        .put("externalNavigationsBlocked", jinhakExternalNavigationsBlocked)
                 .put("jinhakBatchStartCount", jinhakBatchStartCount)
                         .put("applicationAnchorBindingSources", JSONObject(jinhakMissionBindingSourceCounts as Map<*, *>))
                         .put("applicationAnchorActionsParsed", jinhakMissionAnchorParsedKeys.size)
@@ -5027,6 +5053,8 @@ class MainActivity : Activity() {
                 .put("jinhakMissionActionsExecuted", jinhakMissionActionsExecuted)
                 .put("jinhakGenericActionsExecuted", jinhakGenericActionsExecuted)
                 .put("jinhakReferenceRepeatSkips", jinhakReferenceRepeatSkips)
+                .put("jinhakOriginInferredMissionTargets", jinhakOriginInferredMissionTargets)
+                .put("jinhakExternalNavigationsBlocked", jinhakExternalNavigationsBlocked)
                 .put("jinhakNoProgressFences", jinhakNoProgressFences)
                 .put("jinhakApplicationBoundActions", jinhakApplicationBoundActions)
                 .put("jinhakApplicationMissionReturns", jinhakApplicationMissionReturns)
@@ -5196,6 +5224,7 @@ class MainActivity : Activity() {
         for (rawUrl in currentAdapter().seedUrls()) {
             val url = canonicalizeBatchUrl(rawUrl)
             if (url.isBlank() || !isProviderUrl(url) || batchVisited.contains(url) || batchQueued.contains(url)) continue
+            if (provider == ProviderId.JINHAK && !isJinhakDefaultCoreQueueUrl(url)) continue
             val runId = localRunId
             if (runId != null && !currentAdapter().isDynamicListPage(url) && localStore.isDocumentCompleted(runId, url)) continue
             batchQueued.add(url)

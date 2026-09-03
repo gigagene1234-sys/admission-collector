@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.8 Auth Recovery KeepAlive"
+        android:label="Admission Collector v0.9.9 Mission Ledger Routing"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

@@ -42,6 +42,12 @@ object JinhakSiteTopology {
         return when {
             path.contains("/four-year-university/library") || Regex("(수시|정시)?\\s*저장소").containsMatchIn(text) ->
                 JinhakMissionLane.SAVED_APPLICATIONS
+            path.contains("/four-year-university/report/pass-predict") ->
+                JinhakMissionLane.CURRENT_PREDICTION
+            path.contains("/four-year-university/report/actual-admission") ->
+                JinhakMissionLane.ACTUAL_ADMIT
+            path.contains("/four-year-university/report/admission-result") ->
+                JinhakMissionLane.UNIVERSITY_RESULT
             Regex("(actual|actual-admit|admitreport|resultreport|passcase|실제합격자)").containsMatchIn(text) ->
                 JinhakMissionLane.ACTUAL_ADMIT
             Regex("(sapplysample|모의지원\\s*리포트|지원자\\s*분포)").containsMatchIn(text) ->
@@ -83,8 +89,8 @@ object JinhakSiteTopology {
         JinhakMissionLane.MOCK_SUPPORT,
         JinhakMissionLane.ACTUAL_ADMIT,
         JinhakMissionLane.UNIVERSITY_RESULT,
-        JinhakMissionLane.SCORE_ANALYSIS,
-        JinhakMissionLane.REFERENCE -> true
+        JinhakMissionLane.SCORE_ANALYSIS -> true
+        JinhakMissionLane.REFERENCE,
         JinhakMissionLane.RECOMMENDATION,
         JinhakMissionLane.STRATEGY,
         JinhakMissionLane.ADMISSION_KNOWLEDGE,

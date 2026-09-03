@@ -56,13 +56,13 @@ class JinhakMissionTargetLedger {
     fun clear() = targets.clear()
 
     /** Capture every safe application-bound report target currently visible before navigation. */
-    fun capture(originRoute: String, candidates: List<JinhakAgentNavigator.Candidate>): Int {
+    fun capture(originRoute: String, candidates: List<JinhakAgentNavigator.Candidate>, pageType: String = ""): Int {
         if (originRoute.isBlank()) return 0
         var added = 0
         for (candidate in candidates) {
             val context = candidate.applicationContext ?: continue
             val identity = context.identityKey ?: continue
-            val lane = JinhakMissionLaneSequencer.laneForLabel(candidate.label, candidate.kind)
+            val lane = JinhakMissionLaneSequencer.laneForCandidateAtOrigin(candidate.label, candidate.kind, originRoute, pageType)
             if (lane == "reference") continue
             val id = RecordUtils.sha256(listOf(identity, lane, candidate.label, candidate.kind, originRoute).joinToString("|"))
             val existing = targets[id]

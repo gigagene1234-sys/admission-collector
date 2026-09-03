@@ -36,6 +36,18 @@ object JinhakMissionLaneSequencer {
         }
     }
 
+    fun laneForCandidateAtOrigin(label: String, kind: String, originRoute: String, pageType: String): String {
+        val direct = laneForLabel(label, kind)
+        if (direct != "reference") return direct
+        val normalizedLabel = label.replace(Regex("\\s+"), " ").trim()
+        val savedOrigin = pageType == "jinhak-early-storage" || originRoute.contains("/four-year-university/library")
+        return if (savedOrigin && Regex("^리포트(?:\\s*보기)?$").matches(normalizedLabel)) {
+            "current-prediction"
+        } else {
+            "reference"
+        }
+    }
+
     fun laneRank(lane: String): Int {
         val index = laneOrder.indexOf(lane)
         return if (index >= 0) index else laneOrder.size + 1
