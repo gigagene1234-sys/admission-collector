@@ -1,0 +1,191 @@
+name: Build Admission Collector v0.9.5 Passive Login Surface Auto Login
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v095.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    outputs:
+      source_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply v0.9.5 patch
+        run: python3 .github/scripts/patch_v095.py
+      - name: Verify v0.9.5 source invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          manifest=Path('app/src/main/AndroidManifest.xml').read_text()
+          cred=Path('app/src/main/java/com/admissionhub/collector/session/CredentialVault.kt').read_text()
+          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          year=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt').read_text()
+          req={
+            'version':'private const val VERSION = "0.9.5"' in m,
+            'build':'private const val BUILD_CODE = 10950' in m,
+            'gradle':'versionCode = 10950' in g and 'versionName = "0.9.5"' in g,
+            'label':'Admission Collector v0.9.5 Passive Login Surface Auto Login' in manifest,
+            'surface-probe':'private fun probeLoginSurface' in m and 'visiblePassword' in m,
+            'page-finished-probe':'scheduleLoginSurfaceDetection(provider, "page-finished")' in m,
+            'no-forced-login-url':'webView.loadUrl(providerLoginUrl' not in m,
+            'no-legacy-opener':'openStartupLoginPage(' not in m,
+            'session-refresh-passive':'scheduleLoginSurfaceDetection(provider, "session-refresh")' in m,
+            'framework-click-first':'selected.submit.click()' in m,
+            'surface-attempt-limit':'credentialLoginSurfaceAttempts >= 2' in m,
+            'credential-vault':'AES/GCM/NoPadding' in cred and 'admission_collector_credentials_v1' in cred,
+            'same-card':'unique-card-container' in snap,
+            'jinhak-broad-off':'override val supportsBatchCrawl = false' in adapter,
+            'year-guard':'historical-multi-year-or-unresolved' in year,
+            'semantic-guard':'applicantAverageGrade' in adapter,
+          }
+          failed=[k for k,v in req.items() if not v]
+          if failed: raise SystemExit('Missing invariant(s): '+', '.join(failed))
+          # Account values must not enter diagnostics/cloud/export code.
+          if '.put("username", credentials.username)' in m or '.put("password", credentials.password)' in m:
+            raise SystemExit('credential value leak into runtime JSON')
+          print('v0.9.5 source invariants passed')
+          PY
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Test and build patched source
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+      - name: Verify patched APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" >/dev/null
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='10950'" patched-badging.txt
+          grep -q "versionName='0.9.5'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.5 Passive Login Surface Auto Login'" patched-badging.txt
+      - name: Commit v0.9.5 source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.9.5 passive login surface auto login"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  independent-main-build:
+    needs: patch-build-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Refresh exact committed main
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(git rev-parse HEAD)" = "${{ needs.patch-build-commit.outputs.source_sha }}"
+      - name: Reverify committed source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          assert 'private const val VERSION = "0.9.5"' in m
+          assert 'private fun probeLoginSurface' in m
+          assert 'webView.loadUrl(providerLoginUrl' not in m
+          assert 'openStartupLoginPage(' not in m
+          assert 'scheduleLoginSurfaceDetection(provider, "page-finished")' in m
+          print('committed v0.9.5 verified')
+          PY
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build committed main
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Verify and package final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.5-Passive-Login-Surface-Auto-Login.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10950'" badging.txt
+          grep -q "versionName='0.9.5'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.5 Passive Login Surface Auto Login'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.5-Passive-Login-Surface-Auto-Login.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.5-final
+          path: |
+            Admission-Collector-v0.9.5-Passive-Login-Surface-Auto-Login.apk
+            Admission-Collector-v0.9.5-Passive-Login-Surface-Auto-Login.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+      - name: Publish v0.9.5 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="v0.9.5 removes the remaining proactive login navigation paths. The collector no longer loads a provider login URL, clicks a login menu, or bounces to provider.homeUrl to resolve uncertain authentication. Instead it probes the rendered DOM after every page load (including delayed SPA hydration), detects a visible username/password login surface, and only then fills locally encrypted credentials and activates the rendered Login control. The login classifier no longer treats a URL containing login as sufficient proof of logout. A submitted auto-login is confirmed only after the login surface disappears without another explicit login-required state. Per-surface retries are capped to avoid repeated bad-password submissions. Existing CredentialVault, session bundle, mission bootstrap, same-card binding, year guard, applicantAverageGrade guard, website-first Live bridge, and supportsBatchCrawl=false remain. Tests/build/signature verification and independent committed-main rebuild passed. Real-device E2E remains to be verified. Commit: $SHA"
+          gh release create v0.9.5 Admission-Collector-v0.9.5-Passive-Login-Surface-Auto-Login.apk Admission-Collector-v0.9.5-Passive-Login-Surface-Auto-Login.sha256 --target "$SHA" --title "Admission Collector v0.9.5 — Passive Login Surface Auto Login" --notes "$NOTES"
