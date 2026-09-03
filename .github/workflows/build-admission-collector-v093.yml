@@ -1,0 +1,212 @@
+name: Build Admission Collector v0.9.3 Local Credential Auto Login
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v093.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    outputs:
+      source_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.9.3 source patch
+        run: python3 .github/scripts/patch_v093.py
+
+      - name: Verify v0.9.3 source invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          cred=Path('app/src/main/java/com/admissionhub/collector/session/CredentialVault.kt').read_text()
+          sess=Path('app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt').read_text()
+          snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          year=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakReportYearGuard.kt').read_text()
+          gradle=Path('app/build.gradle.kts').read_text()
+          manifest=Path('app/src/main/AndroidManifest.xml').read_text()
+          required={
+            'version':'private const val VERSION = "0.9.3"' in main,
+            'build':'private const val BUILD_CODE = 10930' in main,
+            'gradle':'versionCode = 10930' in gradle and 'versionName = "0.9.3"' in gradle,
+            'label':'Admission Collector v0.9.3 Local Credential Auto Login' in manifest,
+            'credential-vault-init':'credentialVault = CredentialVault(this)' in main,
+            'credential-dialog':'showCredentialDialog(provider, continueAfterSave = false)' in main,
+            'jinhak-login':'https://www.jinhak.com/jh/member/login' in main,
+            'adiga-login':'https://www.adiga.kr/mbs/log/mbsLogView.do?menuId=PCMBSLOG1000' in main,
+            'auto-submit':'attemptSavedCredentialLogin' in main and 'requestSubmit' in main,
+            'credential-keystore':'admission_collector_credentials_v1' in cred,
+            'credential-encrypted':'AES/GCM/NoPadding' in cred,
+            'no-backup':'android:allowBackup="false"' in manifest,
+            'session-bundle-preserved':'admission_secure_session_bundle_v2' in sess,
+            'mission-bootstrap':'normalizedApplicationIdentitySeeds' in main,
+            'same-card':'unique-card-container' in snap,
+            'broad-jinhak-off':'override val supportsBatchCrawl = false' in adapter,
+            'year-guard':'historical-multi-year-or-unresolved' in year,
+            'semantic-guard':'applicantAverageGrade' in adapter,
+          }
+          failed=[k for k,v in required.items() if not v]
+          if failed: raise SystemExit('Missing invariant(s): '+', '.join(failed))
+          # Credential secret must remain confined to CredentialVault/MainActivity login injection.
+          forbidden_files=[
+            Path('app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt'),
+            Path('app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadClient.kt'),
+            Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt'),
+          ]
+          for p in forbidden_files:
+            t=p.read_text()
+            if 'CredentialVault' in t or 'credentialVault.load' in t:
+              raise SystemExit('Credential vault leaked into '+str(p))
+          # Runtime events must never include username/password values.
+          if '.put("username", credentials.username)' in main or '.put("password", credentials.password)' in main:
+            raise SystemExit('Credential value leaked into runtime JSON')
+          print('v0.9.3 source invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Test and build patched v0.9.3 source
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+      - name: Verify patched v0.9.3 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee patched-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='10930'" patched-badging.txt
+          grep -q "versionName='0.9.3'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.3 Local Credential Auto Login'" patched-badging.txt
+      - name: Commit v0.9.3 source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+          if git diff --cached --quiet; then echo "No v0.9.3 source changes" >&2; exit 1; fi
+          git commit -m "Implement v0.9.3 local credential auto login"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  independent-main-build:
+    needs: patch-build-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Refresh exact committed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(git rev-parse HEAD)" = "${{ needs.patch-build-commit.outputs.source_sha }}"
+      - name: Reverify committed source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          c=Path('app/src/main/java/com/admissionhub/collector/session/CredentialVault.kt').read_text()
+          a=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          assert 'private const val VERSION = "0.9.3"' in m
+          assert 'attemptSavedCredentialLogin' in m
+          assert 'credentialVault = CredentialVault(this)' in m
+          assert 'admission_collector_credentials_v1' in c
+          assert 'override val supportsBatchCrawl = false' in a
+          print('committed v0.9.3 verified')
+          PY
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build committed main
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Verify final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.3-Local-Credential-Auto-Login.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10930'" badging.txt
+          grep -q "versionName='0.9.3'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.3 Local Credential Auto Login'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.3-Local-Credential-Auto-Login.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.3-final
+          path: |
+            Admission-Collector-v0.9.3-Local-Credential-Auto-Login.apk
+            Admission-Collector-v0.9.3-Local-Credential-Auto-Login.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+      - name: Publish v0.9.3 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="v0.9.3 adds explicit opt-in device-local ID/password storage for ADIGA and Jinhak. Credentials are AES-GCM encrypted under a non-exportable Android Keystore key and are never included in collection JSON, runtime diagnostics, Cloudflare, Vercel, or GitHub. A valid session is still reused first. Only when authentication is judged absent does the collector load the provider login page, fill the visible username/password inputs and submit the login form, then capture the refreshed session and resume collection. The startup flow no longer forces a manual login page when no credential is configured; it asks for the local credential once instead. Existing v0.9.2 session bundle, v0.9.1 mission bootstrap recovery and Jinhak safety guards remain. Build/tests/signature verification and an independent committed-main rebuild passed. Real-device auto-login remains to be verified on the Galaxy Tab. Commit: $SHA"
+          gh release create v0.9.3 Admission-Collector-v0.9.3-Local-Credential-Auto-Login.apk Admission-Collector-v0.9.3-Local-Credential-Auto-Login.sha256 --target "$SHA" --title "Admission Collector v0.9.3 — Local Credential Auto Login" --notes "$NOTES"
