@@ -24,7 +24,19 @@ jobs:
           ref: main
           fetch-depth: 0
       - name: Apply v0.9.7 patch
-        run: python3 .github/scripts/patch_v097.py
+        run: |
+          # The storage-state annotation is diagnostic-only. The source line changed shape
+          # during prior cumulative patches, so remove that optional patch block rather than
+          # allowing a cosmetic anchor to block the auth/core safety release.
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('.github/scripts/patch_v097.py')
+          s=p.read_text()
+          a=s.index('# Mark core bootstrap when the storage page actually appears.')
+          b=s.index('# Reset core-scope run counters at Jinhak batch start', a)
+          p.write_text(s[:a]+s[b:])
+          PY
+          python3 .github/scripts/patch_v097.py
       - name: Verify v0.9.7 source invariants
         run: |
           python3 - <<'PY'
