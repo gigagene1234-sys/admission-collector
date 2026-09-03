@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.5 Passive Login Surface Auto Login"
+        android:label="Admission Collector v0.9.6 Auth Resume Fence"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
