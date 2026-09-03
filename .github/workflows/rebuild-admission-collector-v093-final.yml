@@ -1,0 +1,109 @@
+name: Rebuild Admission Collector v0.9.3 Final
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/rebuild-admission-collector-v093-final.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  committed-main-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Verify committed v0.9.3 source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          c=Path('app/src/main/java/com/admissionhub/collector/session/CredentialVault.kt').read_text()
+          s=Path('app/src/main/java/com/admissionhub/collector/session/SecureSessionVault.kt').read_text()
+          a=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          mf=Path('app/src/main/AndroidManifest.xml').read_text()
+          assert 'private const val VERSION = "0.9.3"' in m
+          assert 'private const val BUILD_CODE = 10930' in m
+          assert 'attemptSavedCredentialLogin' in m
+          assert 'showCredentialDialog' in m
+          assert 'credentialVault = CredentialVault(this)' in m
+          assert 'admission_collector_credentials_v1' in c
+          assert 'AES/GCM/NoPadding' in c
+          assert 'admission_secure_session_bundle_v2' in s
+          assert 'normalizedApplicationIdentitySeeds' in m
+          assert 'override val supportsBatchCrawl = false' in a
+          assert 'versionCode = 10930' in g and 'versionName = "0.9.3"' in g
+          assert 'Admission Collector v0.9.3 Local Credential Auto Login' in mf
+          assert 'android:allowBackup="false"' in mf
+          assert '.put("username", credentials.username)' not in m
+          assert '.put("password", credentials.password)' not in m
+          print('committed v0.9.3 source verified')
+          PY
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Test and build committed main
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+      - name: Verify final v0.9.3 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.3-Local-Credential-Auto-Login.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='10930'" badging.txt
+          grep -q "versionName='0.9.3'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.3 Local Credential Auto Login'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.3-Local-Credential-Auto-Login.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.3-final
+          path: |
+            Admission-Collector-v0.9.3-Local-Credential-Auto-Login.apk
+            Admission-Collector-v0.9.3-Local-Credential-Auto-Login.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+      - name: Publish v0.9.3 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="v0.9.3 adds explicit opt-in device-local ID/password storage for ADIGA and Jinhak. Credentials are AES-GCM encrypted with a non-exportable Android Keystore key and never included in collection JSON, runtime diagnostics, Cloudflare, Vercel, or GitHub. A valid session is reused first. Only when authentication is actually absent does the collector open the provider login page, fill visible username/password fields, submit the form, capture the renewed session, and resume collection. The app no longer intentionally forces the login screen when an authenticated session is usable. The developing product now also exposes a website-first live-monitor surface while Android remains the device-local authentication/collection agent. Existing session-bundle, mission-bootstrap, same-card, year and semantic guards remain. This release was built from the current committed main after tests, signature verification, and version verification. Real-device credential auto-login still requires Galaxy Tab E2E verification. Commit: $SHA"
+          if gh release view v0.9.3 >/dev/null 2>&1; then
+            gh release upload v0.9.3 Admission-Collector-v0.9.3-Local-Credential-Auto-Login.apk Admission-Collector-v0.9.3-Local-Credential-Auto-Login.sha256 --clobber
+          else
+            gh release create v0.9.3 Admission-Collector-v0.9.3-Local-Credential-Auto-Login.apk Admission-Collector-v0.9.3-Local-Credential-Auto-Login.sha256 --target "$SHA" --title "Admission Collector v0.9.3 — Local Credential Auto Login" --notes "$NOTES"
+          fi
