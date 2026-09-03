@@ -336,8 +336,8 @@ class MainActivity : Activity() {
         private const val JINHAK_CORE_AUTH_STABLE_PASSES = 2
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.9"
-        private const val BUILD_CODE = 10990
+        private const val VERSION = "0.9.10"
+        private const val BUILD_CODE = 109100
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -692,27 +692,90 @@ class MainActivity : Activity() {
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
                 if (runtimeRendererRecovering) return true
                 runtimeRendererRecovering = true
+
+                val deadView = view ?: webView
+                val parent = deadView.parent as? ViewGroup
+                val childIndex = parent?.indexOfChild(deadView) ?: -1
+                val oldLayoutParams = deadView.layoutParams
+                val wasBatchRunning = batchRunning
+                val wasBatchPausedForLogin = batchPausedForLogin
+                val wasUnifiedRunning = unifiedRunning
+                val resumeUrl = currentBatchTarget?.takeIf { it.isNotBlank() }
+                    ?: runCatching { deadView.url }.getOrNull()?.takeIf { !it.isNullOrBlank() }
+                    ?: when (provider) {
+                        ProviderId.JINHAK -> ProviderId.JINHAK.homeUrl
+                        ProviderId.ADIGA -> ProviderId.ADIGA.homeUrl
+                    }
                 val didCrash = detail?.didCrash() ?: false
+                val webViewPackage = runCatching { WebView.getCurrentWebViewPackage() }.getOrNull()
+
                 recordRuntimeEvent(
                     "webview-renderer-gone",
                     JSONObject()
                         .put("didCrash", didCrash)
                         .put("priorityAtExit", detail?.rendererPriorityAtExit() ?: -1)
-                        .put("batchRunning", batchRunning)
+                        .put("webViewPackage", webViewPackage?.packageName ?: JSONObject.NULL)
+                        .put("webViewVersion", webViewPackage?.versionName ?: JSONObject.NULL)
+                        .put("batchRunning", wasBatchRunning)
+                        .put("batchPausedForLogin", wasBatchPausedForLogin)
+                        .put("unifiedRunning", wasUnifiedRunning)
+                        .put("resumeSafePath", runtimeSafePath(resumeUrl))
+                        .put("recoveryMode", "replace-main-webview-in-place")
                 )
-                localRunId?.let { runId ->
-                    val key = currentBatchTarget?.let { canonicalizeBatchUrl(it) }.orEmpty()
-                    if (key.isNotBlank()) localStore.markDocument(runId, key, "error", 0, "webview-renderer-gone")
-                }
-                persistRuntimeCheckpoint(forceResume = unifiedRunning)
+                // Renderer death is an interrupted render, not a terminal document failure.
+                // Pause browser execution only; keep queue, mission ledger and target state intact.
                 batchRunning = false
                 batchCollecting = false
                 disarmBatchNavigationWatchdog()
-                runCatching {
-                    (view?.parent as? ViewGroup)?.removeView(view)
-                    view?.destroy()
-                }
-                handler.postDelayed({ recreate() }, 250L)
+                persistRuntimeCheckpoint(forceResume = wasUnifiedRunning)
+
+                handler.postDelayed({
+                    val recovery = runCatching {
+                        require(parent != null && childIndex >= 0) { "renderer-parent-unavailable" }
+                        runCatching { parent.removeView(deadView) }
+                        runCatching { deadView.stopLoading() }
+                        runCatching { deadView.destroy() }
+
+                        val replacement = WebView(this@MainActivity)
+                        webView = replacement
+                        parent.addView(replacement, childIndex, oldLayoutParams)
+                        configureWebView()
+
+                        // Restore exactly the pre-crash execution flags after replacing only
+                        // the browser surface. Activity/session/mission objects stay alive.
+                        batchRunning = wasBatchRunning
+                        batchPausedForLogin = wasBatchPausedForLogin
+                        batchCollecting = false
+                        currentBatchTarget = currentBatchTarget?.takeIf { it.isNotBlank() } ?: resumeUrl
+                        runtimeRendererRecovering = false
+                        recordRuntimeEvent(
+                            "webview-renderer-recovered-in-place",
+                            JSONObject()
+                                .put("didCrash", didCrash)
+                                .put("batchRunning", batchRunning)
+                                .put("unifiedRunning", unifiedRunning)
+                                .put("resumeSafePath", runtimeSafePath(resumeUrl))
+                                .put("activityRecreated", false)
+                        )
+                        status.text = "WebView renderer 복구 완료 · 현재 수집 지점에서 재개합니다."
+                        replacement.loadUrl(resumeUrl)
+                    }
+                    recovery.onFailure { error ->
+                        runtimeRendererRecovering = false
+                        batchRunning = false
+                        batchCollecting = false
+                        persistRuntimeCheckpoint(forceResume = wasUnifiedRunning)
+                        recordRuntimeEvent(
+                            "webview-renderer-recovery-failed",
+                            JSONObject()
+                                .put("errorClass", error.javaClass.simpleName.take(80))
+                                .put("resumeSafePath", runtimeSafePath(resumeUrl))
+                                .put("activityRecreated", false),
+                            synchronous = true
+                        )
+                        status.text = "WebView renderer 복구 실패 · 앱 재실행 시 체크포인트에서 복구합니다."
+                    }
+                }, 250L)
                 return true
             }
         }
