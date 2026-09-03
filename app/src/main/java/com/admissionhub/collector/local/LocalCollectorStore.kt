@@ -25,7 +25,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "admission_collector_local_v1.db",
     null,
-    4
+    5
 ) {
     private fun ensureFoundationSchema(db: SQLiteDatabase) {
         // Content-aware captures: same route can expose different data at another time/context.
@@ -137,6 +137,36 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         """.trimIndent())
         db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_adiga_plan_identity ON adiga_plan_tasks(academic_year,university_code,task_type)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_adiga_plan_state ON adiga_plan_tasks(state,updated_at)")
+
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS jinhak_mission_targets(
+              session_id TEXT NOT NULL,
+              target_id TEXT NOT NULL,
+              identity_key TEXT NOT NULL,
+              lane TEXT NOT NULL,
+              state TEXT NOT NULL,
+              state_rank INTEGER NOT NULL,
+              payload_json TEXT NOT NULL,
+              first_persisted_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(session_id,target_id)
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_jinhak_mission_session_state ON jinhak_mission_targets(session_id,state,state_rank)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_jinhak_mission_session_identity ON jinhak_mission_targets(session_id,identity_key,lane)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS jinhak_mission_runtime(
+              session_id TEXT PRIMARY KEY,
+              active_target_id TEXT,
+              current_batch_target TEXT,
+              mission_origin_route TEXT,
+              mission_needs_return INTEGER NOT NULL DEFAULT 0,
+              report_bridge_json TEXT,
+              updated_at TEXT NOT NULL
+            )
+        """.trimIndent())
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -281,6 +311,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_unified_capture_page ON unified_analysis_captures(session_id,provider,page_key)")
         }
         if (oldVersion < 4) {
+            ensureFoundationSchema(db)
+        }
+        if (oldVersion < 5) {
             ensureFoundationSchema(db)
         }
     }
@@ -1169,6 +1202,140 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("documentErrorsByType", documentErrorsByType)
             .put("recordBreakdown", recordBreakdown)
             .put("privacy", "no-dom-no-record-content-no-cookie-no-credential-no-url")
+    }
+
+    private fun jinhakMissionStateRank(state: String): Int = when (state.lowercase()) {
+        "pending" -> 0
+        "clicked" -> 10
+        "deferred" -> 20
+        "failed" -> 30
+        "skipped" -> 40
+        "confirmed" -> 50
+        else -> -1
+    }
+
+    /** Upsert a mission target without ever allowing a lower-ranked state to overwrite progress. */
+    fun upsertJinhakMissionTarget(sessionId: String, payload: JSONObject): Boolean {
+        if (sessionId.isBlank()) return false
+        val targetId = payload.optString("targetId").takeIf { it.isNotBlank() && it != "null" } ?: return false
+        val identityKey = payload.optString("identityKey").takeIf { it.isNotBlank() && it != "null" } ?: return false
+        val lane = payload.optString("lane").takeIf { it.isNotBlank() && it != "reference" && it != "null" } ?: return false
+        val state = payload.optString("state", "pending").lowercase()
+        val rank = jinhakMissionStateRank(state)
+        if (rank < 0) return false
+        val now = Instant.now().toString()
+        val db = writableDatabase
+        db.beginTransaction()
+        return try {
+            val existing = db.rawQuery(
+                "SELECT state_rank,first_persisted_at FROM jinhak_mission_targets WHERE session_id=? AND target_id=? LIMIT 1",
+                arrayOf(sessionId, targetId)
+            ).use { c -> if (c.moveToFirst()) Pair(c.getInt(0), c.getString(1)) else null }
+            if (existing != null && existing.first > rank) {
+                db.setTransactionSuccessful()
+                false
+            } else {
+                val cv = ContentValues().apply {
+                    put("session_id", sessionId)
+                    put("target_id", targetId)
+                    put("identity_key", identityKey)
+                    put("lane", lane)
+                    put("state", state)
+                    put("state_rank", rank)
+                    put("payload_json", payload.toString())
+                    put("first_persisted_at", existing?.second ?: now)
+                    put("updated_at", now)
+                }
+                db.insertWithOnConflict("jinhak_mission_targets", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+                db.setTransactionSuccessful()
+                true
+            }
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun loadJinhakMissionTargets(sessionId: String): List<JSONObject> {
+        if (sessionId.isBlank()) return emptyList()
+        val out = mutableListOf<JSONObject>()
+        readableDatabase.rawQuery(
+            "SELECT payload_json FROM jinhak_mission_targets WHERE session_id=? ORDER BY first_persisted_at,target_id",
+            arrayOf(sessionId)
+        ).use { c ->
+            while (c.moveToNext()) {
+                runCatching { JSONObject(c.getString(0)) }.getOrNull()?.let(out::add)
+            }
+        }
+        return out
+    }
+
+    fun storeJinhakMissionRuntime(sessionId: String, payload: JSONObject) {
+        if (sessionId.isBlank()) return
+        val cv = ContentValues().apply {
+            put("session_id", sessionId)
+            putNullable("active_target_id", payload.optString("activeTargetId").takeIf { it.isNotBlank() && it != "null" })
+            putNullable("current_batch_target", payload.optString("currentBatchTarget").takeIf { it.isNotBlank() && it != "null" })
+            putNullable("mission_origin_route", payload.optString("missionOriginRoute").takeIf { it.isNotBlank() && it != "null" })
+            put("mission_needs_return", if (payload.optBoolean("missionNeedsReturn", false)) 1 else 0)
+            val bridge = payload.optJSONObject("reportBridgeContext")
+            putNullable("report_bridge_json", bridge?.toString())
+            put("updated_at", Instant.now().toString())
+        }
+        writableDatabase.insertWithOnConflict("jinhak_mission_runtime", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun loadJinhakMissionRuntime(sessionId: String): JSONObject? {
+        if (sessionId.isBlank()) return null
+        return readableDatabase.rawQuery(
+            "SELECT active_target_id,current_batch_target,mission_origin_route,mission_needs_return,report_bridge_json,updated_at FROM jinhak_mission_runtime WHERE session_id=? LIMIT 1",
+            arrayOf(sessionId)
+        ).use { c ->
+            if (!c.moveToFirst()) return@use null
+            JSONObject()
+                .put("activeTargetId", if (c.isNull(0)) JSONObject.NULL else c.getString(0))
+                .put("currentBatchTarget", if (c.isNull(1)) JSONObject.NULL else c.getString(1))
+                .put("missionOriginRoute", if (c.isNull(2)) JSONObject.NULL else c.getString(2))
+                .put("missionNeedsReturn", c.getInt(3) != 0)
+                .put("reportBridgeContext", if (c.isNull(4)) JSONObject.NULL else runCatching { JSONObject(c.getString(4)) }.getOrNull() ?: JSONObject.NULL)
+                .put("updatedAt", c.getString(5))
+        }
+    }
+
+    fun jinhakMissionPersistenceSummary(sessionId: String): JSONObject {
+        if (sessionId.isBlank()) return JSONObject().put("persistedTargets", 0).put("persistedIdentities", 0)
+        val db = readableDatabase
+        val counts = db.rawQuery(
+            "SELECT COUNT(*),COUNT(DISTINCT identity_key)," +
+                "SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END)," +
+                "SUM(CASE WHEN state='clicked' THEN 1 ELSE 0 END)," +
+                "SUM(CASE WHEN state='deferred' THEN 1 ELSE 0 END)," +
+                "SUM(CASE WHEN state='confirmed' THEN 1 ELSE 0 END)," +
+                "SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END)," +
+                "SUM(CASE WHEN state='skipped' THEN 1 ELSE 0 END) " +
+                "FROM jinhak_mission_targets WHERE session_id=?",
+            arrayOf(sessionId)
+        ).use { c ->
+            if (!c.moveToFirst()) intArrayOf(0,0,0,0,0,0,0,0)
+            else IntArray(8) { i -> if (c.isNull(i)) 0 else c.getInt(i) }
+        }
+        val runtimePresent = db.rawQuery(
+            "SELECT active_target_id IS NOT NULL FROM jinhak_mission_runtime WHERE session_id=? LIMIT 1",
+            arrayOf(sessionId)
+        ).use { c -> c.moveToFirst() && c.getInt(0) != 0 }
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("persistedTargets", counts[0])
+            .put("persistedIdentities", counts[1])
+            .put("pending", counts[2])
+            .put("clicked", counts[3])
+            .put("deferred", counts[4])
+            .put("confirmed", counts[5])
+            .put("failed", counts[6])
+            .put("skipped", counts[7])
+            .put("activeTargetPersisted", runtimePresent)
+            .put("monotonicStateGuard", true)
+            .put("credentialStored", false)
+            .put("sessionSecretStored", false)
     }
 
     private fun nullableInt(obj: JSONObject, key: String): Int? =

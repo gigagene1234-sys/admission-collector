@@ -52,8 +52,109 @@ class JinhakMissionTargetLedger {
         "strategy"
     )
     private val targets = linkedMapOf<String, Target>()
+    private var mutationListener: ((JSONObject) -> Unit)? = null
+
+    fun setMutationListener(listener: ((JSONObject) -> Unit)?) {
+        mutationListener = listener
+    }
 
     fun clear() = targets.clear()
+
+    /** Restore persisted targets without emitting new persistence callbacks. */
+    fun restorePersisted(payloads: List<JSONObject>): Int {
+        var restored = 0
+        for (payload in payloads) {
+            val incoming = targetFromPersistenceJson(payload) ?: continue
+            val existing = targets[incoming.targetId]
+            if (existing == null) {
+                targets[incoming.targetId] = incoming
+                restored += 1
+                continue
+            }
+            if (stateRank(incoming.state) > stateRank(existing.state)) {
+                existing.state = incoming.state
+                existing.failureReason = incoming.failureReason
+            }
+            existing.attempts = maxOf(existing.attempts, incoming.attempts)
+            if (incoming.updatedAtMs > existing.updatedAtMs) {
+                existing.scanIndex = incoming.scanIndex
+                existing.tag = incoming.tag
+                existing.missionPriority = maxOf(existing.missionPriority, incoming.missionPriority)
+                existing.contextText = incoming.contextText
+                existing.applicationContext = incoming.applicationContext
+                existing.updatedAtMs = incoming.updatedAtMs
+            }
+            restored += 1
+        }
+        return restored
+    }
+
+    fun confirmedCoverage(): Map<String, Set<String>> {
+        val result = linkedMapOf<String, MutableSet<String>>()
+        targets.values.filter { it.state == State.CONFIRMED }.forEach { target ->
+            result.getOrPut(target.identityKey) { linkedSetOf() }.add(target.lane)
+        }
+        return result
+    }
+
+    private fun persistenceJson(target: Target): JSONObject = JSONObject()
+        .put("schemaVersion", 1)
+        .put("targetId", target.targetId)
+        .put("identityKey", target.identityKey)
+        .put("lane", target.lane)
+        .put("label", target.label)
+        .put("kind", target.kind)
+        .put("originRoute", target.originRoute)
+        .put("scanIndex", target.scanIndex)
+        .put("tag", target.tag)
+        .put("missionPriority", target.missionPriority)
+        .put("contextText", target.contextText)
+        .put("applicationContext", target.applicationContext.toJson())
+        .put("state", target.state.name.lowercase())
+        .put("attempts", target.attempts)
+        .put("failureReason", target.failureReason ?: JSONObject.NULL)
+        .put("updatedAtMs", target.updatedAtMs)
+
+    private fun targetFromPersistenceJson(obj: JSONObject): Target? {
+        val targetId = obj.optString("targetId").takeIf { it.isNotBlank() && it != "null" } ?: return null
+        val identityKey = obj.optString("identityKey").takeIf { it.isNotBlank() && it != "null" } ?: return null
+        val lane = obj.optString("lane").takeIf { it.isNotBlank() && it != "reference" && it != "null" } ?: return null
+        val context = JinhakApplicationMission.fromJson(obj.optJSONObject("applicationContext")) ?: return null
+        if (context.identityKey != identityKey) return null
+        val state = runCatching { State.valueOf(obj.optString("state", "pending").uppercase()) }.getOrDefault(State.PENDING)
+        return Target(
+            targetId = targetId,
+            identityKey = identityKey,
+            lane = lane,
+            label = obj.optString("label").take(160),
+            kind = obj.optString("kind").take(80),
+            originRoute = obj.optString("originRoute").take(1200),
+            scanIndex = obj.optInt("scanIndex", -1),
+            tag = obj.optString("tag").take(80),
+            missionPriority = obj.optInt("missionPriority", 180),
+            contextText = obj.optString("contextText").take(6000),
+            applicationContext = context,
+            state = state,
+            attempts = obj.optInt("attempts", 0).coerceAtLeast(0),
+            failureReason = obj.optString("failureReason").takeIf { it.isNotBlank() && it != "null" }?.take(100),
+            updatedAtMs = obj.optLong("updatedAtMs", System.currentTimeMillis())
+        )
+    }
+
+    private fun stateRank(state: State): Int = when (state) {
+        State.PENDING -> 0
+        State.CLICKED -> 10
+        State.DEFERRED -> 20
+        State.FAILED -> 30
+        State.SKIPPED -> 40
+        State.CONFIRMED -> 50
+    }
+
+    private fun canTransition(from: State, to: State): Boolean = stateRank(to) >= stateRank(from)
+
+    private fun notifyMutation(target: Target) {
+        mutationListener?.invoke(persistenceJson(target))
+    }
 
     /** Capture every safe application-bound report target currently visible before navigation. */
     fun capture(originRoute: String, candidates: List<JinhakAgentNavigator.Candidate>, pageType: String = ""): Int {
@@ -92,6 +193,7 @@ class JinhakMissionTargetLedger {
                 existing.updatedAtMs = System.currentTimeMillis()
             }
         }
+        targets.values.forEach(::notifyMutation)
         return added
     }
 
@@ -121,6 +223,7 @@ class JinhakMissionTargetLedger {
             it.state = State.SKIPPED
             it.failureReason = "lane-already-covered"
             it.updatedAtMs = System.currentTimeMillis()
+            notifyMutation(it)
         }
     }
 
@@ -148,30 +251,37 @@ class JinhakMissionTargetLedger {
         val target = targetId?.let { targets[it] } ?: return false
         target.attempts += 1
         target.updatedAtMs = System.currentTimeMillis()
+        notifyMutation(target)
         return true
     }
 
     fun markClicked(targetId: String?): Boolean {
         val target = targetId?.let { targets[it] } ?: return false
+        if (!canTransition(target.state, State.CLICKED)) return false
         target.state = State.CLICKED
         target.failureReason = null
         target.updatedAtMs = System.currentTimeMillis()
+        notifyMutation(target)
         return true
     }
 
     fun markDeferred(targetId: String?): Boolean {
         val target = targetId?.let { targets[it] } ?: return false
+        if (!canTransition(target.state, State.DEFERRED)) return false
         target.state = State.DEFERRED
         target.updatedAtMs = System.currentTimeMillis()
+        notifyMutation(target)
         return true
     }
 
     fun markConfirmed(targetId: String?, identityKey: String?, lane: String): Boolean {
         val target = targetId?.let { targets[it] } ?: return false
         if (identityKey.isNullOrBlank() || target.identityKey != identityKey || lane == "reference" || target.lane != lane) return false
+        if (!canTransition(target.state, State.CONFIRMED)) return false
         target.state = State.CONFIRMED
         target.failureReason = null
         target.updatedAtMs = System.currentTimeMillis()
+        notifyMutation(target)
         // One confirmed lane is sufficient. Keep alternate same-lane entry points as evidence but
         // do not click them after the report has already been proven for this application.
         targets.values.filter {
@@ -180,15 +290,18 @@ class JinhakMissionTargetLedger {
             it.state = State.SKIPPED
             it.failureReason = "lane-confirmed-by-alternate-target"
             it.updatedAtMs = System.currentTimeMillis()
+            notifyMutation(it)
         }
         return true
     }
 
     fun markFailed(targetId: String?, reason: String): Boolean {
         val target = targetId?.let { targets[it] } ?: return false
+        if (!canTransition(target.state, State.FAILED)) return false
         target.state = State.FAILED
         target.failureReason = reason.take(100)
         target.updatedAtMs = System.currentTimeMillis()
+        notifyMutation(target)
         return true
     }
 
@@ -197,6 +310,7 @@ class JinhakMissionTargetLedger {
             it.state = State.FAILED
             it.failureReason = reason.take(100)
             it.updatedAtMs = System.currentTimeMillis()
+            notifyMutation(it)
         }
     }
 
@@ -209,6 +323,7 @@ class JinhakMissionTargetLedger {
             it.state = State.FAILED
             it.failureReason = reason.take(100)
             it.updatedAtMs = System.currentTimeMillis()
+            notifyMutation(it)
         }
         return stranded.size
     }

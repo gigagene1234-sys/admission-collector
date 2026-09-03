@@ -336,8 +336,8 @@ class MainActivity : Activity() {
         private const val JINHAK_CORE_AUTH_STABLE_PASSES = 2
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.10"
-        private const val BUILD_CODE = 109100
+        private const val VERSION = "0.9.11"
+        private const val BUILD_CODE = 109110
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -347,6 +347,7 @@ class MainActivity : Activity() {
         installRuntimeCrashGuard()
         cloudOffload = CloudOffloadCoordinator(this)
         localStore = LocalCollectorStore(this)
+        jinhakMissionTargetLedger.setMutationListener { payload -> persistJinhakMissionMutation(payload) }
         sessionVault = SecureSessionVault(this)
         credentialVault = CredentialVault(this)
         buildUi()
@@ -1043,6 +1044,66 @@ class MainActivity : Activity() {
                 .putInt("errorCount", batchErrors.length())
                 .apply()
         }
+        if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
+            persistJinhakMissionRuntimeState("runtime-checkpoint")
+        }
+    }
+
+    private fun persistJinhakMissionMutation(payload: JSONObject) {
+        val sessionId = unifiedSessionId?.takeIf { unifiedRunning && unifiedPhase == "jinhak" } ?: return
+        localStore.upsertJinhakMissionTarget(sessionId, payload)
+        persistJinhakMissionRuntimeState("target-mutation", payload)
+    }
+
+    private fun persistJinhakMissionRuntimeState(trigger: String, mutatedTarget: JSONObject? = null) {
+        val sessionId = unifiedSessionId?.takeIf { unifiedRunning && unifiedPhase == "jinhak" } ?: return
+        val mutatedId = mutatedTarget?.optString("targetId").orEmpty()
+        val mutatedState = mutatedTarget?.optString("state").orEmpty()
+        val terminalMutation = mutatedId.isNotBlank() && mutatedId == jinhakActiveMissionTargetId &&
+            mutatedState in setOf("confirmed", "failed", "skipped")
+        val activeTarget = if (terminalMutation) null else jinhakActiveMissionTargetId
+        localStore.storeJinhakMissionRuntime(
+            sessionId,
+            JSONObject()
+                .put("activeTargetId", activeTarget ?: JSONObject.NULL)
+                .put("currentBatchTarget", currentBatchTarget ?: JSONObject.NULL)
+                .put("missionOriginRoute", if (jinhakMissionOriginRoute.isBlank()) JSONObject.NULL else jinhakMissionOriginRoute)
+                .put("missionNeedsReturn", jinhakMissionNeedsReturn)
+                .put("reportBridgeContext", jinhakReportBridgeContext?.let { JSONObject(it.toString()) } ?: JSONObject.NULL)
+                .put("trigger", trigger.take(60))
+                .put("updatedAtMs", System.currentTimeMillis())
+        )
+    }
+
+    private fun restoreJinhakMissionPersistence(sessionId: String, trigger: String): Int {
+        if (sessionId.isBlank()) return 0
+        val persistedTargets = localStore.loadJinhakMissionTargets(sessionId)
+        val restored = jinhakMissionTargetLedger.restorePersisted(persistedTargets)
+        if (restored > 0) {
+            jinhakMissionCoverage.clear()
+            jinhakMissionTargetLedger.confirmedCoverage().forEach { (identity, lanes) ->
+                jinhakMissionCoverage.getOrPut(identity) { linkedSetOf() }.addAll(lanes)
+            }
+        }
+        localStore.loadJinhakMissionRuntime(sessionId)?.let { runtime ->
+            jinhakActiveMissionTargetId = runtime.optString("activeTargetId").takeIf { it.isNotBlank() && it != "null" }
+            currentBatchTarget = runtime.optString("currentBatchTarget").takeIf { it.isNotBlank() && it != "null" } ?: currentBatchTarget
+            jinhakMissionOriginRoute = runtime.optString("missionOriginRoute").takeIf { it.isNotBlank() && it != "null" }.orEmpty()
+            jinhakMissionNeedsReturn = runtime.optBoolean("missionNeedsReturn", false)
+            jinhakReportBridgeContext = runtime.optJSONObject("reportBridgeContext")
+            jinhakMissionContext = JinhakReportContextBridge.context(jinhakReportBridgeContext)
+        }
+        if (restored > 0) {
+            recordRuntimeEvent(
+                "jinhak-mission-persistence-restored",
+                JSONObject()
+                    .put("trigger", trigger.take(60))
+                    .put("restoredTargets", restored)
+                    .put("summary", localStore.jinhakMissionPersistenceSummary(sessionId))
+                    .put("stateRegressionAllowed", false)
+            )
+        }
+        return restored
     }
 
     private fun recordRuntimeEvent(type: String, detail: JSONObject = JSONObject(), synchronous: Boolean = false) {
@@ -1167,9 +1228,10 @@ class MainActivity : Activity() {
             unifiedPendingAdigaStart = false
             unifiedPendingJinhakStart = true
             unifiedJinhakAutoCapture = false
+            val restoredMissionTargets = restoreJinhakMissionPersistence(sessionId, "activity-resume")
             val lease = runCatching { sessionVault.restore(ProviderId.JINHAK.wireName) }.getOrNull()
             status.text = if (lease?.restored == true) {
-                "이전 중단 감지: 암호화 로그인 세션을 복구하고 진학사 에이전트를 체크포인트에서 재개합니다."
+                "이전 중단 감지: 암호화 로그인 세션과 mission ${restoredMissionTargets}개를 복구하고 진학사 에이전트를 체크포인트에서 재개합니다."
             } else {
                 "이전 중단 감지: 저장된 브라우저 세션을 검증한 뒤 진학사 에이전트를 재개합니다."
             }
@@ -2247,7 +2309,11 @@ class MainActivity : Activity() {
             Toast.makeText(this, "로그인 준비가 끝난 뒤 수집이 자동 시작됩니다.", Toast.LENGTH_SHORT).show()
             return
         }
-        val preserveJinhakMissionState = provider == ProviderId.JINHAK && unifiedRunning && jinhakBatchStartCount > 0
+        val restoredPersistedMissionTargets = if (provider == ProviderId.JINHAK && unifiedRunning) {
+            unifiedSessionId?.let { restoreJinhakMissionPersistence(it, "batch-start") } ?: 0
+        } else 0
+        val preserveJinhakMissionState = provider == ProviderId.JINHAK && unifiedRunning &&
+            (jinhakBatchStartCount > 0 || restoredPersistedMissionTargets > 0)
         if (provider == ProviderId.JINHAK) {
             jinhakBatchStartCount += 1
             recordRuntimeEvent("jinhak-batch-start", JSONObject()
@@ -2395,7 +2461,12 @@ class MainActivity : Activity() {
         jinhakAbsoluteTargetKey = ""
         ++jinhakAbsoluteTargetGeneration
         disarmBatchNavigationWatchdog()
-        currentBatchTarget = if (provider == ProviderId.JINHAK) {
+        if (preserveJinhakMissionState && provider == ProviderId.JINHAK) {
+            unifiedSessionId?.let { restoreJinhakMissionPersistence(it, "post-batch-reset") }
+        }
+        currentBatchTarget = if (provider == ProviderId.JINHAK && preserveJinhakMissionState && !currentBatchTarget.isNullOrBlank()) {
+            currentBatchTarget
+        } else if (provider == ProviderId.JINHAK) {
             canonicalizeBatchUrl(currentAdapter().seedUrls().firstOrNull() ?: url)
         } else canonicalizeBatchUrl(url)
         batchButton.text = "일괄 수집 중지"
@@ -2568,6 +2639,7 @@ class MainActivity : Activity() {
                 .put("missionTargetLedger", jinhakMissionTargetLedger.summary())
                 .put("missionTargetLedgerPending", jinhakMissionTargetLedger.pendingCount())
                 .put("missionTargetLedgerOutstanding", jinhakMissionTargetLedger.outstandingCount())
+                .put("missionPersistence", localStore.jinhakMissionPersistenceSummary(sessionId))
                 .put("referenceRoutesTracked", jinhakReferenceRouteCaptureCounts.size)
                 .put("referenceRepeatSkips", jinhakReferenceRepeatSkips)
                 .put("noProgressFences", jinhakNoProgressFences)
