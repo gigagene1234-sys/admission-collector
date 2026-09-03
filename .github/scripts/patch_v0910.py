@@ -70,7 +70,8 @@ new_block = '''            override fun onRenderProcessGone(view: WebView?, deta
                         .put("recoveryMode", "replace-main-webview-in-place")
                 )
                 // Renderer death is an interrupted render, not a terminal document failure.
-                // Keep the current target and all in-memory mission state intact.
+                // Pause browser execution only; keep queue, mission ledger and target state intact.
+                batchRunning = false
                 batchCollecting = false
                 disarmBatchNavigationWatchdog()
                 persistRuntimeCheckpoint(forceResume = wasUnifiedRunning)
@@ -87,8 +88,8 @@ new_block = '''            override fun onRenderProcessGone(view: WebView?, deta
                         parent.addView(replacement, childIndex, oldLayoutParams)
                         configureWebView()
 
-                        // configureWebView creates only a new browser surface. Restore the
-                        // runtime flags that were already authoritative before renderer death.
+                        // Restore exactly the pre-crash execution flags after replacing only
+                        // the browser surface. Activity/session/mission objects stay alive.
                         batchRunning = wasBatchRunning
                         batchPausedForLogin = wasBatchPausedForLogin
                         batchCollecting = false
