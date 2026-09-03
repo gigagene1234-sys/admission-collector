@@ -271,8 +271,8 @@ class MainActivity : Activity() {
         private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.3"
-        private const val BUILD_CODE = 10930
+        private const val VERSION = "0.9.4"
+        private const val BUILD_CODE = 10940
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -367,8 +367,22 @@ class MainActivity : Activity() {
             text = "계정 자동로그인 설정"
             setOnClickListener { showCredentialDialog(provider, continueAfterSave = false) }
         }
+        val liveWebButton = Button(this).apply {
+            text = "Live 웹"
+            setOnClickListener {
+                val target = cloudOffload.liveDashboardUrl()
+                if (target == null) {
+                    Toast.makeText(this@MainActivity, "Cloudflare 수집 토큰을 먼저 한 번 설정해주세요.", Toast.LENGTH_LONG).show()
+                    cloudOffload.showSettingsDialog(this@MainActivity)
+                } else {
+                    runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(target))) }
+                        .onFailure { Toast.makeText(this@MainActivity, "웹 대시보드를 열 수 없습니다.", Toast.LENGTH_LONG).show() }
+                }
+            }
+        }
         sessionRow.addView(sessionState, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         sessionRow.addView(sessionButton)
+        sessionRow.addView(liveWebButton)
 
         val actions1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1168,7 +1182,8 @@ class MainActivity : Activity() {
                 .put("trigger", startupLoginTrigger)
                 .put("adigaRestored", true)
                 .put("jinhakRestored", true)
-                .put("passwordStored", false)
+                .put("credentialStoredLocally", credentialVault.has(ProviderId.ADIGA.wireName) || credentialVault.has(ProviderId.JINHAK.wireName))
+                .put("credentialExported", false)
                 .put("sessionSecretStoredLocally", true)
                 .put("sessionSecretExported", false))
             handler.postDelayed({
@@ -1249,6 +1264,14 @@ class MainActivity : Activity() {
             if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@checkSessionState
             if (authenticated) {
                 onStartupProviderAuthenticated(expectedProvider, generation)
+                return@checkSessionState
+            }
+            // v0.9.4: an indeterminate DOM/auth check must never be treated as logout.
+            // Preserve the user's current page unless the adapter explicitly sees a login-required state.
+            if (!needsLogin) {
+                sessionState.text = "△ ${expectedProvider.displayName} 로그인 상태 확인 중 · 현재 화면 유지"
+                status.text = "${expectedProvider.displayName} 로그인 여부가 아직 확정되지 않았습니다. 현재 화면을 유지하고 다시 확인합니다. 로그인 필요가 명시적으로 감지될 때만 자동 로그인합니다."
+                scheduleStartupLoginPoll(expectedProvider, generation)
                 return@checkSessionState
             }
             if (credentialVault.has(expectedProvider.wireName)) {
@@ -1357,7 +1380,7 @@ class MainActivity : Activity() {
         if (currentUrl.isNotBlank()) runCatching { sessionVault.captureAuthenticated(expectedProvider.wireName, currentUrl, VERSION) }
         recordRuntimeEvent("startup-login-provider-authenticated", JSONObject()
             .put("provider", expectedProvider.wireName)
-            .put("passwordStored", false).put("sessionSecretStoredLocally", true).put("sessionSecretExported", false))
+            .put("credentialStoredLocally", credentialVault.has(expectedProvider.wireName)).put("credentialExported", false).put("sessionSecretStoredLocally", true).put("sessionSecretExported", false))
         if (expectedProvider == ProviderId.ADIGA) {
             sessionState.text = "● 어디가 로그인 확인 완료"
             status.text = "자동 준비 1/3 완료 · 진학사 로그인 확인으로 이동합니다."
@@ -1376,7 +1399,7 @@ class MainActivity : Activity() {
             recordRuntimeEvent("startup-login-sequence-verified", JSONObject()
                 .put("trigger", startupLoginTrigger)
                 .put("bothProvidersAuthenticated", true)
-                .put("passwordStored", false).put("sessionSecretStoredLocally", true).put("sessionSecretExported", false))
+                .put("credentialStoredLocally", credentialVault.has(expectedProvider.wireName)).put("credentialExported", false).put("sessionSecretStoredLocally", true).put("sessionSecretExported", false))
             handler.postDelayed({
                 if (!unifiedRunning && !batchRunning && startupLoginPreflightVerified) {
                     startUnifiedCollectionAuthenticated()

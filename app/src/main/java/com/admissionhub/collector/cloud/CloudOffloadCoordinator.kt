@@ -3,6 +3,7 @@ package com.admissionhub.collector.cloud
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
+import android.net.Uri
 import android.text.InputType
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -366,6 +367,12 @@ class CloudOffloadCoordinator(context: Context) {
                 } else upload(runId)
             }
         }
+    }
+
+    fun liveDashboardUrl(baseUrl: String = "https://admission-collector-live.vercel.app"): String? {
+        val secret = token().trim()
+        if (secret.isBlank()) return null
+        return baseUrl.trimEnd('/') + "/#token=" + Uri.encode(secret)
     }
 
     fun snapshotStatus(): JSONObject = JSONObject()
