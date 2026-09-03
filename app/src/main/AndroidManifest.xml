@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.1 Mission Bootstrap Recovery"
+        android:label="Admission Collector v0.9.2 Persistent Session Bundle"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

@@ -233,6 +233,7 @@ class MainActivity : Activity() {
     private var startupLoginJinhakAuthenticated = false
     private var startupLoginUiOpenCount = 0
     private var startupLoginVerifiedAtMs = 0L
+    private var startupSessionPreflightBypassed = false
     private var jinhakBatchStartCount = 0
     private val jinhakNormalizedMissionSeedContexts = linkedMapOf<String, JinhakApplicationMission.Context>()
     private val jinhakNormalizedIdentitySeedKeys = linkedSetOf<String>()
@@ -262,8 +263,8 @@ class MainActivity : Activity() {
         private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.1"
-        private const val BUILD_CODE = 10910
+        private const val VERSION = "0.9.2"
+        private const val BUILD_CODE = 10920
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -354,7 +355,7 @@ class MainActivity : Activity() {
             setPadding(8, 8, 8, 8)
         }
         val sessionButton = Button(this).apply {
-            text = "세션 확인/갱신"
+            text = "로그인 세션 저장/갱신"
             setOnClickListener { refreshSessionOrOpenLogin() }
         }
         sessionRow.addView(sessionState, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -991,6 +992,41 @@ class MainActivity : Activity() {
         startupLoginJinhakAuthenticated = false
         startupLoginUiOpenCount = 0
         startupLoginVerifiedAtMs = 0L
+        startupSessionPreflightBypassed = false
+
+        // v0.9.2: restore the encrypted provider session bundles first. When both are
+        // present, do not navigate through the login-preflight UI at all. Server-side
+        // expiry is still handled by the existing batch login-pause/recovery path.
+        val storedAdiga = runCatching { sessionVault.restore(ProviderId.ADIGA.wireName) }.getOrNull()
+        val storedJinhak = runCatching { sessionVault.restore(ProviderId.JINHAK.wireName) }.getOrNull()
+        startupLoginAdigaRestoredLease = storedAdiga?.restored == true
+        startupLoginJinhakRestoredLease = storedJinhak?.restored == true
+        if (startupLoginAdigaRestoredLease && startupLoginJinhakRestoredLease) {
+            CookieManager.getInstance().flush()
+            startupSessionPreflightBypassed = true
+            startupLoginPreflightActive = false
+            startupLoginPreflightVerified = true
+            startupLoginStage = "stored-session-direct"
+            startupLoginVerifiedAtMs = System.currentTimeMillis()
+            startupLoginPollGeneration += 1
+            unifiedButton.text = "통합 수집 시작 중"
+            sessionState.text = "● 암호화 로그인 세션 복원 완료"
+            status.text = "저장된 어디가·진학사 로그인 세션을 복원했습니다. 로그인 사전검사를 건너뛰고 통합 수집을 시작합니다."
+            recordRuntimeEvent("startup-stored-session-direct", JSONObject()
+                .put("trigger", startupLoginTrigger)
+                .put("adigaRestored", true)
+                .put("jinhakRestored", true)
+                .put("passwordStored", false)
+                .put("sessionSecretStoredLocally", true)
+                .put("sessionSecretExported", false))
+            handler.postDelayed({
+                if (!unifiedRunning && !batchRunning && startupSessionPreflightBypassed) {
+                    startUnifiedCollectionAuthenticated()
+                }
+            }, 300L)
+            return
+        }
+
         startupLoginPollGeneration += 1
         unifiedButton.text = "자동 로그인 취소"
         recordRuntimeEvent("startup-login-sequence-start", JSONObject()
@@ -1147,7 +1183,7 @@ class MainActivity : Activity() {
         if (currentUrl.isNotBlank()) runCatching { sessionVault.captureAuthenticated(expectedProvider.wireName, currentUrl, VERSION) }
         recordRuntimeEvent("startup-login-provider-authenticated", JSONObject()
             .put("provider", expectedProvider.wireName)
-            .put("credentialStored", false))
+            .put("passwordStored", false).put("sessionSecretStoredLocally", true).put("sessionSecretExported", false))
         if (expectedProvider == ProviderId.ADIGA) {
             sessionState.text = "● 어디가 로그인 확인 완료"
             status.text = "자동 준비 1/3 완료 · 진학사 로그인 확인으로 이동합니다."
@@ -1166,7 +1202,7 @@ class MainActivity : Activity() {
             recordRuntimeEvent("startup-login-sequence-verified", JSONObject()
                 .put("trigger", startupLoginTrigger)
                 .put("bothProvidersAuthenticated", true)
-                .put("credentialStored", false))
+                .put("passwordStored", false).put("sessionSecretStoredLocally", true).put("sessionSecretExported", false))
             handler.postDelayed({
                 if (!unifiedRunning && !batchRunning && startupLoginPreflightVerified) {
                     startUnifiedCollectionAuthenticated()
@@ -1204,14 +1240,18 @@ class MainActivity : Activity() {
             JSONObject()
                 .put("collectorVersion", VERSION)
                 .put("loginPreflight", JSONObject()
-                    .put("verified", startupLoginPreflightVerified)
+                    .put("verified", startupLoginAdigaAuthenticated && startupLoginJinhakAuthenticated)
+                    .put("collectionBootstrapReady", startupLoginPreflightVerified)
+                    .put("bypassedByStoredSession", startupSessionPreflightBypassed)
                     .put("adigaAuthenticated", startupLoginAdigaAuthenticated)
                     .put("jinhakAuthenticated", startupLoginJinhakAuthenticated)
                     .put("adigaRestoredLease", startupLoginAdigaRestoredLease)
                     .put("jinhakRestoredLease", startupLoginJinhakRestoredLease)
                     .put("loginUiOpenCount", startupLoginUiOpenCount)
                     .put("verifiedAtMs", startupLoginVerifiedAtMs)
-                    .put("credentialStored", false)),
+                    .put("passwordStored", false)
+                    .put("sessionSecretStoredLocally", startupLoginAdigaRestoredLease || startupLoginJinhakRestoredLease)
+                    .put("sessionSecretExported", false)),
             false
         )
         localStore.recordSyncState(sessionId, UnifiedSyncState.ADIGA_PUBLIC_SYNC.name, ProviderId.ADIGA.wireName, JSONObject().put("mode", "legacy-local-first-until-deterministic-planner-activation"), false)
