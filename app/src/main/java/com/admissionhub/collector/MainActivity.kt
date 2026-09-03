@@ -257,6 +257,14 @@ class MainActivity : Activity() {
     private var credentialAutoLoginLastAtMs = 0L
     private var batchRenderedLoginSurfacePauses = 0
     private var crossVersionResumeBlocks = 0
+    private var staleSessionLeaseBypassesPrevented = 0
+    private var loginRouteFallbackPauses = 0
+    private var loginRouteFallbackCredentialPrompts = 0
+    private var jinhakCoreScopeBlockedUrls = 0
+    private val jinhakCoreScopeBlockedLaneCounts = linkedMapOf<String, Int>()
+    private var jinhakAuthVerifiedForBatch = false
+    private var jinhakCoreBootstrapState = "idle"
+    private var startupJinhakProtectedProbeAttempted = false
     private var startupAuthIndeterminatePolls = 0
     private var jinhakBatchStartCount = 0
     private val jinhakNormalizedMissionSeedContexts = linkedMapOf<String, JinhakApplicationMission.Context>()
@@ -287,8 +295,8 @@ class MainActivity : Activity() {
         private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.6"
-        private const val BUILD_CODE = 10960
+        private const val VERSION = "0.9.7"
+        private const val BUILD_CODE = 10970
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1342,6 +1350,22 @@ class MainActivity : Activity() {
         startupLoginUiOpenCount = 0
         startupLoginVerifiedAtMs = 0L
         startupSessionPreflightBypassed = false
+        startupCredentialPromptedProvider = null
+        credentialLoginSurfaceKey = ""
+        credentialLoginSurfaceAttempts = 0
+        credentialAwaitingLoginExitProvider = null
+        credentialLoginSurfaceDetections = 0
+        credentialAutoLoginSubmissions = 0
+        credentialAutoLoginSuccesses = 0
+        credentialAutoLoginFailures = 0
+        credentialAutoLoginLastResult = ""
+        credentialAutoLoginLastProvider = ""
+        credentialAutoLoginLastAtMs = 0L
+        loginRouteFallbackPauses = 0
+        loginRouteFallbackCredentialPrompts = 0
+        jinhakAuthVerifiedForBatch = false
+        jinhakCoreBootstrapState = "auth-preflight"
+        startupJinhakProtectedProbeAttempted = false
 
         // v0.9.2: restore the encrypted provider session bundles first. When both are
         // present, do not navigate through the login-preflight UI at all. Server-side
@@ -1352,29 +1376,20 @@ class MainActivity : Activity() {
         startupLoginJinhakRestoredLease = storedJinhak?.restored == true
         if (startupLoginAdigaRestoredLease && startupLoginJinhakRestoredLease) {
             CookieManager.getInstance().flush()
-            startupSessionPreflightBypassed = true
-            startupLoginPreflightActive = false
-            startupLoginPreflightVerified = true
-            startupLoginStage = "stored-session-direct"
-            startupLoginVerifiedAtMs = System.currentTimeMillis()
-            startupLoginPollGeneration += 1
-            unifiedButton.text = "통합 수집 시작 중"
-            sessionState.text = "● 암호화 로그인 세션 복원 완료"
-            status.text = "저장된 어디가·진학사 로그인 세션을 복원했습니다. 로그인 사전검사를 건너뛰고 통합 수집을 시작합니다."
-            recordRuntimeEvent("startup-stored-session-direct", JSONObject()
+            staleSessionLeaseBypassesPrevented += 1
+            startupSessionPreflightBypassed = false
+            startupLoginStage = "stored-session-verification-required"
+            sessionState.text = "△ 암호화 세션 복원 · 서버 인증 재검증 필요"
+            status.text = "저장된 세션은 복원했지만 인증 성공으로 간주하지 않습니다. 보호 경로에서 실제 인증 상태를 확인합니다."
+            recordRuntimeEvent("startup-stored-session-verification-required", JSONObject()
                 .put("trigger", startupLoginTrigger)
                 .put("adigaRestored", true)
                 .put("jinhakRestored", true)
+                .put("bypassPrevented", true)
                 .put("credentialStoredLocally", credentialVault.has(ProviderId.ADIGA.wireName) || credentialVault.has(ProviderId.JINHAK.wireName))
                 .put("credentialExported", false)
                 .put("sessionSecretStoredLocally", true)
                 .put("sessionSecretExported", false))
-            handler.postDelayed({
-                if (!unifiedRunning && !batchRunning && startupSessionPreflightBypassed) {
-                    startUnifiedCollectionAuthenticated()
-                }
-            }, 300L)
-            return
         }
 
         startupLoginPollGeneration += 1
@@ -1420,9 +1435,9 @@ class MainActivity : Activity() {
             "○ ${which.displayName} 로그인 확인 중"
         }
         status.text = if (which == ProviderId.ADIGA) {
-            "자동 준비 1/3 · 어디가 로그인 세션을 확인합니다. 만료 시 로그인 화면을 자동으로 엽니다."
+            "자동 준비 1/3 · 어디가 세션을 확인합니다. 저장 세션은 서버 응답으로 다시 검증합니다."
         } else {
-            "자동 준비 2/3 · 진학사 로그인 세션을 확인합니다. 만료 시 로그인 화면을 자동으로 엽니다."
+            "자동 준비 2/3 · 진학사 로그인 상태를 확인하고 필요하면 수시저장소 보호 경로로 검증합니다."
         }
         recordRuntimeEvent("startup-login-provider-begin", JSONObject()
             .put("provider", which.wireName)
@@ -1467,30 +1482,85 @@ class MainActivity : Activity() {
                     return@probeLoginSurface
                 }
 
-                // No rendered login surface: never navigate to login just because the auth
-                // classifier is uncertain. After two stable probes, continue bootstrap and
-                // let protected pages naturally redirect; the global surface detector then logs in.
+                // v0.9.7: an indeterminate home page is never enough to approve the Jinhak
+                // collection bootstrap. Verify a protected, read-only Susi route. If that
+                // route redirects to login, keep the browser there and wait for credentials or
+                // manual login; never advance the crawl and never mark the protected target failed.
                 startupAuthIndeterminatePolls += 1
-                if (!needsLogin && startupAuthIndeterminatePolls >= 2) {
-                    recordRuntimeEvent("startup-login-provider-deferred", JSONObject()
-                        .put("provider", expectedProvider.wireName)
-                        .put("reason", "no-rendered-login-surface")
-                        .put("forcedNavigation", false))
-                    startupLoginPollGeneration += 1
-                    startupLoginOpenAttempted = false
-                    if (expectedProvider == ProviderId.ADIGA) {
-                        sessionState.text = "△ 어디가 로그인 화면 없음 · 현재 화면 유지"
-                        status.text = "어디가 로그인 화면을 강제로 열지 않고 진학사 확인으로 넘어갑니다. 보호 페이지에서 로그인 화면이 나타나면 자동 로그인합니다."
-                        handler.postDelayed({ if (startupLoginPreflightActive) beginStartupLoginProvider(ProviderId.JINHAK) }, 200L)
-                    } else {
-                        sessionState.text = "△ 진학사 로그인 화면 없음 · 수집 중 감지 대기"
-                        startupLoginPreflightActive = false
-                        startupLoginPreflightVerified = true
-                        startupLoginStage = "passive-login-surface-ready"
-                        status.text = "로그인 화면 강제 이동 없이 통합 수집을 시작합니다. 수집 중 로그인 화면이 감지되는 즉시 자동 로그인합니다."
-                        handler.postDelayed({ if (!unifiedRunning && !batchRunning) startUnifiedCollectionAuthenticated() }, 250L)
+                if (startupAuthIndeterminatePolls >= 2) {
+                    val currentUrl = webView.url.orEmpty()
+                    if (isProviderLoginUrl(expectedProvider, currentUrl)) {
+                        loginRouteFallbackPauses += 1
+                        if (expectedProvider == ProviderId.JINHAK) {
+                            jinhakAuthVerifiedForBatch = false
+                            jinhakCoreBootstrapState = "login-route-wait"
+                        }
+                        recordRuntimeEvent("startup-login-route-wait", JSONObject()
+                            .put("provider", expectedProvider.wireName)
+                            .put("safePath", runtimeSafePath(currentUrl))
+                            .put("renderedSurfaceDetected", false)
+                            .put("proactiveLoginNavigation", false))
+                        sessionState.text = "○ ${expectedProvider.displayName} 로그인 경로 감지 · 인증 대기"
+                        if (credentialVault.has(expectedProvider.wireName)) {
+                            status.text = "로그인 경로가 확인되었습니다. 현재 화면을 유지하며 저장 계정 자동입력용 로그인 폼 렌더링을 기다립니다."
+                            scheduleLoginSurfaceDetection(expectedProvider, "startup-login-route-fallback")
+                        } else if (startupCredentialPromptedProvider != expectedProvider) {
+                            startupCredentialPromptedProvider = expectedProvider
+                            loginRouteFallbackCredentialPrompts += 1
+                            status.text = "로그인이 필요합니다. 이 기기에만 암호화 저장할 자동로그인 정보를 입력해주세요."
+                            showCredentialDialog(expectedProvider, continueAfterSave = true)
+                        }
+                        scheduleStartupLoginPoll(expectedProvider, generation)
+                        return@probeLoginSurface
                     }
-                    return@probeLoginSurface
+
+                    if (expectedProvider == ProviderId.ADIGA) {
+                        recordRuntimeEvent("startup-login-provider-deferred", JSONObject()
+                            .put("provider", expectedProvider.wireName)
+                            .put("reason", "public-baseline-no-login-surface")
+                            .put("forcedNavigation", false))
+                        startupLoginPollGeneration += 1
+                        startupLoginOpenAttempted = false
+                        sessionState.text = "△ 어디가 로그인 미확정 · 공개 기준자료 수집은 가능"
+                        status.text = "어디가는 공개 기준자료 수집을 유지하고, 진학사 보호 경로 인증 검증으로 넘어갑니다."
+                        handler.postDelayed({ if (startupLoginPreflightActive) beginStartupLoginProvider(ProviderId.JINHAK) }, 200L)
+                        return@probeLoginSurface
+                    }
+
+                    val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
+                    val currentCanonical = canonicalizeBatchUrl(currentUrl)
+                    val probeCanonical = canonicalizeBatchUrl(coreProbe)
+                    if (startupJinhakProtectedProbeAttempted && probeCanonical.isNotBlank() && currentCanonical == probeCanonical && !needsLogin) {
+                        jinhakAuthVerifiedForBatch = true
+                        jinhakCoreBootstrapState = "protected-route-authenticated"
+                        recordRuntimeEvent("jinhak-protected-auth-probe-success", JSONObject()
+                            .put("safePath", runtimeSafePath(currentUrl))
+                            .put("loginUrl", false))
+                        onStartupProviderAuthenticated(expectedProvider, generation)
+                        return@probeLoginSurface
+                    }
+                    if (!startupJinhakProtectedProbeAttempted && coreProbe.isNotBlank()) {
+                        startupJinhakProtectedProbeAttempted = true
+                        startupAuthIndeterminatePolls = 0
+                        startupLoginStage = "jinhak-protected-auth-probe"
+                        jinhakCoreBootstrapState = "protected-route-probe"
+                        recordRuntimeEvent("jinhak-protected-auth-probe-start", JSONObject()
+                            .put("safePath", runtimeSafePath(coreProbe))
+                            .put("readOnly", true)
+                            .put("proactiveLoginNavigation", false))
+                        sessionState.text = "△ 진학사 인증 미확정 · 수시저장소 보호 경로 확인"
+                        status.text = "로그인 URL을 강제로 열지 않고 수시저장소를 읽기 전용으로 열어 서버 인증 상태를 검증합니다."
+                        webView.loadUrl(coreProbe)
+                        return@probeLoginSurface
+                    }
+                    if (startupJinhakProtectedProbeAttempted && startupAuthIndeterminatePolls >= 4 && coreProbe.isNotBlank()) {
+                        startupAuthIndeterminatePolls = 0
+                        recordRuntimeEvent("jinhak-protected-auth-probe-retry", JSONObject()
+                            .put("safePath", runtimeSafePath(coreProbe))
+                            .put("readOnly", true))
+                        webView.loadUrl(coreProbe)
+                        return@probeLoginSurface
+                    }
                 }
                 sessionState.text = if (needsLogin) "○ 로그인 필요 신호 감지 · 로그인 폼 렌더링 대기" else "△ 로그인 상태 확인 중 · 현재 화면 유지"
                 status.text = "${expectedProvider.displayName} 현재 화면을 유지합니다. 실제 로그인 폼이 감지될 때만 자동 로그인을 실행합니다."
@@ -1508,7 +1578,13 @@ class MainActivity : Activity() {
 
     private fun onStartupProviderAuthenticated(expectedProvider: ProviderId, generation: Int) {
         if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return
-        if (expectedProvider == ProviderId.ADIGA) startupLoginAdigaAuthenticated = true else startupLoginJinhakAuthenticated = true
+        if (expectedProvider == ProviderId.ADIGA) {
+            startupLoginAdigaAuthenticated = true
+        } else {
+            startupLoginJinhakAuthenticated = true
+            jinhakAuthVerifiedForBatch = true
+            jinhakCoreBootstrapState = "authenticated"
+        }
         startupLoginPollGeneration += 1
         startupLoginOpenAttempted = false
         val currentUrl = webView.url.orEmpty()
@@ -1533,7 +1609,8 @@ class MainActivity : Activity() {
             status.text = "자동 준비 3/3 · 어디가·진학사 로그인 확인 완료. 통합 수집을 자동 시작합니다."
             recordRuntimeEvent("startup-login-sequence-verified", JSONObject()
                 .put("trigger", startupLoginTrigger)
-                .put("bothProvidersAuthenticated", true)
+                .put("bothProvidersAuthenticated", startupLoginAdigaAuthenticated && startupLoginJinhakAuthenticated)
+                .put("jinhakAuthenticatedForBatch", jinhakAuthVerifiedForBatch)
                 .put("credentialStoredLocally", credentialVault.has(expectedProvider.wireName)).put("credentialExported", false).put("sessionSecretStoredLocally", true).put("sessionSecretExported", false))
             handler.postDelayed({
                 if (!unifiedRunning && !batchRunning && startupLoginPreflightVerified) {
@@ -1590,6 +1667,11 @@ class MainActivity : Activity() {
                     .put("loginSurfaceDetectionsAtBootstrap", credentialLoginSurfaceDetections)
                     .put("credentialAutoLoginSubmissionsAtBootstrap", credentialAutoLoginSubmissions)
                     .put("credentialAutoLoginSuccessesAtBootstrap", credentialAutoLoginSuccesses)
+                    .put("staleSessionLeaseBypassesPrevented", staleSessionLeaseBypassesPrevented)
+                    .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
+                    .put("loginRouteFallbackCredentialPrompts", loginRouteFallbackCredentialPrompts)
+                    .put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)
+                    .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
                     .put("credentialExported", false)),
             false
         )
@@ -1888,6 +1970,11 @@ class MainActivity : Activity() {
         jinhakReferenceRouteCaptureCounts.clear()
         jinhakReferenceRepeatSkips = 0
         jinhakNoProgressFences = 0
+        jinhakCoreScopeBlockedUrls = 0
+        jinhakCoreScopeBlockedLaneCounts.clear()
+        if (provider == ProviderId.JINHAK && jinhakAuthVerifiedForBatch) {
+            jinhakCoreBootstrapState = "batch-core-start"
+        }
         jinhakLastMeaningfulProgressAtMs = if (provider == ProviderId.JINHAK) System.currentTimeMillis() else 0L
         jinhakLastLiveDiagnosticsAtMs = 0L
         ++jinhakProgressFenceGeneration
@@ -2125,6 +2212,18 @@ class MainActivity : Activity() {
                 .put("referenceRoutesTracked", jinhakReferenceRouteCaptureCounts.size)
                 .put("referenceRepeatSkips", jinhakReferenceRepeatSkips)
                 .put("noProgressFences", jinhakNoProgressFences)
+                .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
+                .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
+                .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
+                .put("credentialAutoLoginSuccesses", credentialAutoLoginSuccesses)
+                .put("credentialAutoLoginFailures", credentialAutoLoginFailures)
+                .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
+                .put("loginRouteFallbackCredentialPrompts", loginRouteFallbackCredentialPrompts)
+                .put("staleSessionLeaseBypassesPrevented", staleSessionLeaseBypassesPrevented)
+                .put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)
+                .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
+                .put("jinhakCoreScopeBlockedUrls", jinhakCoreScopeBlockedUrls)
+                .put("jinhakCoreScopeBlockedLanes", JSONObject(jinhakCoreScopeBlockedLaneCounts as Map<*, *>))
                 .put("secondsSinceMeaningfulProgress", sinceProgress ?: JSONObject.NULL)
                 .put("activeMissionTarget", jinhakActiveMissionTargetId != null)
                 .put("slowLaneRunning", slowStats?.running ?: 0)
@@ -2623,6 +2722,38 @@ class MainActivity : Activity() {
                 handler.postDelayed({ continueBatchAfterRenderedLoginGuard(url, attempt + 1) }, delay)
                 return@probeLoginSurface
             }
+            if (isProviderLoginUrl(expectedProvider, url)) {
+                loginRouteFallbackPauses += 1
+                batchPausedForLogin = true
+                batchCollecting = false
+                batchNavigationWatchdogRecovery = false
+                batchCloudFinalCheckInProgress = false
+                disarmBatchNavigationWatchdog()
+                hideBatchCover()
+                if (expectedProvider == ProviderId.JINHAK) {
+                    jinhakAuthVerifiedForBatch = false
+                    jinhakCoreBootstrapState = "batch-login-route-wait"
+                }
+                recordRuntimeEvent("login-route-fallback-batch-pause", JSONObject()
+                    .put("provider", expectedProvider.wireName)
+                    .put("currentTarget", runtimeSafePath(currentBatchTarget))
+                    .put("loginSafePath", runtimeSafePath(url))
+                    .put("renderedSurfaceDetected", false)
+                    .put("proactiveLoginNavigation", false))
+                sessionState.text = "○ ${expectedProvider.displayName} 로그인 경로 감지 · 수집 대상 보존"
+                if (credentialVault.has(expectedProvider.wireName)) {
+                    status.text = "현재 수집 대상을 보존했습니다. 로그인 화면 렌더링을 기다리며 자동로그인을 재시도합니다."
+                    scheduleLoginSurfaceDetection(expectedProvider, "batch-login-route-fallback")
+                } else if (startupCredentialPromptedProvider != expectedProvider) {
+                    startupCredentialPromptedProvider = expectedProvider
+                    loginRouteFallbackCredentialPrompts += 1
+                    status.text = "로그인이 필요합니다. 계정정보는 이 기기에만 암호화 저장되며 현재 수집 target은 유지됩니다."
+                    showCredentialDialog(expectedProvider, continueAfterSave = true)
+                } else {
+                    status.text = "로그인 화면에서 인증을 완료하면 동일 수집 target을 자동으로 다시 엽니다."
+                }
+                return@probeLoginSurface
+            }
             disarmBatchNavigationWatchdog()
             if (batchNavigationWatchdogRecovery) {
                 batchNavigationWatchdogRecovery = false
@@ -2702,6 +2833,10 @@ class MainActivity : Activity() {
                 return@checkSessionState
             }
             batchPausedForLogin = false
+            if (provider == ProviderId.JINHAK) {
+                jinhakAuthVerifiedForBatch = true
+                jinhakCoreBootstrapState = "batch-auth-recovered"
+            }
             showBatchCover()
             sessionState.text = "● 로그인 복구 / 동일 수집 브라우저"
             val retry = currentBatchTarget
@@ -3517,7 +3652,7 @@ class MainActivity : Activity() {
                     val routeCaptureCount = (jinhakReferenceRouteCaptureCounts[safeRoute] ?: 0) + 1
                     jinhakReferenceRouteCaptureCounts[safeRoute] = routeCaptureCount
                     val lowValueReference = isJinhakLowValueReferencePageType(snapshot.optString("providerPageType"))
-                    if (snapshot.optString("providerPageType") == "jinhak-recommended-university") {
+                    if (lowValueReference) {
                         jinhakAllowAgentAction = false
                     }
                     if (lowValueReference && routeCaptureCount > MAX_JINHAK_REFERENCE_ROUTE_CAPTURES &&
@@ -4068,6 +4203,10 @@ class MainActivity : Activity() {
                         val url = canonicalizeBatchUrl(item.optString("url"))
                         val taskId = item.optString("taskId")
                         if (url.isBlank() || taskId.isBlank() || !isBatchNavigableProviderUrl(url)) continue
+                        if (provider == ProviderId.JINHAK && !JinhakSiteTopology.isDefaultSusiCoreTraversalUrl(url)) {
+                            recordJinhakCoreScopeBlock(url)
+                            continue
+                        }
                         if (!batchVisited.contains(url) && batchQueued.add(url)) {
                             batchQueue.addLast(url)
                             cloudFrontierTaskIds[url] = taskId
@@ -4486,6 +4625,13 @@ class MainActivity : Activity() {
                         .put("credentialAutoLoginLastAtMs", credentialAutoLoginLastAtMs)
                         .put("batchRenderedLoginSurfacePauses", batchRenderedLoginSurfacePauses)
                         .put("crossVersionResumeBlocks", crossVersionResumeBlocks)
+                        .put("staleSessionLeaseBypassesPrevented", staleSessionLeaseBypassesPrevented)
+                        .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
+                        .put("loginRouteFallbackCredentialPrompts", loginRouteFallbackCredentialPrompts)
+                        .put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)
+                        .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
+                        .put("jinhakCoreScopeBlockedUrls", jinhakCoreScopeBlockedUrls)
+                        .put("jinhakCoreScopeBlockedLanes", JSONObject(jinhakCoreScopeBlockedLaneCounts as Map<*, *>))
                         .put("applicationBoundAgentActions", jinhakApplicationBoundActions)
                         .put("applicationMissionReturns", jinhakApplicationMissionReturns)
                         .put("applicationMissionIdentities", jinhakMissionCoverage.size)
@@ -4762,12 +4908,27 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun recordJinhakCoreScopeBlock(url: String) {
+        if (provider != ProviderId.JINHAK) return
+        val lane = JinhakSiteTopology.lane(url).wireName
+        jinhakCoreScopeBlockedUrls += 1
+        jinhakCoreScopeBlockedLaneCounts[lane] = (jinhakCoreScopeBlockedLaneCounts[lane] ?: 0) + 1
+    }
+
+    private fun isJinhakDefaultCoreQueueUrl(url: String): Boolean {
+        if (provider != ProviderId.JINHAK) return true
+        val allowed = JinhakSiteTopology.isDefaultSusiCoreTraversalUrl(url)
+        if (!allowed) recordJinhakCoreScopeBlock(url)
+        return allowed
+    }
+
     private fun enqueueDiscoveredLinks(links: JSONArray) {
         val frontierBatch = JSONArray()
         for (i in 0 until links.length()) {
             val obj = links.optJSONObject(i) ?: continue
             val url = canonicalizeBatchUrl(obj.optString("url"))
             if (url.isBlank() || !isBatchNavigableProviderUrl(url)) continue
+            if (!isJinhakDefaultCoreQueueUrl(url)) continue
             enqueueDiscoveredUrl(url)
             frontierBatch.put(url)
             historicalMirrorUrl(url)?.let { mirror ->
@@ -4790,6 +4951,7 @@ class MainActivity : Activity() {
 
     private fun enqueueDiscoveredUrl(url: String) {
         if (url.isBlank() || !isBatchNavigableProviderUrl(url)) return
+        if (provider == ProviderId.JINHAK && !JinhakSiteTopology.isDefaultSusiCoreTraversalUrl(url)) return
         if (provider == ProviderId.JINHAK && batchQueued.size + batchVisited.size >= MAX_JINHAK_AUTONAV_PAGES) return
         if (batchVisited.contains(url)) return
         val runId = localRunId

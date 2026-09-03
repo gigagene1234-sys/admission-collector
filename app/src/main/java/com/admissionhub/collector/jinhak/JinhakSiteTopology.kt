@@ -32,8 +32,7 @@ object JinhakSiteTopology {
         "$ROOT/jh/high3/early/four-year-university/library",
         "$ROOT/jh/high3/early/four-year-university/university-major-predict",
         "$ROOT/jh/high3/early/four-year-university/search",
-        "$ROOT/jh/high3/univ-major/univ-info/univ-search",
-        "$ROOT/jh/high3/univ-entrance-info/ipsi-analysis/ipsi-strategy"
+        "$ROOT/jh/high3/univ-major/univ-info/univ-search"
     )
 
     fun lane(url: String, label: String = ""): JinhakMissionLane {
@@ -78,10 +77,22 @@ object JinhakSiteTopology {
 
     fun isCoreMissionRoute(url: String, label: String = ""): Boolean = priority(url, label) >= 80
 
+    fun isDefaultSusiCoreTraversalUrl(url: String, label: String = ""): Boolean = when (lane(url, label)) {
+        JinhakMissionLane.SAVED_APPLICATIONS,
+        JinhakMissionLane.CURRENT_PREDICTION,
+        JinhakMissionLane.MOCK_SUPPORT,
+        JinhakMissionLane.ACTUAL_ADMIT,
+        JinhakMissionLane.UNIVERSITY_RESULT,
+        JinhakMissionLane.SCORE_ANALYSIS,
+        JinhakMissionLane.REFERENCE -> true
+        JinhakMissionLane.RECOMMENDATION,
+        JinhakMissionLane.STRATEGY,
+        JinhakMissionLane.ADMISSION_KNOWLEDGE,
+        JinhakMissionLane.MEDIA,
+        JinhakMissionLane.UNKNOWN -> false
+    }
+
     fun shouldExpandEditorial(url: String, label: String = ""): Boolean {
-        val lane = lane(url, label)
-        return lane == JinhakMissionLane.STRATEGY ||
-            lane == JinhakMissionLane.ADMISSION_KNOWLEDGE ||
-            lane == JinhakMissionLane.UNIVERSITY_RESULT
+        return lane(url, label) == JinhakMissionLane.UNIVERSITY_RESULT
     }
 }
