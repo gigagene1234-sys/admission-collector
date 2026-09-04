@@ -314,6 +314,10 @@ class MainActivity : Activity() {
     private val jinhakPageStateErrorTypes = linkedMapOf<String, Int>()
     private var jinhakBootstrapRetryAttempts = 0
     private var jinhakBootstrapFatalNoSuccess = 0
+    private var jinhakSameCardReplayRetries = 0
+    private var jinhakSameCardReplayRecovered = 0
+    private var jinhakSameCardReplayTerminalFailures = 0
+    private val jinhakSameCardReplayResolutionCounts = linkedMapOf<String, Int>()
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -339,10 +343,11 @@ class MainActivity : Activity() {
         private const val JINHAK_LOGIN_RECOVERY_POLL_MS = 1_500L
         private const val JINHAK_CORE_AUTH_STABLE_PASSES = 2
         private const val MAX_JINHAK_BOOTSTRAP_PAGE_RETRIES = 2
+        private const val MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.12"
-        private const val BUILD_CODE = 109120
+        private const val VERSION = "0.9.13"
+        private const val BUILD_CODE = 109130
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -2409,6 +2414,10 @@ class MainActivity : Activity() {
         jinhakPageStateErrorTypes.clear()
         jinhakBootstrapRetryAttempts = 0
         jinhakBootstrapFatalNoSuccess = 0
+        jinhakSameCardReplayRetries = 0
+        jinhakSameCardReplayRecovered = 0
+        jinhakSameCardReplayTerminalFailures = 0
+        jinhakSameCardReplayResolutionCounts.clear()
         if (provider == ProviderId.JINHAK && jinhakAuthVerifiedForBatch) {
             jinhakCoreBootstrapState = "batch-core-start"
         }
@@ -4540,8 +4549,23 @@ class MainActivity : Activity() {
                 val rejectReason = result.optString("reason", "unknown-agent-action-failure").take(80)
                 jinhakAnchorRejectReasons[rejectReason] = (jinhakAnchorRejectReasons[rejectReason] ?: 0) + 1
                 if (ledgerTargetIdForAction != null) {
-                    jinhakMissionTargetLedger.markFailed(ledgerTargetIdForAction, rejectReason)
+                    val targetAttempts = jinhakMissionTargetLedger.target(ledgerTargetIdForAction)?.attempts ?: 0
+                    val retryableSameCardMiss = rejectReason == "same-card-action-not-found" &&
+                        targetAttempts < MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS
+                    if (retryableSameCardMiss) {
+                        jinhakMissionTargetLedger.markRetryableFailure(ledgerTargetIdForAction, rejectReason)
+                        jinhakSameCardReplayRetries += 1
+                        recordRuntimeEvent("jinhak-same-card-replay-scheduled", JSONObject()
+                            .put("attempt", targetAttempts)
+                            .put("maxAttempts", MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS)
+                            .put("safePath", runtimeSafePath(route)))
+                    } else {
+                        jinhakMissionTargetLedger.markFailed(ledgerTargetIdForAction, rejectReason)
+                        if (rejectReason == "same-card-action-not-found") jinhakSameCardReplayTerminalFailures += 1
+                    }
                     if (jinhakActiveMissionTargetId == ledgerTargetIdForAction) jinhakActiveMissionTargetId = null
+                    // Execution failure never navigated away from the origin.
+                    jinhakMissionNeedsReturn = false
                 }
                 recordRuntimeEvent("jinhak-agent-action-rejected", JSONObject()
                     .put("safePath", runtimeSafePath(route))
@@ -4553,7 +4577,13 @@ class MainActivity : Activity() {
                 if (candidate.kind == "mission-link-navigation") jinhakReportBridgeContext = null
             }
             if (result.optBoolean("ok", false)) {
-                if (ledgerTargetIdForAction != null) jinhakMissionTargetLedger.markClicked(ledgerTargetIdForAction)
+                if (ledgerTargetIdForAction != null) {
+                    val targetAttempts = jinhakMissionTargetLedger.target(ledgerTargetIdForAction)?.attempts ?: 0
+                    if (targetAttempts > 1) jinhakSameCardReplayRecovered += 1
+                    val resolution = result.optString("resolution", "unknown").ifBlank { "unknown" }.take(60)
+                    jinhakSameCardReplayResolutionCounts[resolution] = (jinhakSameCardReplayResolutionCounts[resolution] ?: 0) + 1
+                    jinhakMissionTargetLedger.markClicked(ledgerTargetIdForAction)
+                }
                 noteJinhakMeaningfulProgress("agent-click", forceDiagnostics = true)
                 if (candidate.kind == "mission-link-navigation") {
                     jinhakMissionAnchorActionsExecuted += 1
@@ -5181,6 +5211,10 @@ class MainActivity : Activity() {
                         .put("applicationAnchorActionsExecuted", jinhakMissionAnchorActionsExecuted)
                         .put("applicationAnchorReportConfirmed", jinhakReportConfirmedKeys.size)
                         .put("applicationAnchorRejectReasons", JSONObject(jinhakAnchorRejectReasons as Map<*, *>))
+                        .put("sameCardReplayRetries", jinhakSameCardReplayRetries)
+                        .put("sameCardReplayRecovered", jinhakSameCardReplayRecovered)
+                        .put("sameCardReplayTerminalFailures", jinhakSameCardReplayTerminalFailures)
+                        .put("sameCardReplayResolutionCounts", JSONObject(jinhakSameCardReplayResolutionCounts as Map<*, *>))
                         .put("reportBridgeArmed", jinhakReportBridgeArmed)
                         .put("reportBridgeApplied", jinhakReportBridgeApplied)
                         .put("reportBridgeConfirmed", jinhakReportBridgeConfirmed)
@@ -5278,6 +5312,10 @@ class MainActivity : Activity() {
                 .put("jinhakApplicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
                 .put("jinhakApplicationAnchorActionsExecuted", jinhakMissionAnchorActionsExecuted)
                 .put("jinhakApplicationAnchorRejectReasons", JSONObject(jinhakAnchorRejectReasons as Map<*, *>))
+                .put("jinhakSameCardReplayRetries", jinhakSameCardReplayRetries)
+                .put("jinhakSameCardReplayRecovered", jinhakSameCardReplayRecovered)
+                .put("jinhakSameCardReplayTerminalFailures", jinhakSameCardReplayTerminalFailures)
+                .put("jinhakSameCardReplayResolutionCounts", JSONObject(jinhakSameCardReplayResolutionCounts as Map<*, *>))
                 .put("jinhakReportBridgeArmed", jinhakReportBridgeArmed)
                 .put("jinhakReportBridgeApplied", jinhakReportBridgeApplied)
                 .put("jinhakConsentGatesEncountered", jinhakConsentGatesEncountered)

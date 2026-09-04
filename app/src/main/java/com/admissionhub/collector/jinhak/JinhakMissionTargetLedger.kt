@@ -295,6 +295,15 @@ class JinhakMissionTargetLedger {
         return true
     }
 
+    fun markRetryableFailure(targetId: String?, reason: String): Boolean {
+        val target = targetId?.let { targets[it] } ?: return false
+        if (target.state != State.PENDING) return false
+        target.failureReason = reason.take(100)
+        target.updatedAtMs = System.currentTimeMillis()
+        notifyMutation(target)
+        return true
+    }
+
     fun markFailed(targetId: String?, reason: String): Boolean {
         val target = targetId?.let { targets[it] } ?: return false
         if (!canTransition(target.state, State.FAILED)) return false
