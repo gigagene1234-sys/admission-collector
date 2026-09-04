@@ -146,7 +146,9 @@ object SnapshotScript {
   var authenticated=logoutControl;
   var titleText=cleanText(document.title||'');
   var error404=/(404\s*Not\s*Found|요청하신\s*페이지를\s*찾을\s*수\s*없|페이지를\s*찾을\s*수\s*없)/i.test(titleText+' '+bodyText);
-  var serverError=/(500\s*(?:Internal\s*Server\s*Error)?|서비스\s*처리\s*중\s*오류|일시적인\s*오류가\s*발생)/i.test(titleText+' '+bodyText);
+  var titleServerError=/^(?:500(?:\s+Internal\s+Server\s+Error)?|HTTP\s+ERROR\s+500)$/i.test(titleText);
+  var bodyServerError=/(?:\b500\s+Internal\s+Server\s+Error\b|\bHTTP\s+ERROR\s+500\b|서비스\s*처리\s*중\s*오류|일시적인\s*오류가\s*발생)/i.test(bodyText);
+  var serverError=titleServerError||bodyServerError;
   var browserError=/(웹페이지를\s*사용할\s*수\s*없|net::ERR_|ERR_CONNECTION_|ERR_NAME_NOT_RESOLVED)/i.test(titleText+' '+bodyText);
   var pageError=error404||serverError||browserError;
   var errorType=error404?'404':(serverError?'server-error':(browserError?'browser-error':''));

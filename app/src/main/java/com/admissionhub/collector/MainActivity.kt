@@ -310,6 +310,10 @@ class MainActivity : Activity() {
     private val jinhakNormalizedIdentitySeedKeys = linkedSetOf<String>()
     private val jinhakNormalizedCandidateBindingKeys = linkedSetOf<String>()
     private var jinhakNormalizedAmbiguousBindings = 0
+    private val jinhakBootstrapRetryCounts = linkedMapOf<String, Int>()
+    private val jinhakPageStateErrorTypes = linkedMapOf<String, Int>()
+    private var jinhakBootstrapRetryAttempts = 0
+    private var jinhakBootstrapFatalNoSuccess = 0
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -334,10 +338,11 @@ class MainActivity : Activity() {
         private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
         private const val JINHAK_LOGIN_RECOVERY_POLL_MS = 1_500L
         private const val JINHAK_CORE_AUTH_STABLE_PASSES = 2
+        private const val MAX_JINHAK_BOOTSTRAP_PAGE_RETRIES = 2
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.11"
-        private const val BUILD_CODE = 109110
+        private const val VERSION = "0.9.12"
+        private const val BUILD_CODE = 109120
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -2315,10 +2320,15 @@ class MainActivity : Activity() {
         val preserveJinhakMissionState = provider == ProviderId.JINHAK && unifiedRunning &&
             (jinhakBatchStartCount > 0 || restoredPersistedMissionTargets > 0)
         if (provider == ProviderId.JINHAK) {
+            localRunId = localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
+            unifiedSessionId?.takeIf { unifiedRunning }?.let { sessionId ->
+                localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId) }
+            }
             jinhakBatchStartCount += 1
             recordRuntimeEvent("jinhak-batch-start", JSONObject()
                 .put("count", jinhakBatchStartCount)
-                .put("preserveMissionState", preserveJinhakMissionState))
+                .put("preserveMissionState", preserveJinhakMissionState)
+                .put("providerRunInitializedBeforeSnapshot", localRunId != null))
         }
         val url = webView.url
         if (url.isNullOrBlank() || !isProviderUrl(url)) {
@@ -2395,6 +2405,10 @@ class MainActivity : Activity() {
         jinhakNoProgressFences = 0
         jinhakCoreScopeBlockedUrls = 0
         jinhakCoreScopeBlockedLaneCounts.clear()
+        jinhakBootstrapRetryCounts.clear()
+        jinhakPageStateErrorTypes.clear()
+        jinhakBootstrapRetryAttempts = 0
+        jinhakBootstrapFatalNoSuccess = 0
         if (provider == ProviderId.JINHAK && jinhakAuthVerifiedForBatch) {
             jinhakCoreBootstrapState = "batch-core-start"
         }
@@ -3839,6 +3853,44 @@ class MainActivity : Activity() {
             val pageState = snapshot.optJSONObject("pageState") ?: JSONObject()
             if (pageState.optBoolean("isError", false)) {
                 val errorType = pageState.optString("errorType", "page-error")
+                if (provider == ProviderId.JINHAK) {
+                    jinhakPageStateErrorTypes[errorType] = (jinhakPageStateErrorTypes[errorType] ?: 0) + 1
+                    val failedRoute = canonicalizeBatchUrl(
+                        snapshot.optString("navigationKey", snapshot.optString("url", currentBatchTarget.orEmpty()))
+                    )
+                    recordRuntimeEvent("jinhak-page-state-error", JSONObject()
+                        .put("errorType", errorType.take(80))
+                        .put("safePath", runtimeSafePath(failedRoute))
+                        .put("pageTitle", snapshot.optString("title").take(120))
+                        .put("successfulSnapshotsBeforeError", batchSnapshots.length()))
+                    val bootstrapUnpopulated = batchSnapshots.length() == 0 &&
+                        jinhakMissionTargetLedger.summary().optInt("targets", 0) == 0
+                    val retryableCoreRoute = failedRoute.isNotBlank() &&
+                        JinhakSiteTopology.isDefaultSusiCoreTraversalUrl(failedRoute)
+                    if (bootstrapUnpopulated && retryableCoreRoute) {
+                        val prior = jinhakBootstrapRetryCounts[failedRoute] ?: 0
+                        if (prior < MAX_JINHAK_BOOTSTRAP_PAGE_RETRIES) {
+                            val nextAttempt = prior + 1
+                            jinhakBootstrapRetryCounts[failedRoute] = nextAttempt
+                            jinhakBootstrapRetryAttempts += 1
+                            if (navigationKey.isNotBlank()) batchVisited.remove(navigationKey)
+                            batchVisited.remove(failedRoute)
+                            currentBatchTarget = failedRoute
+                            status.text = "진학사 핵심 수시 화면 오류 감지: ${nextAttempt}/${MAX_JINHAK_BOOTSTRAP_PAGE_RETRIES}회 제한 재시도"
+                            recordRuntimeEvent("jinhak-bootstrap-core-retry", JSONObject()
+                                .put("errorType", errorType.take(80))
+                                .put("attempt", nextAttempt)
+                                .put("maxAttempts", MAX_JINHAK_BOOTSTRAP_PAGE_RETRIES)
+                                .put("safePath", runtimeSafePath(failedRoute)))
+                            handler.postDelayed({
+                                if (batchRunning && !batchPausedForLogin && provider == ProviderId.JINHAK) {
+                                    webView.loadUrl(failedRoute)
+                                }
+                            }, 700L + nextAttempt * 500L)
+                            return@collectSnapshot
+                        }
+                    }
+                }
                 if (activeAction != null && activeAction.retry < MAX_PAGE_RETRIES) {
                     activeBatchPageAction = null
                     schedulePageActionRetry(activeAction, errorType)
@@ -4675,6 +4727,23 @@ class MainActivity : Activity() {
 
     private fun verifyLocalCompletionOrFinish() {
         if (!batchRunning || batchPausedForLogin) return
+        if (provider == ProviderId.JINHAK && batchSnapshots.length() == 0) {
+            jinhakBootstrapFatalNoSuccess += 1
+            val persistence = unifiedSessionId?.let { localStore.jinhakMissionPersistenceSummary(it) } ?: JSONObject()
+            batchErrors.put(JSONObject()
+                .put("type", "jinhak-bootstrap-no-success")
+                .put("attemptedSnapshots", batchPageCount)
+                .put("errorTypes", JSONObject(jinhakPageStateErrorTypes as Map<*, *>))
+                .put("bootstrapRetryAttempts", jinhakBootstrapRetryAttempts)
+                .put("persistedTargets", persistence.optInt("persistedTargets", 0)))
+            recordRuntimeEvent("jinhak-bootstrap-no-success", JSONObject()
+                .put("attemptedSnapshots", batchPageCount)
+                .put("errorTypes", JSONObject(jinhakPageStateErrorTypes as Map<*, *>))
+                .put("bootstrapRetryAttempts", jinhakBootstrapRetryAttempts)
+                .put("persistence", persistence))
+            finishBatch("jinhak-bootstrap-no-success")
+            return
+        }
         if (provider == ProviderId.JINHAK && jinhakMissionTargetLedger.outstandingCount() > 0) {
             val outstanding = jinhakMissionTargetLedger.outstandingCount()
             val terminalized = jinhakMissionTargetLedger.failAllOutstanding("completion-fence-stranded-target")
@@ -5138,6 +5207,10 @@ class MainActivity : Activity() {
                         .put("missionTargetLedger", jinhakMissionTargetLedger.summary())
                         .put("missionTargetLedgerPending", jinhakMissionTargetLedger.pendingCount())
                         .put("missionTargetLedgerOutstanding", jinhakMissionTargetLedger.outstandingCount())
+                        .put("missionPersistence", localStore.jinhakMissionPersistenceSummary(sessionId))
+                        .put("jinhakBootstrapRetryAttempts", jinhakBootstrapRetryAttempts)
+                        .put("jinhakBootstrapFatalNoSuccess", jinhakBootstrapFatalNoSuccess)
+                        .put("jinhakPageStateErrorTypes", JSONObject(jinhakPageStateErrorTypes as Map<*, *>))
                         .put("cloudFrontierPublished", cloudFrontierPublished)
                         .put("cloudFrontierClaimed", cloudFrontierClaimed)
                         .put("cloudFrontierCompleted", cloudFrontierCompleted)
@@ -5197,6 +5270,10 @@ class MainActivity : Activity() {
                 .put("jinhakMissionTargetLedger", jinhakMissionTargetLedger.summary())
                 .put("jinhakMissionTargetLedgerPending", jinhakMissionTargetLedger.pendingCount())
                 .put("jinhakMissionTargetLedgerOutstanding", jinhakMissionTargetLedger.outstandingCount())
+                .put("jinhakMissionPersistence", unifiedSessionId?.let { localStore.jinhakMissionPersistenceSummary(it) } ?: JSONObject())
+                .put("jinhakBootstrapRetryAttempts", jinhakBootstrapRetryAttempts)
+                .put("jinhakBootstrapFatalNoSuccess", jinhakBootstrapFatalNoSuccess)
+                .put("jinhakPageStateErrorTypes", JSONObject(jinhakPageStateErrorTypes as Map<*, *>))
                 .put("jinhakApplicationAnchorActionsDiscovered", jinhakMissionAnchorDiscoveredKeys.size)
                 .put("jinhakApplicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
                 .put("jinhakApplicationAnchorActionsExecuted", jinhakMissionAnchorActionsExecuted)

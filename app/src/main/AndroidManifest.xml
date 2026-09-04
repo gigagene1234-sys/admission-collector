@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.11 Mission State Persistence"
+        android:label="Admission Collector v0.9.12 Jinhak Bootstrap Recovery"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
