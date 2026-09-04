@@ -1,0 +1,230 @@
+name: Build Admission Collector v0.9.15 Mission Stall Fence
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v0915.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    outputs:
+      source_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.9.15 mission stall fence patch
+        run: python3 .github/scripts/patch_v0915.py
+
+      - name: Verify bounded change surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          changed=set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())
+          allowed={
+            'app/src/main/java/com/admissionhub/collector/MainActivity.kt',
+            'app/build.gradle.kts',
+            'app/src/main/AndroidManifest.xml',
+          }
+          extra=changed-allowed
+          missing=allowed-changed
+          if extra: raise SystemExit('Unexpected files changed: '+', '.join(sorted(extra)))
+          if missing: raise SystemExit('Required files not changed: '+', '.join(sorted(missing)))
+          print('v0.9.15 file boundary passed')
+          PY
+
+      - name: Verify v0.9.15 invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          p=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt').read_text()
+          l=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
+          s=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          manifest=Path('app/src/main/AndroidManifest.xml').read_text()
+          req={
+            'version':'private const val VERSION = "0.9.15"' in m and 'private const val BUILD_CODE = 109150' in m,
+            'gradle':'versionCode = 109150' in g and 'versionName = "0.9.15"' in g,
+            'label':'Admission Collector v0.9.15 Mission Stall Fence' in manifest,
+            'mission-stall-helper':'recoverOrStopJinhakMissionStall' in m,
+            'bounded-recoveries':'MAX_JINHAK_MISSION_STALL_RECOVERIES = 2' in m,
+            'bounded-error-streak':'MAX_JINHAK_MISSION_ORIGIN_ERROR_STREAK = 5' in m,
+            'fast-error-circuit':'mission-origin-snapshot-error-circuit' in m,
+            'terminal-stop':'jinhak-mission-stall-terminal-stop' in m and 'failAllOutstanding(reason)' in m,
+            'live-stall-telemetry':'missionStallFenceTrips' in m and 'missionOriginSnapshotErrorTotal' in m,
+            'live-error-types':m.count('jinhakPageStateErrorTypes') >= 5,
+            'renderer-circuit-preserved':'const val DEFAULT_MAX_WORKERS = 1' in p and 'rendererCircuitOpen' in p,
+            'foreground-fallback-preserved':'jinhak-slow-lane-renderer-fallback-main' in m,
+            'mission-persistence-preserved':'CREATE TABLE IF NOT EXISTS jinhak_mission_targets' in l and 'monotonicStateGuard' in l,
+            'same-card-preserved':'same-card-action-not-found' in m and 'MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3' in m,
+            'auth-preserved':'protected-core-stable' in m and 'scheduleJinhakLoginRecovery' in m,
+            'susi-core-preserved':'isDefaultSusiCoreTraversalUrl' in m,
+            'snapshot-privacy':'safeCloneText' in s and 'input,textarea,select,option,form' in s,
+          }
+          failed=[k for k,v in req.items() if not v]
+          if failed: raise SystemExit('Missing invariant(s): '+', '.join(failed))
+          if '.put("username", credentials.username)' in m or '.put("password", credentials.password)' in m:
+              raise SystemExit('credential export invariant failed')
+          print('v0.9.15 invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test and build patched source
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Verify patched APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" >/dev/null
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='109150'" patched-badging.txt
+          grep -q "versionName='0.9.15'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.15 Mission Stall Fence'" patched-badging.txt
+
+      - name: Commit v0.9.15 source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+                  app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.9.15 Mission Stall Fence"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  independent-main-build:
+    needs: patch-build-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Refresh exact committed main
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(git rev-parse HEAD)" = "${{ needs.patch-build-commit.outputs.source_sha }}"
+
+      - name: Reverify committed v0.9.15
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          p=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          assert 'private const val VERSION = "0.9.15"' in m
+          assert 'versionCode = 109150' in g
+          assert 'recoverOrStopJinhakMissionStall' in m
+          assert 'MAX_JINHAK_MISSION_STALL_RECOVERIES = 2' in m
+          assert 'MAX_JINHAK_MISSION_ORIGIN_ERROR_STREAK = 5' in m
+          assert 'mission-origin-snapshot-error-circuit' in m
+          assert 'jinhak-mission-stall-terminal-stop' in m
+          assert 'const val DEFAULT_MAX_WORKERS = 1' in p
+          assert 'rendererCircuitOpen' in p
+          assert 'jinhak-slow-lane-renderer-fallback-main' in m
+          print('committed v0.9.15 verified')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build committed main
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify and package final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.15-Mission-Stall-Fence.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='109150'" badging.txt
+          grep -q "versionName='0.9.15'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.15 Mission Stall Fence'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.15-Mission-Stall-Fence.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.15-final
+          path: |
+            Admission-Collector-v0.9.15-Mission-Stall-Fence.apk
+            Admission-Collector-v0.9.15-Mission-Stall-Fence.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish v0.9.15 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="v0.9.15 is a bounded mission-stall release based on the real-device v0.9.14 export admission-unified-v0.9.14-1788523190145.json. v0.9.14 successfully kept hidden-renderer loss recoverable, but after a later runtime reset the Jinhak mission remained running for hours with 57 outstanding targets, 7,047 attempted snapshots, zero successful snapshots in the current segment, 7,049 error events and about 4.8 hours without meaningful progress. The existing 60-second no-progress fence intentionally refused to intervene while a mission target was outstanding, so the error loop could not terminate. v0.9.15 adds a mission-aware bounded fence: five consecutive mission-origin page-state errors trigger recovery immediately; otherwise 60 seconds without mission progress triggers it. At most two deterministic saved-application-origin reload recoveries are attempted; if no actionable pending origin exists or both recoveries fail, remaining non-terminal targets are preserved as explicit mission-stall failures and the run ends with local errors rather than staying running indefinitely. Live/final diagnostics now expose mission-stall trips, recovery attempts, terminal stops, mission-origin error streak/total/last type, page-state error classes and renderer-circuit telemetry. Existing v0.9.14 renderer circuit breaker, v0.9.13 same-card replay, v0.9.11 monotonic SQLite mission persistence, auth/Susi-only routing, privacy guards and state-changing-action prohibitions are preserved. Identity canonicalization is intentionally not changed in this release. Commit: $SHA"
+          gh release create v0.9.15 Admission-Collector-v0.9.15-Mission-Stall-Fence.apk Admission-Collector-v0.9.15-Mission-Stall-Fence.sha256 --target "$SHA" --title "Admission Collector v0.9.15 — Mission Stall Fence" --notes "$NOTES"
