@@ -326,6 +326,12 @@ class MainActivity : Activity() {
     private var jinhakMissionOriginSnapshotErrorStreak = 0
     private var jinhakMissionOriginSnapshotErrorTotal = 0
     private var jinhakLastMissionOriginSnapshotErrorType = ""
+    private val jinhakTargetAuthRedirectCounts = linkedMapOf<String, Int>()
+    private val jinhakTargetAuthRedirectQuarantinedKeys = linkedSetOf<String>()
+    private var jinhakTargetAuthRedirectEpisodeOpenKey = ""
+    private var jinhakTargetAuthRedirectEpisodes = 0
+    private var jinhakTargetAuthRedirectQuarantines = 0
+    private var jinhakLastTargetAuthRedirectSafePath = ""
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -346,6 +352,7 @@ class MainActivity : Activity() {
         private const val JINHAK_PROGRESS_FENCE_POLL_MS = 15_000L
         private const val MAX_JINHAK_MISSION_STALL_RECOVERIES = 2
         private const val MAX_JINHAK_MISSION_ORIGIN_ERROR_STREAK = 5
+        private const val MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES = 2
         private const val JINHAK_LIVE_DIAGNOSTIC_MIN_INTERVAL_MS = 10_000L
         private const val AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = true
         private const val LOGIN_PREFLIGHT_DOM_SETTLE_MS = 300L
@@ -356,8 +363,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.15"
-        private const val BUILD_CODE = 109150
+        private const val VERSION = "0.9.16"
+        private const val BUILD_CODE = 109160
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1090,6 +1097,8 @@ class MainActivity : Activity() {
                 .put("missionOriginRoute", if (jinhakMissionOriginRoute.isBlank()) JSONObject.NULL else jinhakMissionOriginRoute)
                 .put("missionNeedsReturn", jinhakMissionNeedsReturn)
                 .put("reportBridgeContext", jinhakReportBridgeContext?.let { JSONObject(it.toString()) } ?: JSONObject.NULL)
+                .put("targetAuthRedirectCounts", JSONObject(jinhakTargetAuthRedirectCounts as Map<*, *>))
+                .put("targetAuthRedirectEpisodeOpenKey", if (jinhakTargetAuthRedirectEpisodeOpenKey.isBlank()) JSONObject.NULL else jinhakTargetAuthRedirectEpisodeOpenKey)
                 .put("trigger", trigger.take(60))
                 .put("updatedAtMs", System.currentTimeMillis())
         )
@@ -1112,6 +1121,17 @@ class MainActivity : Activity() {
             jinhakMissionNeedsReturn = runtime.optBoolean("missionNeedsReturn", false)
             jinhakReportBridgeContext = runtime.optJSONObject("reportBridgeContext")
             jinhakMissionContext = JinhakReportContextBridge.context(jinhakReportBridgeContext)
+            runtime.optJSONObject("targetAuthRedirectCounts")?.let { persisted ->
+                jinhakTargetAuthRedirectCounts.clear()
+                val keys = persisted.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    val count = persisted.optInt(key, 0)
+                    if (key.isNotBlank() && count > 0) jinhakTargetAuthRedirectCounts[key] = count
+                }
+            }
+            jinhakTargetAuthRedirectEpisodeOpenKey = runtime.optString("targetAuthRedirectEpisodeOpenKey")
+                .takeIf { it.isNotBlank() && it != "null" }.orEmpty()
         }
         if (restored > 0) {
             recordRuntimeEvent(
@@ -1908,6 +1928,12 @@ class MainActivity : Activity() {
                     .put("credentialAutoLoginSuccessesAtBootstrap", credentialAutoLoginSuccesses)
                     .put("staleSessionLeaseBypassesPrevented", staleSessionLeaseBypassesPrevented)
                     .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
+                    .put("targetAuthRedirectEpisodes", jinhakTargetAuthRedirectEpisodes)
+                    .put("targetAuthRedirectQuarantines", jinhakTargetAuthRedirectQuarantines)
+                    .put("targetAuthRedirectTrackedTargets", jinhakTargetAuthRedirectCounts.size)
+                    .put("targetAuthRedirectMaxCycles", jinhakTargetAuthRedirectCounts.values.maxOrNull() ?: 0)
+                    .put("targetAuthRedirectThreshold", MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES)
+                    .put("lastTargetAuthRedirectSafePath", jinhakLastTargetAuthRedirectSafePath.take(300))
                     .put("loginRouteFallbackCredentialPrompts", loginRouteFallbackCredentialPrompts)
                     .put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)
                     .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
@@ -1980,6 +2006,115 @@ class MainActivity : Activity() {
         webView.loadUrl(coreProbe)
     }
 
+    private fun jinhakTargetAuthRedirectKey(rawTarget: String?): String? {
+        val target = canonicalizeBatchUrl(rawTarget.orEmpty())
+        if (target.isBlank() || isProviderLoginUrl(ProviderId.JINHAK, target)) return null
+        val core = canonicalizeBatchUrl(JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty())
+        if (core.isNotBlank() && target == core) return null
+        return RecordUtils.sha256(target)
+    }
+
+    private fun noteJinhakTargetAuthRedirectEpisode(source: String): Int {
+        if (provider != ProviderId.JINHAK || !batchRunning) return 0
+        val target = canonicalizeBatchUrl(currentBatchTarget.orEmpty())
+        val key = jinhakTargetAuthRedirectKey(target) ?: return 0
+        if (jinhakTargetAuthRedirectEpisodeOpenKey == key) {
+            return jinhakTargetAuthRedirectCounts[key] ?: 0
+        }
+        jinhakTargetAuthRedirectEpisodeOpenKey = key
+        val count = (jinhakTargetAuthRedirectCounts[key] ?: 0) + 1
+        jinhakTargetAuthRedirectCounts[key] = count
+        jinhakTargetAuthRedirectEpisodes += 1
+        jinhakLastTargetAuthRedirectSafePath = runtimeSafePath(target)
+        recordRuntimeEvent("jinhak-target-auth-redirect-episode", JSONObject()
+            .put("source", source.take(60))
+            .put("targetSafePath", jinhakLastTargetAuthRedirectSafePath)
+            .put("cycle", count)
+            .put("quarantineThreshold", MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES)
+            .put("globalAuthFailed", false))
+        persistJinhakMissionRuntimeState("target-auth-redirect-episode")
+        persistJinhakAuthDiagnostics("target-auth-redirect-episode")
+        return count
+    }
+
+    private fun clearJinhakTargetAuthRedirectAfterSuccessfulTarget(snapshot: JSONObject) {
+        if (provider != ProviderId.JINHAK) return
+        val target = canonicalizeBatchUrl(currentBatchTarget.orEmpty())
+        val key = jinhakTargetAuthRedirectKey(target) ?: return
+        val actual = canonicalizeBatchUrl(snapshot.optString("navigationKey", snapshot.optString("url")))
+        if (actual.isBlank() || actual != target) return
+        if (jinhakTargetAuthRedirectCounts.remove(key) != null) {
+            if (jinhakTargetAuthRedirectEpisodeOpenKey == key) jinhakTargetAuthRedirectEpisodeOpenKey = ""
+            recordRuntimeEvent("jinhak-target-auth-redirect-cleared", JSONObject()
+                .put("targetSafePath", runtimeSafePath(target))
+                .put("reason", "target-loaded-successfully"))
+            persistJinhakMissionRuntimeState("target-auth-redirect-cleared")
+        }
+    }
+
+    private fun quarantineJinhakTargetSpecificAuthRedirect(retry: String?, reason: String): Boolean {
+        if (provider != ProviderId.JINHAK || !batchRunning) return false
+        val target = canonicalizeBatchUrl(retry.orEmpty())
+        val key = jinhakTargetAuthRedirectKey(target) ?: return false
+        val cycles = jinhakTargetAuthRedirectCounts[key] ?: 0
+        if (cycles < MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES) return false
+
+        jinhakTargetAuthRedirectEpisodeOpenKey = ""
+        if (jinhakTargetAuthRedirectQuarantinedKeys.add(key)) jinhakTargetAuthRedirectQuarantines += 1
+        val activeTargetId = jinhakActiveMissionTargetId
+        if (activeTargetId != null) {
+            jinhakMissionTargetLedger.markFailed(activeTargetId, "target-specific-auth-redirect")
+            jinhakActiveMissionTargetId = null
+        }
+        batchVisited.add(target)
+        batchQueued.remove(target)
+        batchErrors.put(JSONObject()
+            .put("type", "target-specific-auth-redirect")
+            .put("targetSafePath", runtimeSafePath(target))
+            .put("cycles", cycles)
+            .put("protectedCoreVerified", jinhakAuthVerifiedForBatch)
+            .put("reason", reason.take(80)))
+        localRunId?.let { runId ->
+            localStore.markDocument(runId, target, "error", cycles, "target-specific-auth-redirect")
+        }
+        cloudFrontierTaskIds.remove(target)?.let { taskId ->
+            cloudOffload.completeFrontier(taskId, "error", "target-specific-auth-redirect") { ok ->
+                if (ok) cloudFrontierCompleted += 1 else cloudFrontierCompletionFailed += 1
+            }
+        }
+
+        batchPausedForLogin = false
+        batchCollecting = false
+        batchNavigationWatchdogRecovery = false
+        batchReadinessPolling = false
+        pendingBatchPageAction = null
+        activeBatchPageAction = null
+        jinhakAgentActionInFlight = false
+        jinhakMissionNeedsReturn = false
+        jinhakReportBridgeContext = null
+        jinhakMissionContext = null
+        currentBatchTarget = null
+        jinhakAbsoluteTargetKey = ""
+        ++jinhakAbsoluteTargetGeneration
+        ++jinhakStallWatchdogGeneration
+        runCatching { webView.stopLoading() }
+        showBatchCover()
+        sessionState.text = "● 진학사 보호 경로 인증 유지 · 반복 리다이렉트 target만 격리"
+        status.text = "동일 target이 로그인 경로로 반복 이동해 해당 target만 오류로 보존하고 다음 지원안으로 진행합니다."
+        recordRuntimeEvent("jinhak-target-specific-auth-redirect-quarantined", JSONObject()
+            .put("targetSafePath", runtimeSafePath(target))
+            .put("cycles", cycles)
+            .put("activeMissionTargetFailed", activeTargetId != null)
+            .put("globalAuthStillVerified", jinhakAuthVerifiedForBatch))
+        persistJinhakMissionRuntimeState("target-auth-redirect-quarantined")
+        persistJinhakAuthDiagnostics("target-auth-redirect-quarantined")
+        persistLiveJinhakDiagnostics("target-auth-redirect-quarantined", force = true)
+        handler.postDelayed({
+            if (batchRunning && !batchPausedForLogin && provider == ProviderId.JINHAK) loadNextBatchPage()
+        }, 220L)
+        return true
+    }
+
     private fun persistJinhakAuthDiagnostics(trigger: String) {
         val sessionId = unifiedSessionId ?: return
         if (provider != ProviderId.JINHAK && unifiedPhase != "jinhak") return
@@ -2008,6 +2143,12 @@ class MainActivity : Activity() {
                     .put("authVerificationFailures", jinhakAuthVerificationFailures)
                     .put("transitionAuthChecks", jinhakTransitionAuthChecks)
                     .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
+                    .put("targetAuthRedirectEpisodes", jinhakTargetAuthRedirectEpisodes)
+                    .put("targetAuthRedirectQuarantines", jinhakTargetAuthRedirectQuarantines)
+                    .put("targetAuthRedirectTrackedTargets", jinhakTargetAuthRedirectCounts.size)
+                    .put("targetAuthRedirectMaxCycles", jinhakTargetAuthRedirectCounts.values.maxOrNull() ?: 0)
+                    .put("targetAuthRedirectThreshold", MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES)
+                    .put("lastTargetAuthRedirectSafePath", jinhakLastTargetAuthRedirectSafePath.take(300))
                     .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
                     .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
                     .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
@@ -2152,7 +2293,15 @@ class MainActivity : Activity() {
         showBatchCover()
         sessionState.text = "● 진학사 인증 복구 · 동일 수집 target 재개"
         val retry = currentBatchTarget
+        val retryKey = jinhakTargetAuthRedirectKey(retry)
+        val redirectCycles = retryKey?.let { jinhakTargetAuthRedirectCounts[it] } ?: 0
+        jinhakTargetAuthRedirectEpisodeOpenKey = ""
+        persistJinhakMissionRuntimeState("verified-auth-before-target-resume")
         persistJinhakAuthDiagnostics("$reason-resume-target")
+        if (redirectCycles >= MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES &&
+            quarantineJinhakTargetSpecificAuthRedirect(retry, reason)) {
+            return
+        }
         handler.postDelayed({
             if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return@postDelayed
             if (!retry.isNullOrBlank() && isProviderUrl(retry)) webView.loadUrl(retry)
@@ -2434,6 +2583,14 @@ class MainActivity : Activity() {
         jinhakMissionOriginSnapshotErrorStreak = 0
         jinhakMissionOriginSnapshotErrorTotal = 0
         jinhakLastMissionOriginSnapshotErrorType = ""
+        if (!preserveJinhakMissionState) {
+            jinhakTargetAuthRedirectCounts.clear()
+            jinhakTargetAuthRedirectQuarantinedKeys.clear()
+            jinhakTargetAuthRedirectEpisodeOpenKey = ""
+            jinhakTargetAuthRedirectEpisodes = 0
+            jinhakTargetAuthRedirectQuarantines = 0
+            jinhakLastTargetAuthRedirectSafePath = ""
+        }
         if (provider == ProviderId.JINHAK && jinhakAuthVerifiedForBatch) {
             jinhakCoreBootstrapState = "batch-core-start"
         }
@@ -3347,6 +3504,7 @@ class MainActivity : Activity() {
         if (!batchRunning || batchPausedForLogin || provider != which) return
         batchRenderedLoginSurfacePauses += 1
         batchPausedForLogin = true
+        if (which == ProviderId.JINHAK) noteJinhakTargetAuthRedirectEpisode("rendered-login-surface")
         batchCollecting = false
         batchNavigationWatchdogRecovery = false
         batchCloudFinalCheckInProgress = false
@@ -3395,6 +3553,7 @@ class MainActivity : Activity() {
                 disarmBatchNavigationWatchdog()
                 hideBatchCover()
                 if (expectedProvider == ProviderId.JINHAK) {
+                    noteJinhakTargetAuthRedirectEpisode("login-route-fallback")
                     jinhakAuthVerifiedForBatch = false
                     jinhakCoreBootstrapState = "batch-login-route-wait"
                 }
@@ -4179,6 +4338,7 @@ class MainActivity : Activity() {
             batchSessionSyncRetries = 0
 
             if (provider == ProviderId.JINHAK) {
+                clearJinhakTargetAuthRedirectAfterSuccessfulTarget(snapshot)
                 val gate = snapshot.optJSONObject("interactionGate") ?: JSONObject()
                 if (gate.optBoolean("requiresUserAction", false)) {
                     pauseJinhakForConsent(snapshot)
@@ -5402,6 +5562,12 @@ class MainActivity : Activity() {
                         .put("crossVersionResumeBlocks", crossVersionResumeBlocks)
                         .put("staleSessionLeaseBypassesPrevented", staleSessionLeaseBypassesPrevented)
                         .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
+                    .put("targetAuthRedirectEpisodes", jinhakTargetAuthRedirectEpisodes)
+                    .put("targetAuthRedirectQuarantines", jinhakTargetAuthRedirectQuarantines)
+                    .put("targetAuthRedirectTrackedTargets", jinhakTargetAuthRedirectCounts.size)
+                    .put("targetAuthRedirectMaxCycles", jinhakTargetAuthRedirectCounts.values.maxOrNull() ?: 0)
+                    .put("targetAuthRedirectThreshold", MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES)
+                    .put("lastTargetAuthRedirectSafePath", jinhakLastTargetAuthRedirectSafePath.take(300))
                         .put("loginRouteFallbackCredentialPrompts", loginRouteFallbackCredentialPrompts)
                         .put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)
                         .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
