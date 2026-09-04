@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.14 WebView Renderer Circuit Breaker"
+        android:label="Admission Collector v0.9.15 Mission Stall Fence"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

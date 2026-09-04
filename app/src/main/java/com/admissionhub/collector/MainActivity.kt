@@ -320,6 +320,12 @@ class MainActivity : Activity() {
     private val jinhakSameCardReplayResolutionCounts = linkedMapOf<String, Int>()
     private var jinhakSlowLaneRendererFallbacks = 0
     private var jinhakSlowLaneRendererCircuitOpens = 0
+    private var jinhakMissionStallFenceTrips = 0
+    private var jinhakMissionStallRecoveryAttempts = 0
+    private var jinhakMissionStallTerminalStops = 0
+    private var jinhakMissionOriginSnapshotErrorStreak = 0
+    private var jinhakMissionOriginSnapshotErrorTotal = 0
+    private var jinhakLastMissionOriginSnapshotErrorType = ""
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -338,6 +344,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_REFERENCE_ROUTE_CAPTURES = 2
         private const val JINHAK_NO_PROGRESS_FENCE_MS = 60_000L
         private const val JINHAK_PROGRESS_FENCE_POLL_MS = 15_000L
+        private const val MAX_JINHAK_MISSION_STALL_RECOVERIES = 2
+        private const val MAX_JINHAK_MISSION_ORIGIN_ERROR_STREAK = 5
         private const val JINHAK_LIVE_DIAGNOSTIC_MIN_INTERVAL_MS = 10_000L
         private const val AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = true
         private const val LOGIN_PREFLIGHT_DOM_SETTLE_MS = 300L
@@ -348,8 +356,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.14"
-        private const val BUILD_CODE = 109140
+        private const val VERSION = "0.9.15"
+        private const val BUILD_CODE = 109150
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -2420,6 +2428,12 @@ class MainActivity : Activity() {
         jinhakSameCardReplayRecovered = 0
         jinhakSameCardReplayTerminalFailures = 0
         jinhakSameCardReplayResolutionCounts.clear()
+        jinhakMissionStallFenceTrips = 0
+        jinhakMissionStallRecoveryAttempts = 0
+        jinhakMissionStallTerminalStops = 0
+        jinhakMissionOriginSnapshotErrorStreak = 0
+        jinhakMissionOriginSnapshotErrorTotal = 0
+        jinhakLastMissionOriginSnapshotErrorType = ""
         if (provider == ProviderId.JINHAK && jinhakAuthVerifiedForBatch) {
             jinhakCoreBootstrapState = "batch-core-start"
         }
@@ -2618,6 +2632,10 @@ class MainActivity : Activity() {
     private fun noteJinhakMeaningfulProgress(reason: String, forceDiagnostics: Boolean = false) {
         if (provider != ProviderId.JINHAK) return
         jinhakLastMeaningfulProgressAtMs = System.currentTimeMillis()
+        if (reason in setOf("mission-target-confirmed", "mission-target-captured", "slow-lane-completed")) {
+            jinhakMissionStallRecoveryAttempts = 0
+            jinhakMissionOriginSnapshotErrorStreak = 0
+        }
         recordRuntimeEvent("jinhak-meaningful-progress", JSONObject()
             .put("reason", reason.take(80))
             .put("safePath", runtimeSafePath(webView.url ?: currentBatchTarget ?: "")))
@@ -2672,6 +2690,17 @@ class MainActivity : Activity() {
                 .put("referenceRoutesTracked", jinhakReferenceRouteCaptureCounts.size)
                 .put("referenceRepeatSkips", jinhakReferenceRepeatSkips)
                 .put("noProgressFences", jinhakNoProgressFences)
+                .put("missionStallFenceTrips", jinhakMissionStallFenceTrips)
+                .put("missionStallRecoveryAttempts", jinhakMissionStallRecoveryAttempts)
+                .put("missionStallTerminalStops", jinhakMissionStallTerminalStops)
+                .put("missionOriginSnapshotErrorStreak", jinhakMissionOriginSnapshotErrorStreak)
+                .put("missionOriginSnapshotErrorTotal", jinhakMissionOriginSnapshotErrorTotal)
+                .put("lastMissionOriginSnapshotErrorType", jinhakLastMissionOriginSnapshotErrorType.take(80))
+                .put("jinhakPageStateErrorTypes", JSONObject(jinhakPageStateErrorTypes as Map<*, *>))
+                .put("slowLaneRendererGoneCount", slowStats?.rendererGoneCount ?: 0)
+                .put("slowLaneRendererCircuitOpen", slowStats?.rendererCircuitOpen ?: false)
+                .put("slowLaneRendererFallbacks", jinhakSlowLaneRendererFallbacks)
+                .put("slowLaneRendererCircuitOpenFallbacks", jinhakSlowLaneRendererCircuitOpens)
                 .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
                 .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
                 .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
@@ -2692,6 +2721,106 @@ class MainActivity : Activity() {
             false,
             updateOrchestrator = false
         )
+    }
+
+    private fun recoverOrStopJinhakMissionStall(
+        trigger: String,
+        errorType: String? = null,
+        countAsNoProgressFence: Boolean = false
+    ): Boolean {
+        if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return false
+        val outstanding = jinhakMissionTargetLedger.outstandingCount()
+        if (outstanding <= 0) return false
+        val slowWork = ::slowLanePool.isInitialized && slowLanePool.hasWork()
+        if (slowWork || jinhakAgentActionInFlight || batchCollecting) return false
+
+        jinhakMissionStallFenceTrips += 1
+        if (countAsNoProgressFence) jinhakNoProgressFences += 1
+        val pendingBefore = jinhakMissionTargetLedger.pendingCount()
+        val preferredIdentity = jinhakMissionContext?.identityKey
+        val origin = jinhakMissionTargetLedger.originForNextPending(preferredIdentity)
+        val now = System.currentTimeMillis()
+
+        if (jinhakMissionStallRecoveryAttempts < MAX_JINHAK_MISSION_STALL_RECOVERIES && !origin.isNullOrBlank()) {
+            jinhakMissionStallRecoveryAttempts += 1
+            val attempt = jinhakMissionStallRecoveryAttempts
+            batchErrors.put(JSONObject()
+                .put("type", "jinhak-mission-stall-recovery")
+                .put("trigger", trigger.take(80))
+                .put("errorType", errorType ?: JSONObject.NULL)
+                .put("attempt", attempt)
+                .put("maxAttempts", MAX_JINHAK_MISSION_STALL_RECOVERIES)
+                .put("outstanding", outstanding)
+                .put("pending", pendingBefore)
+                .put("originSafePath", runtimeSafePath(origin)))
+            localRunId?.let { runId ->
+                localStore.markDocument(runId, origin, "pending", attempt, "jinhak-mission-stall-recovery")
+            }
+            jinhakMissionOriginSnapshotErrorStreak = 0
+            jinhakAgentActionInFlight = false
+            jinhakMissionNeedsReturn = false
+            jinhakReportBridgeContext = null
+            batchCollecting = false
+            batchNavigationWatchdogRecovery = false
+            batchReadinessPolling = false
+            pendingBatchPageAction = null
+            activeBatchPageAction = null
+            currentBatchTarget = canonicalizeBatchUrl(origin)
+            jinhakAbsoluteTargetKey = ""
+            ++jinhakAbsoluteTargetGeneration
+            ++jinhakStallWatchdogGeneration
+            runCatching { webView.stopLoading() }
+
+            // This timestamp is a recovery checkpoint, not evidence that a target was
+            // confirmed. It only prevents the 15-second fence poller from firing twice
+            // while the bounded origin reload is being attempted.
+            jinhakLastMeaningfulProgressAtMs = now
+            recordRuntimeEvent("jinhak-mission-stall-recovery", JSONObject()
+                .put("trigger", trigger.take(80))
+                .put("errorType", errorType ?: JSONObject.NULL)
+                .put("attempt", attempt)
+                .put("outstanding", outstanding)
+                .put("pending", pendingBefore)
+                .put("originSafePath", runtimeSafePath(origin)))
+            persistLiveJinhakDiagnostics("mission-stall-recovery", force = true)
+            status.text = "진학사 미션 정체 감지 · 저장된 target은 유지하고 수시저장소 origin을 제한 재시도합니다. ($attempt/$MAX_JINHAK_MISSION_STALL_RECOVERIES)"
+            handler.postDelayed({
+                if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return@postDelayed
+                val retryOrigin = currentBatchTarget
+                if (!retryOrigin.isNullOrBlank() && isProviderUrl(retryOrigin)) webView.loadUrl(retryOrigin)
+                else loadNextBatchPage()
+            }, 900L + attempt * 600L)
+            return true
+        }
+
+        jinhakMissionStallTerminalStops += 1
+        val reason = if (origin.isNullOrBlank()) {
+            "mission-stall-no-actionable-pending-origin"
+        } else {
+            "mission-stall-fence-exhausted"
+        }
+        val terminalized = jinhakMissionTargetLedger.failAllOutstanding(reason)
+        batchErrors.put(JSONObject()
+            .put("type", "jinhak-mission-stall-terminal-stop")
+            .put("trigger", trigger.take(80))
+            .put("errorType", errorType ?: JSONObject.NULL)
+            .put("reason", reason)
+            .put("outstandingBeforeFence", outstanding)
+            .put("pendingBeforeFence", pendingBefore)
+            .put("terminalized", terminalized))
+        recordRuntimeEvent("jinhak-mission-stall-terminal-stop", JSONObject()
+            .put("trigger", trigger.take(80))
+            .put("errorType", errorType ?: JSONObject.NULL)
+            .put("reason", reason)
+            .put("outstandingBeforeFence", outstanding)
+            .put("terminalized", terminalized)
+            .put("ledger", jinhakMissionTargetLedger.summary()))
+        persistLiveJinhakDiagnostics("mission-stall-terminal-stop", force = true)
+        status.text = "진학사 미션 정체 복구 한도 도달 · 남은 target을 오류로 보존하고 이번 실행을 종료합니다."
+        handler.postDelayed({
+            if (batchRunning && provider == ProviderId.JINHAK) finishBatch("completed-with-local-errors")
+        }, 120L)
+        return true
     }
 
     private fun armJinhakProgressFence() {
@@ -2737,9 +2866,15 @@ class MainActivity : Activity() {
                         persistLiveJinhakDiagnostics("no-progress-fence", force = true)
                         status.text = "60초 동안 새 수집 진전이 없어 현재 일반 탐색 페이지를 종료하고 다음 대상으로 진행합니다."
                         handler.postDelayed({ if (batchRunning && !batchPausedForLogin) loadNextBatchPage() }, 220L)
+                    } else if (ledgerOutstanding > 0 && !slowWork && !jinhakAgentActionInFlight && !batchCollecting) {
+                        if (!recoverOrStopJinhakMissionStall(
+                                trigger = "no-progress-mission",
+                                countAsNoProgressFence = true
+                            )) {
+                            persistLiveJinhakDiagnostics("progress-wait-mission", force = true)
+                        }
                     } else {
-                        // Mission/slow-worker work owns the target. Existing 35s slow-lane fences
-                        // remain authoritative; expose the stalled state without stealing ownership.
+                        // A real slow worker/action/snapshot still owns the target. Do not steal it.
                         persistLiveJinhakDiagnostics("progress-wait-mission", force = true)
                     }
                 } else {
@@ -3939,6 +4074,19 @@ class MainActivity : Activity() {
                 val errorType = pageState.optString("errorType", "page-error")
                 if (provider == ProviderId.JINHAK) {
                     jinhakPageStateErrorTypes[errorType] = (jinhakPageStateErrorTypes[errorType] ?: 0) + 1
+                    if (jinhakMissionTargetLedger.outstandingCount() > 0) {
+                        jinhakMissionOriginSnapshotErrorTotal += 1
+                        jinhakMissionOriginSnapshotErrorStreak += 1
+                        jinhakLastMissionOriginSnapshotErrorType = errorType.take(80)
+                        if (jinhakMissionOriginSnapshotErrorStreak >= MAX_JINHAK_MISSION_ORIGIN_ERROR_STREAK &&
+                            recoverOrStopJinhakMissionStall(
+                                trigger = "mission-origin-snapshot-error-circuit",
+                                errorType = errorType,
+                                countAsNoProgressFence = false
+                            )) {
+                            return@collectSnapshot
+                        }
+                    }
                     val failedRoute = canonicalizeBatchUrl(
                         snapshot.optString("navigationKey", snapshot.optString("url", currentBatchTarget.orEmpty()))
                     )
@@ -4016,6 +4164,9 @@ class MainActivity : Activity() {
                 return@collectSnapshot
             }
 
+            if (provider == ProviderId.JINHAK) {
+                jinhakMissionOriginSnapshotErrorStreak = 0
+            }
             val session = snapshot.optJSONObject("session") ?: JSONObject()
             if (session.optBoolean("needsLogin", false)) {
                 if (activeAction != null) {
@@ -5231,6 +5382,13 @@ class MainActivity : Activity() {
                         .put("referenceRoutesTracked", jinhakReferenceRouteCaptureCounts.size)
                         .put("referenceRepeatSkips", jinhakReferenceRepeatSkips)
                         .put("noProgressFences", jinhakNoProgressFences)
+                        .put("missionStallFenceTrips", jinhakMissionStallFenceTrips)
+                        .put("missionStallRecoveryAttempts", jinhakMissionStallRecoveryAttempts)
+                        .put("missionStallTerminalStops", jinhakMissionStallTerminalStops)
+                        .put("missionOriginSnapshotErrorStreak", jinhakMissionOriginSnapshotErrorStreak)
+                        .put("missionOriginSnapshotErrorTotal", jinhakMissionOriginSnapshotErrorTotal)
+                        .put("lastMissionOriginSnapshotErrorType", jinhakLastMissionOriginSnapshotErrorType.take(80))
+                        .put("jinhakPageStateErrorTypes", JSONObject(jinhakPageStateErrorTypes as Map<*, *>))
                         .put("secondsSinceMeaningfulProgress", if (jinhakLastMeaningfulProgressAtMs > 0L) (System.currentTimeMillis() - jinhakLastMeaningfulProgressAtMs).coerceAtLeast(0L) / 1000.0 else JSONObject.NULL)
                         .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
                         .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
@@ -5377,6 +5535,12 @@ class MainActivity : Activity() {
                 .put("jinhakOriginInferredMissionTargets", jinhakOriginInferredMissionTargets)
                 .put("jinhakExternalNavigationsBlocked", jinhakExternalNavigationsBlocked)
                 .put("jinhakNoProgressFences", jinhakNoProgressFences)
+                .put("jinhakMissionStallFenceTrips", jinhakMissionStallFenceTrips)
+                .put("jinhakMissionStallRecoveryAttempts", jinhakMissionStallRecoveryAttempts)
+                .put("jinhakMissionStallTerminalStops", jinhakMissionStallTerminalStops)
+                .put("jinhakMissionOriginSnapshotErrorStreak", jinhakMissionOriginSnapshotErrorStreak)
+                .put("jinhakMissionOriginSnapshotErrorTotal", jinhakMissionOriginSnapshotErrorTotal)
+                .put("jinhakLastMissionOriginSnapshotErrorType", jinhakLastMissionOriginSnapshotErrorType.take(80))
                 .put("jinhakApplicationBoundActions", jinhakApplicationBoundActions)
                 .put("jinhakApplicationMissionReturns", jinhakApplicationMissionReturns)
                 .put("jinhakApplicationMissionIdentities", jinhakMissionCoverage.size)
