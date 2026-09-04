@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.13 Same-Card Mission Replay Recovery"
+        android:label="Admission Collector v0.9.14 WebView Renderer Circuit Breaker"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

@@ -78,7 +78,9 @@ class JinhakSlowLanePool(
         val progressExtensions: Int,
         val replayAttempts: Int,
         val replaySuccesses: Int,
-        val maxActiveWorkers: Int
+        val maxActiveWorkers: Int,
+        val rendererGoneCount: Int,
+        val rendererCircuitOpen: Boolean
     )
 
     interface Listener {
@@ -107,17 +109,19 @@ class JinhakSlowLanePool(
     private val pending = ArrayDeque<Task>()
     private val pendingKeys = linkedSetOf<String>()
     private val slots = mutableListOf<WorkerSlot>()
-    private var maxActiveWorkers = 2
+    private var maxActiveWorkers = 1
     private var completedCount = 0
     private var failedCount = 0
     private var escalatedCount = 0
     private var progressExtensions = 0
     private var replayAttempts = 0
     private var replaySuccesses = 0
+    private var rendererGoneCount = 0
+    private var rendererCircuitOpen = false
     private var destroyed = false
 
     companion object {
-        const val DEFAULT_MAX_WORKERS = 2
+        const val DEFAULT_MAX_WORKERS = 1
         private const val MAX_QUEUE = 24
         private const val HEARTBEAT_MS = 2_000L
         private const val STALL_CHECK_AFTER_MS = 90_000L
@@ -128,7 +132,7 @@ class JinhakSlowLanePool(
     }
 
     fun enqueue(task: Task): Boolean {
-        if (destroyed || !isAllowedJinhakUrl(task.targetUrl) || !isAllowedJinhakUrl(task.originUrl.ifBlank { task.targetUrl })) return false
+        if (destroyed || rendererCircuitOpen || !isAllowedJinhakUrl(task.targetUrl) || !isAllowedJinhakUrl(task.originUrl.ifBlank { task.targetUrl })) return false
         val key = task.dedupeKey()
         if (pendingKeys.contains(key) || slots.any { it.task?.dedupeKey() == key }) return true
         if (pending.size >= MAX_QUEUE) return false
@@ -140,7 +144,7 @@ class JinhakSlowLanePool(
         return true
     }
 
-    fun hasWork(): Boolean = pending.isNotEmpty() || slots.any { it.task != null }
+    fun hasWork(): Boolean = !rendererCircuitOpen && (pending.isNotEmpty() || slots.any { it.task != null })
 
     fun stats(): Stats = Stats(
         queued = pending.size,
@@ -151,7 +155,9 @@ class JinhakSlowLanePool(
         progressExtensions = progressExtensions,
         replayAttempts = replayAttempts,
         replaySuccesses = replaySuccesses,
-        maxActiveWorkers = maxActiveWorkers
+        maxActiveWorkers = maxActiveWorkers,
+        rendererGoneCount = rendererGoneCount,
+        rendererCircuitOpen = rendererCircuitOpen
     )
 
     fun setMaxActiveWorkers(value: Int) {
@@ -202,7 +208,7 @@ class JinhakSlowLanePool(
     }
 
     private fun pump() {
-        if (destroyed) return
+        if (destroyed || rendererCircuitOpen) return
         while (slots.size < maxActiveWorkers) slots += createSlot(slots.size + 1)
         for (slot in slots) {
             if (slot.task != null || pending.isEmpty()) continue
@@ -252,8 +258,7 @@ class JinhakSlowLanePool(
             }
 
             override fun onRenderProcessGone(v: WebView?, detail: RenderProcessGoneDetail?): Boolean {
-                val task = slot.task
-                if (task != null) finishFailure(slot, "slow-lane-renderer-gone")
+                handleRendererGone(slot)
                 return true
             }
         }
@@ -392,6 +397,48 @@ class JinhakSlowLanePool(
         resetSlot(slot)
         notifyStats()
         pump()
+    }
+
+    private fun handleRendererGone(slot: WorkerSlot) {
+        val activeTask = slot.task
+        val activeStats = if (activeTask != null) {
+            resultStats(slot, laneSatisfied = false)
+        } else {
+            ResultStats(slot.id, 0L, 0, 0, false, false)
+        }
+
+        rendererGoneCount += 1
+        rendererCircuitOpen = true
+        slot.heartbeatGeneration += 1
+        slot.task = null
+
+        // Android WebView termination contract: this instance is dead and must never
+        // be reset or reused. Remove it from both the view hierarchy and worker pool.
+        runCatching { slot.webView.stopLoading() }
+        runCatching { host.removeView(slot.webView) }
+        runCatching { slot.webView.destroy() }
+        slots.remove(slot)
+
+        if (activeTask != null) {
+            failedCount += 1
+            listener.onSlowLaneFailed(activeTask, "slow-lane-renderer-gone", activeStats)
+        }
+
+        // Once one hidden renderer dies, do not create another hidden WebView in the
+        // same collection session. Return every queued task to the foreground mission
+        // scheduler as a recoverable circuit-open event.
+        val drained = pending.toList()
+        pending.clear()
+        pendingKeys.clear()
+        drained.forEach { task ->
+            failedCount += 1
+            listener.onSlowLaneFailed(
+                task,
+                "slow-lane-renderer-circuit-open",
+                ResultStats(0, 0L, 0, 0, false, false)
+            )
+        }
+        notifyStats()
     }
 
     private fun resultStats(slot: WorkerSlot, laneSatisfied: Boolean): ResultStats = ResultStats(

@@ -318,6 +318,8 @@ class MainActivity : Activity() {
     private var jinhakSameCardReplayRecovered = 0
     private var jinhakSameCardReplayTerminalFailures = 0
     private val jinhakSameCardReplayResolutionCounts = linkedMapOf<String, Int>()
+    private var jinhakSlowLaneRendererFallbacks = 0
+    private var jinhakSlowLaneRendererCircuitOpens = 0
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -346,8 +348,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.13"
-        private const val BUILD_CODE = 109130
+        private const val VERSION = "0.9.14"
+        private const val BUILD_CODE = 109140
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -2659,6 +2661,10 @@ class MainActivity : Activity() {
                 .put("applicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
                 .put("applicationAnchorActionsClicked", jinhakMissionAnchorClickedKeys.size)
                 .put("applicationAnchorReportConfirmed", jinhakReportConfirmedKeys.size)
+                .put("sameCardReplayRetries", jinhakSameCardReplayRetries)
+                .put("sameCardReplayRecovered", jinhakSameCardReplayRecovered)
+                .put("sameCardReplayTerminalFailures", jinhakSameCardReplayTerminalFailures)
+                .put("sameCardReplayResolutionCounts", JSONObject(jinhakSameCardReplayResolutionCounts as Map<*, *>))
                 .put("missionTargetLedger", jinhakMissionTargetLedger.summary())
                 .put("missionTargetLedgerPending", jinhakMissionTargetLedger.pendingCount())
                 .put("missionTargetLedgerOutstanding", jinhakMissionTargetLedger.outstandingCount())
@@ -2884,7 +2890,8 @@ class MainActivity : Activity() {
                 priority = priority,
                 reason = "foreground-35s-slow-escalation"
             )
-            val accepted = ::slowLanePool.isInitialized && slowLanePool.enqueue(task)
+            val slowLaneCircuitOpen = ::slowLanePool.isInitialized && slowLanePool.stats().rendererCircuitOpen
+            val accepted = !slowLaneCircuitOpen && ::slowLanePool.isInitialized && slowLanePool.enqueue(task)
             val ledgerTargetForSlowLane = jinhakActiveMissionTargetId
             if (accepted) {
                 if (ledgerTargetForSlowLane != null) {
@@ -2901,6 +2908,32 @@ class MainActivity : Activity() {
                     .put("priority", priority)
                     .put("missionBound", mission?.identityKey != null))
                 localRunId?.let { runId -> localStore.markDocument(runId, target, "slow-lane", 0, null) }
+            } else if (slowLaneCircuitOpen) {
+                if (ledgerTargetForSlowLane != null) {
+                    jinhakMissionTargetLedger.markRetryableFailure(ledgerTargetForSlowLane, "slow-lane-renderer-circuit-open")
+                    if (jinhakActiveMissionTargetId == ledgerTargetForSlowLane) jinhakActiveMissionTargetId = null
+                }
+                jinhakSlowLaneRendererCircuitOpens += 1
+                val origin = canonicalizeBatchUrl(actionOrigin)
+                currentBatchTarget = origin.takeIf { it.isNotBlank() } ?: currentBatchTarget
+                jinhakMissionNeedsReturn = false
+                jinhakReportBridgeContext = null
+                recordRuntimeEvent("jinhak-slow-lane-circuit-open-main-fallback", JSONObject()
+                    .put("targetSafePath", runtimeSafePath(target))
+                    .put("originSafePath", runtimeSafePath(origin))
+                    .put("missionTargetRestored", ledgerTargetForSlowLane != null))
+                persistLiveJinhakDiagnostics("slow-lane-circuit-open", force = true)
+                jinhakAbsoluteTargetKey = ""
+                ++jinhakAbsoluteTargetGeneration
+                runCatching { webView.stopLoading() }
+                status.text = "slow lane renderer circuit이 열려 숨김 WebView를 생성하지 않습니다 · 메인 WebView에서 지원안 미션을 계속합니다."
+                handler.postDelayed({
+                    if (!batchRunning || batchPausedForLogin) return@postDelayed
+                    val retryOrigin = currentBatchTarget
+                    if (!retryOrigin.isNullOrBlank() && isProviderUrl(retryOrigin)) webView.loadUrl(retryOrigin)
+                    else loadNextBatchPage()
+                }, 350L)
+                return@postDelayed
             } else {
                 if (ledgerTargetForSlowLane != null) {
                     jinhakMissionTargetLedger.markFailed(ledgerTargetForSlowLane, "slow-lane-queue-full")
@@ -3064,26 +3097,68 @@ class MainActivity : Activity() {
         reason: String,
         stats: JinhakSlowLanePool.ResultStats
     ) {
-        jinhakSlowLaneMissionTargetIds.remove(task.id)?.let { targetId ->
-            jinhakMissionTargetLedger.markFailed(targetId, reason)
+        val failureClass = reason.substringBefore(':').take(80)
+        val recoverableRendererFailure = failureClass == "slow-lane-renderer-gone" ||
+            failureClass == "slow-lane-renderer-circuit-open"
+        val targetId = jinhakSlowLaneMissionTargetIds.remove(task.id)
+        if (targetId != null) {
+            if (recoverableRendererFailure) {
+                jinhakMissionTargetLedger.markRetryableFailure(targetId, failureClass)
+                if (jinhakActiveMissionTargetId == targetId) jinhakActiveMissionTargetId = null
+            } else {
+                jinhakMissionTargetLedger.markFailed(targetId, reason)
+            }
         }
         jinhakSlowLaneFailed += 1
-        val failureClass = reason.substringBefore(':').take(80)
         jinhakSlowLaneFailureReasons[failureClass] = (jinhakSlowLaneFailureReasons[failureClass] ?: 0) + 1
         batchErrors.put(JSONObject()
             .put("type", reason.take(120))
             .put("targetSafePath", runtimeSafePath(task.targetUrl))
             .put("source", "concurrent-slow-lane")
             .put("laneHint", task.laneHint)
+            .put("recoverable", recoverableRendererFailure)
             .put("elapsedMs", stats.elapsedMs)
             .put("progressEvents", stats.progressEvents))
-        localRunId?.let { runId -> localStore.markDocument(runId, task.targetUrl, "error", 0, reason.take(120)) }
-        cloudFrontierTaskIds.remove(task.targetUrl)?.let { taskId -> cloudOffload.completeFrontier(taskId, "error", reason.take(120)) { ok -> if (ok) cloudFrontierCompleted += 1 else cloudFrontierCompletionFailed += 1 } }
+        localRunId?.let { runId -> localStore.markDocument(runId, task.targetUrl, if (recoverableRendererFailure) "pending" else "error", 0, reason.take(120)) }
+        if (!recoverableRendererFailure) {
+            cloudFrontierTaskIds.remove(task.targetUrl)?.let { taskId -> cloudOffload.completeFrontier(taskId, "error", reason.take(120)) { ok -> if (ok) cloudFrontierCompleted += 1 else cloudFrontierCompletionFailed += 1 } }
+        }
         recordRuntimeEvent("jinhak-slow-lane-failed", JSONObject()
             .put("targetSafePath", runtimeSafePath(task.targetUrl))
             .put("reason", reason.take(120))
+            .put("recoverable", recoverableRendererFailure)
             .put("elapsedMs", stats.elapsedMs)
             .put("progressEvents", stats.progressEvents))
+
+        if (recoverableRendererFailure) {
+            jinhakSlowLaneRendererFallbacks += 1
+            if (failureClass == "slow-lane-renderer-circuit-open") jinhakSlowLaneRendererCircuitOpens += 1
+            val fallbackMission = JinhakReportContextBridge.context(task.missionContext)
+                ?: JinhakApplicationMission.fromJson(task.missionContext)
+            if (fallbackMission?.identityKey != null) jinhakMissionContext = fallbackMission
+            val origin = canonicalizeBatchUrl(task.originUrl.ifBlank { task.targetUrl })
+            if (origin.isNotBlank()) jinhakMissionOriginRoute = origin
+            jinhakMissionNeedsReturn = false
+            jinhakReportBridgeContext = null
+            currentBatchTarget = origin.takeIf { it.isNotBlank() } ?: currentBatchTarget
+            recordRuntimeEvent("jinhak-slow-lane-renderer-fallback-main", JSONObject()
+                .put("targetSafePath", runtimeSafePath(task.targetUrl))
+                .put("originSafePath", runtimeSafePath(origin))
+                .put("failureClass", failureClass)
+                .put("missionTargetRestored", targetId != null)
+                .put("hiddenRendererCircuitOpen", ::slowLanePool.isInitialized && slowLanePool.stats().rendererCircuitOpen))
+            persistLiveJinhakDiagnostics("slow-lane-renderer-fallback", force = true)
+            status.text = "숨김 WebView renderer 종료 감지 · slow lane을 차단하고 같은 지원안 target을 메인 WebView로 복귀합니다."
+            if (batchRunning && !batchPausedForLogin) {
+                handler.postDelayed({
+                    if (!batchRunning || batchPausedForLogin) return@postDelayed
+                    val retryOrigin = currentBatchTarget
+                    if (!retryOrigin.isNullOrBlank() && isProviderUrl(retryOrigin)) webView.loadUrl(retryOrigin)
+                    else loadNextBatchPage()
+                }, 350L)
+            }
+            return
+        }
         if (batchRunning && !batchPausedForLogin) handler.postDelayed({ loadNextBatchPage() }, 80L)
     }
 
@@ -5232,6 +5307,10 @@ class MainActivity : Activity() {
                         .put("slowLaneReplayAttempts", if (::slowLanePool.isInitialized) slowLanePool.stats().replayAttempts else 0)
                         .put("slowLaneReplaySuccesses", if (::slowLanePool.isInitialized) slowLanePool.stats().replaySuccesses else 0)
                         .put("slowLaneMaxActiveWorkers", if (::slowLanePool.isInitialized) slowLanePool.stats().maxActiveWorkers else 0)
+                        .put("slowLaneRendererGoneCount", if (::slowLanePool.isInitialized) slowLanePool.stats().rendererGoneCount else 0)
+                        .put("slowLaneRendererCircuitOpen", if (::slowLanePool.isInitialized) slowLanePool.stats().rendererCircuitOpen else false)
+                        .put("slowLaneRendererFallbacks", jinhakSlowLaneRendererFallbacks)
+                        .put("slowLaneRendererCircuitOpenFallbacks", jinhakSlowLaneRendererCircuitOpens)
                         .put("applicationMissionCoverage", JSONObject().apply {
                             val lanes = listOf("saved-application", "current-prediction", "mock-support", "actual-admit", "university-result", "score-analysis", "strategy")
                             for (lane in lanes) put(lane, jinhakMissionCoverage.values.count { it.contains(lane) })
