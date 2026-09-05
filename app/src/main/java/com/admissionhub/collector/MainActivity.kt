@@ -354,6 +354,9 @@ class MainActivity : Activity() {
     private var jinhakRealAuthProbeBaselineAutoSubmissions = 0
     private var jinhakRealAuthProbeBaselineAutoSuccesses = 0
     private var jinhakRealAuthProbeBaselineAutoFailures = 0
+    private var jinhakRealAuthResumeGatePending = false
+    private var jinhakAuthProofRestores = 0
+    private var jinhakAuthResumeGateRuns = 0
 
     companion object {
         private const val SAVE_JSON_REQUEST = 7001
@@ -390,8 +393,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.17"
-        private const val BUILD_CODE = 109170
+        private const val VERSION = "0.9.18"
+        private const val BUILD_CODE = 109180
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -419,10 +422,15 @@ class MainActivity : Activity() {
             }
         })
         configureWebView()
+        restoreJinhakAuthProofCheckpoint("activity-create")
         val resumed = resumeInterruptedUnifiedSessionIfNeeded()
         if (!resumed) {
             if (AUTO_LOGIN_AND_COLLECT_ON_LAUNCH) {
-                handler.postDelayed({ startJinhakRealAuthProbe(autoContinue = true, trigger = "app-launch") }, 350L)
+                if (isFreshJinhakRealAuthProbe()) {
+                    handler.postDelayed({ startAutomaticLoginAndCollectionSequence("app-launch-restored-real-auth") }, 350L)
+                } else {
+                    handler.postDelayed({ startJinhakRealAuthProbe(autoContinue = true, trigger = "app-launch") }, 350L)
+                }
             } else {
                 openProvider(ProviderId.JINHAK)
             }
@@ -1104,6 +1112,53 @@ class MainActivity : Activity() {
         } catch (_: Exception) { "unparseable" }
     }
 
+    private fun hasFreshJinhakProtectedCoreProof(): Boolean {
+        if (jinhakLastCoreVerifiedAtMs <= 0L) return false
+        val age = (System.currentTimeMillis() - jinhakLastCoreVerifiedAtMs).coerceAtLeast(0L)
+        if (age > JINHAK_REAL_AUTH_PROBE_FRESH_MS) return false
+        return jinhakLastAuthEvidence.startsWith("protected-core-stable") ||
+            jinhakLastAuthEvidence.startsWith("real-protected-core-stable")
+    }
+
+    private fun persistJinhakAuthProofCheckpoint(synchronous: Boolean = false) {
+        runCatching {
+            val editor = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
+                .putString("jinhakAuthProofCollectorVersion", VERSION)
+                .putString("jinhakRealAuthProbeResult", jinhakRealAuthProbeResult.take(80))
+                .putLong("jinhakRealAuthProbeVerifiedAtMs", jinhakRealAuthProbeVerifiedAtMs)
+                .putLong("jinhakLastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
+                .putString("jinhakLastAuthEvidence", jinhakLastAuthEvidence.take(80))
+                .putString("jinhakAuthProofSafePath", runtimeSafePath(webView.url).take(300))
+                .putBoolean("credentialExported", false)
+                .putBoolean("sessionSecretExported", false)
+            if (synchronous) editor.commit() else editor.apply()
+        }
+    }
+
+    private fun restoreJinhakAuthProofCheckpoint(trigger: String): Boolean {
+        val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
+        if (prefs.getString("jinhakAuthProofCollectorVersion", "") != VERSION) return false
+        val restoredProbeResult = prefs.getString("jinhakRealAuthProbeResult", "never-run").orEmpty().take(80)
+        val restoredProbeAt = prefs.getLong("jinhakRealAuthProbeVerifiedAtMs", 0L)
+        val restoredCoreAt = prefs.getLong("jinhakLastCoreVerifiedAtMs", 0L)
+        val restoredEvidence = prefs.getString("jinhakLastAuthEvidence", "none").orEmpty().take(80)
+        if (restoredProbeAt > jinhakRealAuthProbeVerifiedAtMs) {
+            jinhakRealAuthProbeVerifiedAtMs = restoredProbeAt
+            jinhakRealAuthProbeResult = restoredProbeResult.ifBlank { "never-run" }
+        }
+        if (restoredCoreAt > jinhakLastCoreVerifiedAtMs) {
+            jinhakLastCoreVerifiedAtMs = restoredCoreAt
+            jinhakLastAuthEvidence = restoredEvidence.ifBlank { "none" }
+        }
+        val fresh = hasFreshJinhakProtectedCoreProof()
+        if (fresh) {
+            jinhakAuthVerifiedForBatch = true
+            jinhakCoreBootstrapState = "protected-core-checkpoint-restored"
+            jinhakAuthProofRestores += 1
+        }
+        return fresh
+    }
+
     private fun persistRuntimeCheckpoint(forceResume: Boolean = unifiedRunning) {
         runCatching {
             getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
@@ -1114,6 +1169,12 @@ class MainActivity : Activity() {
                 .putInt("batchPageCount", batchPageCount)
                 .putInt("queueSize", batchQueue.size)
                 .putInt("errorCount", batchErrors.length())
+                .putString("jinhakAuthProofCollectorVersion", VERSION)
+                .putString("jinhakRealAuthProbeResult", jinhakRealAuthProbeResult.take(80))
+                .putLong("jinhakRealAuthProbeVerifiedAtMs", jinhakRealAuthProbeVerifiedAtMs)
+                .putLong("jinhakLastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
+                .putString("jinhakLastAuthEvidence", jinhakLastAuthEvidence.take(80))
+                .putString("jinhakAuthProofSafePath", runtimeSafePath(webView.url).take(300))
                 .apply()
         }
         if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
@@ -1144,6 +1205,14 @@ class MainActivity : Activity() {
                 .put("reportBridgeContext", jinhakReportBridgeContext?.let { JSONObject(it.toString()) } ?: JSONObject.NULL)
                 .put("targetAuthRedirectCounts", JSONObject(jinhakTargetAuthRedirectCounts as Map<*, *>))
                 .put("targetAuthRedirectEpisodeOpenKey", if (jinhakTargetAuthRedirectEpisodeOpenKey.isBlank()) JSONObject.NULL else jinhakTargetAuthRedirectEpisodeOpenKey)
+                .put("authProofCollectorVersion", VERSION)
+                .put("realAuthProbeResult", jinhakRealAuthProbeResult.take(80))
+                .put("realAuthProbeVerifiedAtMs", jinhakRealAuthProbeVerifiedAtMs)
+                .put("lastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
+                .put("lastAuthEvidence", jinhakLastAuthEvidence.take(80))
+                .put("authProofSafePath", runtimeSafePath(webView.url).take(300))
+                .put("credentialStored", false)
+                .put("sessionSecretStored", false)
                 .put("trigger", trigger.take(60))
                 .put("updatedAtMs", System.currentTimeMillis())
         )
@@ -1177,6 +1246,23 @@ class MainActivity : Activity() {
             }
             jinhakTargetAuthRedirectEpisodeOpenKey = runtime.optString("targetAuthRedirectEpisodeOpenKey")
                 .takeIf { it.isNotBlank() && it != "null" }.orEmpty()
+            if (runtime.optString("authProofCollectorVersion") == VERSION) {
+                val runtimeProbeAt = runtime.optLong("realAuthProbeVerifiedAtMs", 0L)
+                val runtimeCoreAt = runtime.optLong("lastCoreVerifiedAtMs", 0L)
+                if (runtimeProbeAt > jinhakRealAuthProbeVerifiedAtMs) {
+                    jinhakRealAuthProbeVerifiedAtMs = runtimeProbeAt
+                    jinhakRealAuthProbeResult = runtime.optString("realAuthProbeResult", "never-run").take(80)
+                }
+                if (runtimeCoreAt > jinhakLastCoreVerifiedAtMs) {
+                    jinhakLastCoreVerifiedAtMs = runtimeCoreAt
+                    jinhakLastAuthEvidence = runtime.optString("lastAuthEvidence", "none").take(80)
+                }
+                if (hasFreshJinhakProtectedCoreProof()) {
+                    jinhakAuthVerifiedForBatch = true
+                    jinhakCoreBootstrapState = "protected-core-session-checkpoint-restored"
+                    jinhakAuthProofRestores += 1
+                }
+            }
         }
         if (restored > 0) {
             recordRuntimeEvent(
@@ -1315,12 +1401,38 @@ class MainActivity : Activity() {
             unifiedJinhakAutoCapture = false
             val restoredMissionTargets = restoreJinhakMissionPersistence(sessionId, "activity-resume")
             val lease = runCatching { sessionVault.restore(ProviderId.JINHAK.wireName) }.getOrNull()
-            status.text = if (lease?.restored == true) {
-                "이전 중단 감지: 암호화 로그인 세션과 mission ${restoredMissionTargets}개를 복구하고 진학사 에이전트를 체크포인트에서 재개합니다."
+            val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
+            if (hasFreshJinhakProtectedCoreProof() && coreProbe.isNotBlank()) {
+                jinhakAuthVerifiedForBatch = false
+                jinhakCoreBootstrapState = "resume-core-revalidate"
+                jinhakLastAuthEvidence = "resume-core-revalidation-pending"
+                jinhakTransitionAuthGateActive = true
+                status.text = "이전 중단 감지: mission ${restoredMissionTargets}개와 최신 보호경로 인증 증거를 복구했습니다. 실제 수시저장소를 재검증한 뒤 재개합니다."
+                recordRuntimeEvent("jinhak-resume-auth-proof-restored", JSONObject()
+                    .put("restoredMissionTargets", restoredMissionTargets)
+                    .put("leaseRestored", lease?.restored == true)
+                    .put("proofAgeMs", (System.currentTimeMillis() - jinhakLastCoreVerifiedAtMs).coerceAtLeast(0L))
+                    .put("coreSafePath", runtimeSafePath(coreProbe))
+                    .put("credentialExported", false)
+                    .put("sessionSecretExported", false))
+                webView.loadUrl(coreProbe)
             } else {
-                "이전 중단 감지: 저장된 브라우저 세션을 검증한 뒤 진학사 에이전트를 재개합니다."
+                unifiedPendingJinhakStart = false
+                jinhakRealAuthResumeGatePending = true
+                jinhakAuthResumeGateRuns += 1
+                status.text = "이전 중단 감지: mission ${restoredMissionTargets}개는 보존됐지만 최신 인증 증거가 없어 실제 진학사 로그인 진단을 먼저 실행합니다."
+                recordRuntimeEvent("jinhak-resume-real-auth-gate-required", JSONObject()
+                    .put("restoredMissionTargets", restoredMissionTargets)
+                    .put("leaseRestored", lease?.restored == true)
+                    .put("proofFresh", false)
+                    .put("credentialExported", false)
+                    .put("sessionSecretExported", false))
+                handler.postDelayed({
+                    if (unifiedRunning && unifiedPhase == "jinhak" && !batchRunning && jinhakRealAuthResumeGatePending) {
+                        startJinhakRealAuthProbe(autoContinue = true, trigger = "activity-resume-auth-gate")
+                    }
+                }, 350L)
             }
-            webView.loadUrl(ProviderId.JINHAK.homeUrl)
             true
         }
     }
@@ -1659,7 +1771,9 @@ class MainActivity : Activity() {
 
     private fun startJinhakRealAuthProbe(autoContinue: Boolean, trigger: String) {
         if (jinhakRealAuthProbeActive) return
-        if (unifiedRunning || batchRunning || startupLoginPreflightActive) {
+        val restoredResumeGate = jinhakRealAuthResumeGatePending && unifiedRunning &&
+            unifiedPhase == "jinhak" && !batchRunning && !startupLoginPreflightActive
+        if ((!restoredResumeGate && unifiedRunning) || batchRunning || startupLoginPreflightActive) {
             Toast.makeText(this, "진행 중인 수집/로그인 준비가 있어 실제 진학사 로그인 진단을 시작할 수 없습니다.", Toast.LENGTH_LONG).show()
             return
         }
@@ -1812,8 +1926,10 @@ class MainActivity : Activity() {
             jinhakAuthVerifiedForBatch = false
             jinhakCoreBootstrapState = "real-auth-probe-failed"
             jinhakLastAuthEvidence = result.take(80)
+            jinhakLastCoreVerifiedAtMs = 0L
             runCatching { webView.stopLoading() }
         }
+        persistJinhakAuthProofCheckpoint(synchronous = true)
         realJinhakAuthProbeButton.text = "진학사 실제 로그인 진단"
         unifiedButton.isEnabled = true
         val output = JSONObject()
@@ -1860,11 +1976,20 @@ class MainActivity : Activity() {
             "진학사 실제 로그인 진단: $result · 전체 수집을 시작하지 않았습니다. JSON 저장으로 짧은 인증 경로 로그를 확인할 수 있습니다."
         }
         if (success && autoContinue) {
-            handler.postDelayed({
-                if (!unifiedRunning && !batchRunning && !startupLoginPreflightActive) {
-                    startAutomaticLoginAndCollectionSequence("real-jinhak-auth-probe")
-                }
-            }, 250L)
+            if (jinhakRealAuthResumeGatePending && unifiedRunning && unifiedPhase == "jinhak" && !batchRunning) {
+                jinhakRealAuthResumeGatePending = false
+                unifiedPendingJinhakStart = false
+                status.text = "재개 인증 진단 통과 · 보존된 mission ledger에서 진학사 수집을 재개합니다."
+                handler.postDelayed({
+                    if (unifiedRunning && unifiedPhase == "jinhak" && !batchRunning) startBatch()
+                }, 250L)
+            } else {
+                handler.postDelayed({
+                    if (!unifiedRunning && !batchRunning && !startupLoginPreflightActive) {
+                        startAutomaticLoginAndCollectionSequence("real-jinhak-auth-probe")
+                    }
+                }, 250L)
+            }
         }
     }
 
@@ -2489,6 +2614,10 @@ class MainActivity : Activity() {
                     .put("realJinhakAuthProbeVerifiedAtMs", jinhakRealAuthProbeVerifiedAtMs)
                     .put("realJinhakAuthRouteCycleDetected", jinhakRealAuthProbeRouteCycleDetected)
                     .put("realJinhakAuthRouteTransitions", jinhakRealAuthProbeRouteEvents.length())
+                    .put("authProofRestores", jinhakAuthProofRestores)
+                    .put("authResumeGateRuns", jinhakAuthResumeGateRuns)
+                    .put("authResumeGatePending", jinhakRealAuthResumeGatePending)
+                    .put("freshProtectedCoreProof", hasFreshJinhakProtectedCoreProof())
                     .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
                     .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
                     .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
@@ -2609,6 +2738,8 @@ class MainActivity : Activity() {
             }
         }
         runCatching { sessionVault.captureAuthenticated(ProviderId.JINHAK.wireName, webView.url.orEmpty(), VERSION) }
+        persistJinhakAuthProofCheckpoint(synchronous = true)
+        persistJinhakMissionRuntimeState("protected-core-auth-verified")
         persistJinhakAuthDiagnostics("$reason-auth-verified")
         ++jinhakLoginRecoveryGeneration
 

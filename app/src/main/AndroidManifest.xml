@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.17 Real Jinhak Auth Gate"
+        android:label="Admission Collector v0.9.18 Auth Proof Resume Gate"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
