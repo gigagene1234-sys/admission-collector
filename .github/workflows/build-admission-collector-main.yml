@@ -69,7 +69,7 @@ jobs:
           grep -q 'fun storeObservationEvidence' "$STORE"
           grep -q 'fun writeObservations' "$STORE"
           grep -q 'unclassified-potential-value' "$MAIN"
-          grep -q 'override val supportsBatchCrawl = true' "$ADAPTER"
+          grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
           grep -q 'PUBLIC_DETERMINISTIC_COLLECTION' app/src/main/java/com/admissionhub/collector/provider/ProviderCapability.kt
           grep -q 'JINHAK_AUTONOMOUS_CRAWL' "$SYNC"
           grep -q 'JINHAK_USER_CONSENT_REQUIRED' "$SYNC"
