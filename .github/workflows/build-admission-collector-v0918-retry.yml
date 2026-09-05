@@ -1,0 +1,232 @@
+name: Build Admission Collector v0.9.18 Auth Proof Resume Gate Retry
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v0918-retry.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify-commit-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Confirm v0.9.17 source baseline and no published v0.9.18 tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'private const val VERSION = "0.9.17"' app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          grep -q 'versionName = "0.9.17"' app/build.gradle.kts
+          if git rev-parse -q --verify refs/tags/v0.9.18 >/dev/null; then
+            echo "v0.9.18 tag already exists; refusing to overwrite it"
+            exit 1
+          fi
+          if gh release view v0.9.18 >/dev/null 2>&1; then
+            echo "v0.9.18 release already exists; refusing to overwrite it"
+            exit 1
+          fi
+
+      - name: Apply already-reviewed v0.9.18 patch
+        run: python3 .github/scripts/patch_v0918.py
+
+      - name: Verify bounded source change and cumulative safety invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          changed=set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())
+          allowed={
+              'app/src/main/java/com/admissionhub/collector/MainActivity.kt',
+              'app/build.gradle.kts',
+              'app/src/main/AndroidManifest.xml',
+          }
+          if changed != allowed:
+              raise SystemExit(f'Unexpected source change set: {sorted(changed)}')
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          p=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt').read_text()
+          l=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
+          s=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          manifest=Path('app/src/main/AndroidManifest.xml').read_text()
+          checks={
+              'version': 'private const val VERSION = "0.9.18"' in m and 'private const val BUILD_CODE = 109180' in m,
+              'gradle': 'versionCode = 109180' in g and 'versionName = "0.9.18"' in g,
+              'label': 'Admission Collector v0.9.18 Auth Proof Resume Gate' in manifest,
+              'proof-persist': 'persistJinhakAuthProofCheckpoint' in m and 'jinhakAuthProofCollectorVersion' in m,
+              'proof-restore': 'restoreJinhakAuthProofCheckpoint' in m and 'hasFreshJinhakProtectedCoreProof' in m,
+              'resume-real-probe-gate': 'jinhak-resume-real-auth-gate-required' in m and 'activity-resume-auth-gate' in m,
+              'same-session': 'jinhakRealAuthResumeGatePending' in m and '보존된 mission ledger' in m,
+              'real-auth-cycle': 'auth-route-cycle-detected' in m and 'MAX_JINHAK_REAL_AUTH_ROUTE_TRANSITIONS = 14' in m,
+              'real-auth-timeout': 'JINHAK_REAL_AUTH_PROBE_TIMEOUT_MS = 90_000L' in m,
+              'redirect-guard': 'quarantineJinhakTargetSpecificAuthRedirect' in m and 'MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES = 2' in m,
+              'stall-fence': 'recoverOrStopJinhakMissionStall' in m and 'MAX_JINHAK_MISSION_STALL_RECOVERIES = 2' in m,
+              'renderer-circuit': 'const val DEFAULT_MAX_WORKERS = 1' in p and 'rendererCircuitOpen' in p,
+              'mission-sqlite': 'CREATE TABLE IF NOT EXISTS jinhak_mission_targets' in l and 'monotonicStateGuard' in l,
+              'same-card': 'same-card-action-not-found' in m and 'MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3' in m,
+              'susi-core': 'isDefaultSusiCoreTraversalUrl' in m,
+              'credential-vault': 'CredentialVault' in m,
+              'snapshot-privacy': 'safeCloneText' in s and 'input,textarea,select,option,form' in s,
+              'probe-privacy': 'sanitized-host-path-only-no-query' in m and '.put("cookieExported", false)' in m and '.put("formValuesExported", false)' in m,
+              'proof-privacy': 'authProofSafePath' in m and '.putBoolean("credentialExported", false)' in m and '.putBoolean("sessionSecretExported", false)' in m,
+          }
+          failed=[k for k,v in checks.items() if not v]
+          if failed:
+              raise SystemExit('Invariant failure: '+', '.join(failed))
+          forbidden=[
+              '.put("username", credentials.username)',
+              '.put("password", credentials.password)',
+              '.putString("username",',
+              '.putString("password",',
+          ]
+          hits=[x for x in forbidden if x in m]
+          if hits:
+              raise SystemExit('Credential export invariant failed: '+', '.join(hits))
+          print('v0.9.18 cumulative invariants passed')
+          PY
+          git diff --check
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Unit test and build patched source
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Verify patched APK identity and signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" >/dev/null
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee precommit-badging.txt
+          grep -q "versionCode='109180'" precommit-badging.txt
+          grep -q "versionName='0.9.18'" precommit-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.18 Auth Proof Resume Gate'" precommit-badging.txt
+
+      - name: Commit source, rebase non-destructively, and push
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.9.18 Auth Proof Resume Gate"
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Fresh-check exact committed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED="${{ steps.commit.outputs.sha }}"
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(git rev-parse HEAD)" = "$EXPECTED"
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          assert 'private const val VERSION = "0.9.18"' in m
+          assert 'versionCode = 109180' in g
+          assert 'persistJinhakAuthProofCheckpoint' in m
+          assert 'restoreJinhakAuthProofCheckpoint' in m
+          assert 'jinhak-resume-real-auth-gate-required' in m
+          assert 'activity-resume-auth-gate' in m
+          assert 'auth-route-cycle-detected' in m
+          assert 'quarantineJinhakTargetSpecificAuthRedirect' in m
+          assert 'recoverOrStopJinhakMissionStall' in m
+          print('fresh committed main source verified')
+          PY
+
+      - name: Independently rebuild committed main
+        run: gradle --no-daemon clean :app:assembleDebug
+
+      - name: Package and hash final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.18-Auth-Proof-Resume-Gate.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='109180'" badging.txt
+          grep -q "versionName='0.9.18'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.18 Auth Proof Resume Gate'" badging.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.18-Auth-Proof-Resume-Gate.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-v0.9.18-auth-proof-resume-gate
+          path: |
+            Admission-Collector-v0.9.18-Auth-Proof-Resume-Gate.apk
+            Admission-Collector-v0.9.18-Auth-Proof-Resume-Gate.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish immutable v0.9.18 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          if gh release view v0.9.18 >/dev/null 2>&1; then
+            echo "Release v0.9.18 appeared concurrently; refusing to overwrite it"
+            exit 1
+          fi
+          NOTES="v0.9.18 fixes the v0.9.17 auth-proof continuity defect observed on the Galaxy Tab run: the real Jinhak auth probe and protected-core verification succeeded, but later volatile auth fields reverted to never-run/false while the SQLite mission ledger survived. This build persists only privacy-safe auth evidence (version, bounded state strings, timestamps, sanitized host/path without query), restores it after recreation, revalidates fresh protected-core proof before mission resume, and runs the bounded real-site auth probe first when proof is missing or stale. The preserved mission ledger resumes in the same unified session. ID, password, cookies, tokens, localStorage, sessionStorage and hidden form values are never persisted/exported by this patch. Existing renderer recovery/circuit breaker, SQLite monotonic mission persistence, bootstrap recovery, same-card replay, mission stall fence, target auth redirect guard, real auth route-cycle detector, Susi-core restriction and same-card binding remain cumulative. Source commit: $SHA"
+          gh release create v0.9.18 Admission-Collector-v0.9.18-Auth-Proof-Resume-Gate.apk Admission-Collector-v0.9.18-Auth-Proof-Resume-Gate.sha256 --target "$SHA" --title "Admission Collector v0.9.18 — Auth Proof Resume Gate" --notes "$NOTES"
+
+      - name: Verify published release target and assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED="${{ steps.commit.outputs.sha }}"
+          gh release view v0.9.18 --json tagName,targetCommitish,name,assets > release.json
+          cat release.json
+          grep -q 'Admission-Collector-v0.9.18-Auth-Proof-Resume-Gate.apk' release.json
+          grep -q 'Admission-Collector-v0.9.18-Auth-Proof-Resume-Gate.sha256' release.json
+          test "$(git rev-parse HEAD)" = "$EXPECTED"
