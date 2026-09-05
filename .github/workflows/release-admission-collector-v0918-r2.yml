@@ -1,0 +1,236 @@
+name: Release Admission Collector v0.9.18 Auth Resume Revalidation R2
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/release-admission-collector-v0918-r2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: v0.9.18
+      APK_NAME: Admission-Collector-v0.9.18-Auth-Resume-Revalidation.apk
+
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply scoped v0.9.18 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/patch_v0918_auth_resume_v2.py
+          git diff --check
+
+      - name: Verify patch and cumulative safety invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          SLOW=app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt
+          SNAP=app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
+
+          grep -q 'private const val VERSION = "0.9.18"' "$MAIN"
+          grep -q 'private const val BUILD_CODE = 109180' "$MAIN"
+          grep -q 'versionName = "0.9.18"' app/build.gradle.kts
+          grep -q 'versionCode = 109180' app/build.gradle.kts
+          grep -q 'Admission Collector v0.9.18 Auth Resume Revalidation' app/src/main/AndroidManifest.xml
+          grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
+          grep -q 'override val supportsUserSessionMissionTraversal = true' "$ADAPTER"
+          grep -q 'DEFAULT_MAX_WORKERS = 2' "$SLOW"
+          grep -q 'slowLanePool.setMaxActiveWorkers(1)' "$MAIN"
+          grep -q 'persistJinhakAuthRuntimeEvidence' "$MAIN"
+          grep -q 'restoreJinhakAuthRuntimeEvidence' "$MAIN"
+          grep -q 'activity-resume-core-revalidate' "$MAIN"
+          grep -q 'jinhak-activity-resume-auth-revalidation' "$MAIN"
+          grep -q 'JINHAK_CORE_AUTH_STABLE_PASSES = 2' "$MAIN"
+          grep -q 'target-specific-auth-redirect' "$MAIN"
+          grep -q 'onRenderProcessGone' "$MAIN"
+          grep -q 'restoreJinhakMissionPersistence' "$MAIN"
+          grep -q 'jinhakSameCardReplayRetries' "$MAIN"
+          grep -q 'slowLaneRendererCircuitOpen' "$MAIN"
+          grep -q 'jinhakMissionStallFenceTrips' "$MAIN"
+          grep -q 'CredentialVault' "$MAIN"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          main = Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          workflow = Path('.github/workflows/build-admission-collector-main.yml').read_text()
+          snap = Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          adapter = Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+
+          if 'override val supportsBatchCrawl = false' not in adapter:
+              raise SystemExit('Jinhak deterministic batch crawl safety invariant regressed')
+          if "grep -q 'override val supportsBatchCrawl = false' \"$ADAPTER\"" not in workflow:
+              raise SystemExit('main CI still contradicts Jinhak batch safety invariant')
+
+          checkpoint = main.split('private fun persistJinhakAuthRuntimeEvidence',1)[1].split('private fun restoreJinhakAuthRuntimeEvidence',1)[0]
+          forbidden = ['password', 'passwd', 'cookie', 'localStorage', 'sessionStorage', 'formValues', 'credentialVault.load', 'document.cookie', 'hidden']
+          for token in forbidden:
+              if token.lower() in checkpoint.lower():
+                  raise SystemExit('forbidden auth checkpoint material: ' + token)
+
+          dept = snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
+          if 'previousElementSibling' in dept or 'nextElementSibling' in dept:
+              raise SystemExit('cross-card department inheritance detected')
+
+          resume = main.split('private fun resumeInterruptedUnifiedSessionIfNeeded()',1)[1].split('private fun providerLoginUrl',1)[0]
+          jinhak = resume.split('provider = ProviderId.JINHAK',1)[1]
+          if 'unifiedPendingJinhakStart = true' in jinhak:
+              raise SystemExit('activity resume can directly arm Jinhak batch start')
+          for token in [
+              'jinhakTransitionAuthGateActive = true',
+              'jinhakAuthVerifiedForBatch = false',
+              'jinhakProtectedCoreStablePasses = 0',
+              'JinhakSiteTopology.missionSeeds().firstOrNull()',
+          ]:
+              if token not in jinhak:
+                  raise SystemExit('activity-resume auth gate missing: ' + token)
+
+          # Mission target is restored before the auth probe and must not be replaced by coreProbe.
+          if 'currentBatchTarget = coreProbe' in jinhak:
+              raise SystemExit('auth core probe overwrites persisted mission target')
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test and build patched source
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon test :app:assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/v0918-badging.txt
+          grep -Fq "versionCode='109180'" /tmp/v0918-badging.txt
+          grep -Fq "versionName='0.9.18'" /tmp/v0918-badging.txt
+          grep -Fq "application-label:'Admission Collector v0.9.18 Auth Resume Revalidation'" /tmp/v0918-badging.txt
+
+      - name: Commit verified application source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "admission-collector-bot"
+          git config user.email "admission-collector-bot@users.noreply.github.com"
+          git add \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml \
+            .github/workflows/build-admission-collector-main.yml
+          git diff --cached --check
+          git commit -m "v0.9.18: revalidate Jinhak auth after activity resume"
+          git push origin HEAD:main
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          echo "sha=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+
+      - name: Fresh checkout committed source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.commit.outputs.sha }}
+          path: verify-source
+
+      - name: Independently rebuild committed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd verify-source
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          grep -q 'private const val VERSION = "0.9.18"' app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          grep -q 'override val supportsBatchCrawl = false' app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
+          gradle --no-daemon :app:assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/v0918-committed-badging.txt
+          grep -Fq "versionCode='109180'" /tmp/v0918-committed-badging.txt
+          grep -Fq "versionName='0.9.18'" /tmp/v0918-committed-badging.txt
+          cp "$APK" "$GITHUB_WORKSPACE/$APK_NAME"
+          cd "$GITHUB_WORKSPACE"
+          APK_SHA256=$(sha256sum "$APK_NAME" | awk '{print $1}')
+          echo "APK_SHA256=$APK_SHA256" >> "$GITHUB_ENV"
+          printf '%s  %s\n' "$APK_SHA256" "$APK_NAME" > "$APK_NAME.sha256"
+
+      - name: Publish release
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES=$(cat <<EOF
+          Admission Collector v0.9.18 — Auth Resume Revalidation
+
+          Fix derived from the v0.9.17 real-device export: Real Auth Probe reached protected-core-stable, but later Activity/process state continuity loss made the final export report never-run while the SQLite mission ledger survived.
+
+          Changes:
+          - persist only sanitized auth/probe evidence across Activity/process recreation;
+          - treat restored auth verification as diagnostics only, never as permission to crawl;
+          - restore the existing SQLite mission target, then revalidate protected Jinhak core for two stable passes before resuming that target;
+          - never replace currentBatchTarget with the protected-core probe URL;
+          - add activity-resume auth continuity diagnostics;
+          - enforce JinhakAdapter.supportsBatchCrawl=false in the main CI check.
+
+          Existing renderer recovery, mission persistence, bootstrap recovery, same-card replay, renderer circuit breaker, mission stall fence, target auth redirect guard, Real Auth Probe, encrypted credentials, read-only behavior, and same-card binding remain cumulative.
+
+          Source commit: $SOURCE_COMMIT
+          APK SHA-256: $APK_SHA256
+          EOF
+          )
+          gh release create "$TAG" "$APK_NAME" "$APK_NAME.sha256" \
+            --target "$SOURCE_COMMIT" \
+            --title "Admission Collector v0.9.18 — Auth Resume Revalidation" \
+            --notes "$NOTES"
+
+      - name: Verify published release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json tagName,name,targetCommitish,isDraft,isPrerelease,assets,url > /tmp/release.json
+          python3 - <<'PY'
+          import json, os
+          d=json.load(open('/tmp/release.json'))
+          assert d['tagName']=='v0.9.18'
+          assert d['name']=='Admission Collector v0.9.18 — Auth Resume Revalidation'
+          assert d['isDraft'] is False and d['isPrerelease'] is False
+          names={a['name'] for a in d.get('assets',[])}
+          apk=os.environ['APK_NAME']
+          assert apk in names and apk+'.sha256' in names, names
+          print(json.dumps(d, ensure_ascii=False, indent=2))
+          PY
