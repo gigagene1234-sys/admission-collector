@@ -1,0 +1,73 @@
+name: One-shot v0.9.18 retry scaffold cleanup
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/cleanup-v0918-retry-scaffolds.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fix Jinhak batch-safety CI and remove retry scaffolds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/build-admission-collector-main.yml')
+          text = workflow.read_text()
+          old = "grep -q 'override val supportsBatchCrawl = true' \"$ADAPTER\""
+          new = "grep -q 'override val supportsBatchCrawl = false' \"$ADAPTER\""
+          if text.count(old) != 1:
+              raise SystemExit(f'Expected exactly one stale supportsBatchCrawl=true assertion, found {text.count(old)}')
+          workflow.write_text(text.replace(old, new, 1))
+
+          adapter = Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          if 'override val supportsBatchCrawl = false' not in adapter:
+              raise SystemExit('JinhakAdapter safety invariant is not false')
+          if 'override val supportsUserSessionMissionTraversal = true' not in adapter:
+              raise SystemExit('Jinhak user-session mission traversal invariant missing')
+          PY
+
+          rm -f \
+            scripts/patch_v0918_auth_resume.py \
+            scripts/patch_v0918_auth_resume_v2.py \
+            .github/workflows/release-admission-collector-v0918.yml \
+            .github/workflows/release-admission-collector-v0918-r2.yml \
+            .github/workflows/release-admission-collector-v0918-r3.yml \
+            .github/workflows/cleanup-v0918-retry-scaffolds.yml
+
+          git diff --check
+          test "$(grep -c "override val supportsBatchCrawl = false" app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt)" -eq 1
+          grep -q "grep -q 'override val supportsBatchCrawl = false' \"\$ADAPTER\"" .github/workflows/build-admission-collector-main.yml
+          test ! -e scripts/patch_v0918_auth_resume.py
+          test ! -e scripts/patch_v0918_auth_resume_v2.py
+          test ! -e .github/workflows/release-admission-collector-v0918.yml
+          test ! -e .github/workflows/release-admission-collector-v0918-r2.yml
+          test ! -e .github/workflows/release-admission-collector-v0918-r3.yml
+
+      - name: Commit cleanup to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Fix Jinhak batch safety CI and remove v0.9.18 retry scaffolds"
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
