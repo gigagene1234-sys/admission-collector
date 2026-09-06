@@ -1,1 +1,1 @@
-2026-09-06 v0.9.19 crash cloud-state read request
+2026-08-30 v0.5.7 context-probe diagnostic read request
