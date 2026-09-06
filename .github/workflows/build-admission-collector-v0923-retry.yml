@@ -1,0 +1,150 @@
+name: Build Admission Collector v0.9.23 Mission Closure Auth Fence Retry
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v0923-retry.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-verify-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply corrected v0.9.23 patch
+        run: python3 .github/scripts/patch_v0923_retry.py
+
+      - name: Verify source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          manifest=Path('app/src/main/AndroidManifest.xml').read_text()
+          j=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          req={
+            'version':'private const val VERSION = "0.9.23"' in m and 'private const val BUILD_CODE = 109230' in m,
+            'gradle':'versionCode = 109230' in g and 'versionName = "0.9.23"' in g,
+            'label':'Admission Collector v0.9.23 Mission Closure Auth Fence' in manifest,
+            'closure':'finishJinhakPostMissionLoginIfReady' in m and 'jinhak-post-mission-login-closure' in m,
+            'bounded':'JINHAK_LOGIN_RECOVERY_TIMEOUT_MS = 60_000L' in m and 'MAX_JINHAK_LOGIN_RECOVERY_POLLS = 40' in m and 'jinhak-login-recovery-timeout' in m,
+            'single-episode':'jinhak-login-recovery-episode-started' in m and 'jinhakLoginRecoveryEpisodeStartedAtMs' in m,
+            'v0922':'JINHAK_SINGLE_WEBVIEW_STABILITY_MODE = true' in m and 'destroyTransientPopup' in m and 'jinhakSnapshotOverlapDeferrals' in m,
+            'mission':'recoverOrStopJinhakMissionStall' in m and 'same-card-action-not-found' in m,
+            'auth':'persistJinhakAuthProofCheckpoint' in m and 'auth-route-cycle-detected' in m,
+            'adapter':'override val supportsBatchCrawl = false' in j and 'override val supportsUserSessionMissionTraversal = true' in j,
+          }
+          failed=[k for k,v in req.items() if not v]
+          if failed: raise SystemExit('Missing invariant(s): '+', '.join(failed))
+          forbidden=['.put("password", credentials.password)', '.putString("processCookie"', '.putString("processToken"']
+          hits=[x for x in forbidden if x in m]
+          if hits: raise SystemExit('privacy invariant failed: '+', '.join(hits))
+          print('v0.9.23 source invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compile patched source
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify patched APK metadata and signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee patched-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='109230'" patched-badging.txt
+          grep -q "versionName='0.9.23'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.23 Mission Closure Auth Fence'" patched-badging.txt
+          grep -qi "db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995" patched-apksigner.txt
+
+      - name: Commit v0.9.23 source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.9.23 Mission Closure Auth Fence"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild exact committed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA='${{ steps.commit.outputs.sha }}'
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(git rev-parse HEAD)" = "$SHA"
+          gradle --no-daemon :app:assembleDebug
+
+      - name: Package final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.23-Mission-Closure-Auth-Fence.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='109230'" badging.txt
+          grep -q "versionName='0.9.23'" badging.txt
+          grep -qi "db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995" apksigner.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.23-Mission-Closure-Auth-Fence.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.23-final
+          path: |
+            Admission-Collector-v0.9.23-Mission-Closure-Auth-Fence.apk
+            Admission-Collector-v0.9.23-Mission-Closure-Auth-Fence.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish v0.9.23 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="v0.9.23 fixes the post-mission Jinhak login loop observed in the v0.9.22 real-device export: all 27 mission targets were confirmed with zero outstanding targets, generic actions were exhausted at 180/180, then a non-mission university-major-predict target redirected to /jh/member/login and recovery kept polling. The new mission-closure fence skips unnecessary re-auth in that exact state and finishes cleanly. Batch login recovery is now a single episode and is bounded to 60 seconds or 40 polls; if it cannot recover, the run terminates with local data preserved rather than looping forever. Existing v0.9.22 single-WebView stability and all earlier mission/auth/privacy safeguards are preserved. Commit: $SHA"
+          gh release create v0.9.23 Admission-Collector-v0.9.23-Mission-Closure-Auth-Fence.apk Admission-Collector-v0.9.23-Mission-Closure-Auth-Fence.sha256 --target "$SHA" --title "Admission Collector v0.9.23 — Mission Closure Auth Fence" --notes "$NOTES"
