@@ -1,3 +1,4 @@
+// v0.9.19 main-build verification trigger
 val admissionSigningStore = System.getenv("ADMISSION_SIGNING_STORE_FILE")
 val admissionSigningPassword = System.getenv("ADMISSION_SIGNING_PASSWORD")
 
