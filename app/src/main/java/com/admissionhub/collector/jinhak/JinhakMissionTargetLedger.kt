@@ -197,6 +197,11 @@ class JinhakMissionTargetLedger {
         return added
     }
 
+    fun recoveryCandidateForIdentity(identityKey: String?): JinhakAgentNavigator.Candidate? {
+        if (identityKey.isNullOrBlank()) return null
+        return sortedTargets().firstOrNull { it.identityKey == identityKey }?.candidate()
+    }
+
     fun hasMission(identityKey: String?): Boolean = identityKey != null && targets.values.any { it.identityKey == identityKey }
 
     fun hasActionablePending(): Boolean = targets.values.any { it.state == State.PENDING }

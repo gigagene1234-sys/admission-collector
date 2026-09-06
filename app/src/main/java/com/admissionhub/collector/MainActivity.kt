@@ -205,6 +205,13 @@ class MainActivity : Activity() {
     private val jinhakMissionCoverageLedger = JinhakMissionCoverageLedger()
     private var jinhakCoreCoverageClosureFences = 0
     private var jinhakCoreCoverageClosurePending = false
+    private val jinhakIncompleteCoverageRecoveryAttempts = linkedMapOf<String, Int>()
+    private var jinhakIncompleteCoverageRecoveryEpisodes = 0
+    private var jinhakIncompleteCoverageRecoveryActions = 0
+    private var jinhakIncompleteCoverageRecoverySuccesses = 0
+    private var jinhakIncompleteCoverageFinishes = 0
+    private var jinhakIncompleteCoverageActiveIdentity: String? = null
+    private var jinhakLoginUrlStateCorrections = 0
     private var jinhakTerminalSeals = 0
     private var jinhakTerminalSealed = false
     private var jinhakActiveMissionTargetId: String? = null
@@ -409,6 +416,7 @@ class MainActivity : Activity() {
         private const val JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS = 2_000L
         private const val JINHAK_LOGIN_RECOVERY_TIMEOUT_MS = 60_000L
         private const val MAX_JINHAK_LOGIN_RECOVERY_POLLS = 40
+        private const val MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS = 2
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val MAX_JINHAK_GENERIC_ACTIONS = 180
         private const val MAX_JINHAK_MISSION_ACTIONS = 220
@@ -439,8 +447,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.9.25"
-        private const val BUILD_CODE = 109250
+        private const val VERSION = "0.9.26"
+        private const val BUILD_CODE = 109260
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -1534,6 +1542,14 @@ class MainActivity : Activity() {
                 .put("source", source.take(60)))
             handler.post { maybeSealJinhakCoreCoverage("coverage:$lane") }
         }
+        if (jinhakIncompleteCoverageActiveIdentity == identity &&
+            JinhakMissionCoverageLedger.CORE_LANES.all { it in jinhakMissionCoverageLedger.lanes(identity) }) {
+            jinhakIncompleteCoverageRecoverySuccesses += 1
+            jinhakIncompleteCoverageActiveIdentity = null
+            recordRuntimeEvent("jinhak-incomplete-coverage-recovery-complete", JSONObject()
+                .put("applicationIdentityHash", identity.take(24))
+                .put("coverageLanes", jinhakMissionCoverageLedger.lanes(identity).size))
+        }
         return mapChanged || ledgerChanged
     }
 
@@ -1556,6 +1572,101 @@ class MainActivity : Activity() {
 
     private fun jinhakCoreCoverageAudit(): JSONObject =
         jinhakMissionCoverageLedger.summary(currentExpectedJinhakMissionIdentities())
+
+    private fun missingJinhakCoreLanes(identityKey: String): Set<String> {
+        val covered = jinhakMissionCoverageLedger.lanes(identityKey)
+        return JinhakMissionCoverageLedger.CORE_LANES.filterNot { it in covered }.toSet()
+    }
+
+    private fun incompleteJinhakCoverageIdentities(): List<String> =
+        currentExpectedJinhakMissionIdentities()
+            .filter { missingJinhakCoreLanes(it).isNotEmpty() }
+            .sorted()
+
+    private fun isJinhakSavedApplicationLibrary(route: String): Boolean {
+        val normalized = canonicalizeBatchUrl(route).lowercase()
+        return normalized.contains("/jh/high3/early/four-year-university/library")
+    }
+
+    private fun nextJinhakIncompleteCoverageRecoveryCandidate(
+        trigger: String,
+        route: String
+    ): JinhakAgentNavigator.Candidate? {
+        if (!batchRunning || provider != ProviderId.JINHAK || batchPausedForLogin) return null
+        if (!isJinhakSavedApplicationLibrary(route)) return null
+        if (jinhakMissionTargetLedger.outstandingCount() != 0) return null
+        val expected = currentExpectedJinhakMissionIdentities()
+        if (expected.size < 6) return null
+        val incomplete = incompleteJinhakCoverageIdentities()
+        if (incomplete.isEmpty()) return null
+
+        for (identity in incomplete) {
+            val attempts = jinhakIncompleteCoverageRecoveryAttempts[identity] ?: 0
+            if (attempts >= MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS) continue
+            val candidate = jinhakMissionTargetLedger.recoveryCandidateForIdentity(identity)
+            if (candidate == null) {
+                jinhakIncompleteCoverageRecoveryAttempts[identity] = MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS
+                recordRuntimeEvent("jinhak-incomplete-coverage-unrecoverable", JSONObject()
+                    .put("trigger", trigger.take(80))
+                    .put("applicationIdentityHash", identity.take(24))
+                    .put("missingLanes", JSONArray(missingJinhakCoreLanes(identity).toList())))
+                continue
+            }
+            val nextAttempt = attempts + 1
+            jinhakIncompleteCoverageRecoveryAttempts[identity] = nextAttempt
+            jinhakIncompleteCoverageRecoveryEpisodes += 1
+            jinhakIncompleteCoverageRecoveryActions += 1
+            jinhakIncompleteCoverageActiveIdentity = identity
+            // The candidate comes directly from the persistent SAME-APPLICATION ledger, so it
+            // bypasses the ordinary live-candidate seen-key filter without mutating confirmed state.
+            recordRuntimeEvent("jinhak-incomplete-coverage-recovery-start", JSONObject()
+                .put("trigger", trigger.take(80))
+                .put("applicationIdentityHash", identity.take(24))
+                .put("attempt", nextAttempt)
+                .put("maxAttempts", MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS)
+                .put("missingLanes", JSONArray(missingJinhakCoreLanes(identity).toList()))
+                .put("genericTailAllowed", false))
+            return candidate
+        }
+        return null
+    }
+
+    private fun jinhakIncompleteCoverageRecoveryExhausted(): Boolean {
+        val incomplete = incompleteJinhakCoverageIdentities()
+        if (incomplete.isEmpty()) return false
+        return incomplete.all { identity ->
+            (jinhakIncompleteCoverageRecoveryAttempts[identity] ?: 0) >= MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS ||
+                jinhakMissionTargetLedger.recoveryCandidateForIdentity(identity) == null
+        }
+    }
+
+    private fun maybeFinishJinhakIncompleteCoverage(trigger: String, route: String): Boolean {
+        if (!batchRunning || provider != ProviderId.JINHAK || batchPausedForLogin || jinhakCoreCoverageClosurePending) return false
+        if (!isJinhakSavedApplicationLibrary(route)) return false
+        if (jinhakMissionTargetLedger.outstandingCount() != 0) return false
+        val expected = currentExpectedJinhakMissionIdentities()
+        if (expected.size < 6) return false
+        val incomplete = incompleteJinhakCoverageIdentities()
+        if (incomplete.isEmpty() || !jinhakIncompleteCoverageRecoveryExhausted()) return false
+        if (jinhakApplicationMissionReturns < expected.size) return false
+
+        jinhakCoreCoverageClosurePending = true
+        jinhakIncompleteCoverageFinishes += 1
+        jinhakIncompleteCoverageActiveIdentity = null
+        recordRuntimeEvent("jinhak-incomplete-coverage-terminal-fence", JSONObject()
+            .put("trigger", trigger.take(80))
+            .put("coverage", jinhakCoreCoverageAudit())
+            .put("incompleteIdentities", incomplete.size)
+            .put("recoveryEpisodes", jinhakIncompleteCoverageRecoveryEpisodes)
+            .put("genericActionsAvoided", (MAX_JINHAK_GENERIC_ACTIONS - jinhakGenericActionsExecuted).coerceAtLeast(0)))
+        persistLiveJinhakDiagnostics("incomplete-coverage-terminal-fence", force = true)
+        handler.postDelayed({
+            if (batchRunning && provider == ProviderId.JINHAK) {
+                finishBatch("completed-with-incomplete-coverage")
+            }
+        }, 120L)
+        return true
+    }
 
     private fun maybeSealJinhakCoreCoverage(trigger: String) {
         if (!batchRunning || provider != ProviderId.JINHAK || batchPausedForLogin || jinhakCoreCoverageClosurePending) return
@@ -3086,9 +3197,18 @@ class MainActivity : Activity() {
         val ledgerSummary = jinhakMissionTargetLedger.summary()
         val targetCount = ledgerSummary.optInt("targets", 0)
         if (targetCount <= 0 || jinhakMissionTargetLedger.outstandingCount() != 0) return false
-        if (jinhakActiveMissionTargetId != null || jinhakAgentActionInFlight || batchCollecting) return false
-        if (jinhakMissionCells.hasActiveOwnership()) return false
-        if (::slowLanePool.isInitialized && slowLanePool.hasWork()) return false
+        val onLoginRoute = ::webView.isInitialized && isProviderLoginUrl(ProviderId.JINHAK, webView.url.orEmpty())
+        if (!onLoginRoute) {
+            if (jinhakActiveMissionTargetId != null || jinhakAgentActionInFlight || batchCollecting) return false
+            if (jinhakMissionCells.hasActiveOwnership()) return false
+            if (::slowLanePool.isInitialized && slowLanePool.hasWork()) return false
+        }
+        val expected = currentExpectedJinhakMissionIdentities()
+        if (expected.size >= 6) {
+            val audit = jinhakMissionCoverageLedger.summary(expected)
+            if (audit.optBoolean("coreComplete", false)) return true
+            if (jinhakIncompleteCoverageRecoveryExhausted()) return true
+        }
         return jinhakGenericActionsExecuted >= MAX_JINHAK_GENERIC_ACTIONS
     }
 
@@ -3122,6 +3242,25 @@ class MainActivity : Activity() {
 
     private fun scheduleJinhakLoginRecovery(reason: String) {
         if (provider != ProviderId.JINHAK) return
+        val currentUrl = if (::webView.isInitialized) webView.url.orEmpty() else ""
+        if (batchRunning && isProviderLoginUrl(ProviderId.JINHAK, currentUrl) && !batchPausedForLogin) {
+            jinhakLoginUrlStateCorrections += 1
+            batchPausedForLogin = true
+            batchCollecting = false
+            batchNavigationWatchdogRecovery = false
+            batchCloudFinalCheckInProgress = false
+            disarmBatchNavigationWatchdog()
+            jinhakAuthVerifiedForBatch = false
+            jinhakProtectedCoreStablePasses = 0
+            jinhakCoreBootstrapState = "batch-login-route-wait"
+            jinhakReauthCycles += 1
+            recordRuntimeEvent("jinhak-login-url-state-correction", JSONObject()
+                .put("reason", reason.take(80))
+                .put("loginSafePath", runtimeSafePath(currentUrl))
+                .put("missionOutstanding", jinhakMissionTargetLedger.outstandingCount())
+                .put("coverageRecoveryExhausted", jinhakIncompleteCoverageRecoveryExhausted()))
+            persistJinhakAuthDiagnostics("login-url-state-correction")
+        }
         val recoveryActive = startupLoginPreflightActive || jinhakTransitionAuthGateActive || (batchRunning && batchPausedForLogin)
         if (!recoveryActive) return
         if (batchRunning && batchPausedForLogin && finishJinhakPostMissionLoginIfReady("schedule:$reason")) return
@@ -3687,6 +3826,13 @@ class MainActivity : Activity() {
         jinhakInheritedReportLaneActions = 0
         jinhakCoreCoverageClosureFences = 0
         jinhakCoreCoverageClosurePending = false
+        jinhakIncompleteCoverageRecoveryAttempts.clear()
+        jinhakIncompleteCoverageRecoveryEpisodes = 0
+        jinhakIncompleteCoverageRecoveryActions = 0
+        jinhakIncompleteCoverageRecoverySuccesses = 0
+        jinhakIncompleteCoverageFinishes = 0
+        jinhakIncompleteCoverageActiveIdentity = null
+        jinhakLoginUrlStateCorrections = 0
         jinhakTerminalSeals = 0
         jinhakTerminalSealed = false
         jinhakMissionAnchorActionsAttempted = 0
@@ -6005,8 +6151,19 @@ class MainActivity : Activity() {
             else -> null
         }
         var exhaustedCurrentMission = false
+        val incompleteCoverageRecoveryCandidate = if (ledgerTarget == null && jinhakMissionTargetLedger.outstandingCount() == 0) {
+            nextJinhakIncompleteCoverageRecoveryCandidate("selection", route)
+        } else null
+        val incompleteCoverageTerminal = incompleteCoverageRecoveryCandidate == null &&
+            maybeFinishJinhakIncompleteCoverage("selection", route)
 
         val selection = when {
+            incompleteCoverageRecoveryCandidate != null -> JinhakMissionLaneSequencer.Selection(
+                candidate = incompleteCoverageRecoveryCandidate,
+                missionExhaustedAtOrigin = true,
+                requestedLane = "current-prediction"
+            )
+            incompleteCoverageTerminal -> JinhakMissionLaneSequencer.Selection(null, false, "reference")
             ledgerTarget != null -> JinhakMissionLaneSequencer.Selection(
                 candidate = ledgerTarget!!.candidate(),
                 missionExhaustedAtOrigin = false,
@@ -6868,6 +7025,14 @@ class MainActivity : Activity() {
                         .put("inheritedReportLaneActions", jinhakInheritedReportLaneActions)
                         .put("coreCoverageClosureFences", jinhakCoreCoverageClosureFences)
                         .put("coreCoverageClosurePending", jinhakCoreCoverageClosurePending)
+                        .put("incompleteCoverageRecoveryEpisodes", jinhakIncompleteCoverageRecoveryEpisodes)
+                        .put("incompleteCoverageRecoveryActions", jinhakIncompleteCoverageRecoveryActions)
+                        .put("incompleteCoverageRecoverySuccesses", jinhakIncompleteCoverageRecoverySuccesses)
+                        .put("incompleteCoverageFinishes", jinhakIncompleteCoverageFinishes)
+                        .put("incompleteCoverageRecoveryExhausted", jinhakIncompleteCoverageRecoveryExhausted())
+                        .put("incompleteCoverageActiveIdentityHash", jinhakIncompleteCoverageActiveIdentity?.take(24) ?: JSONObject.NULL)
+                        .put("incompleteCoverageRecoveryAttempts", JSONObject(jinhakIncompleteCoverageRecoveryAttempts.mapKeys { it.key.take(24) } as Map<*, *>))
+                        .put("loginUrlStateCorrections", jinhakLoginUrlStateCorrections)
                         .put("terminalSeals", jinhakTerminalSeals)
                         .put("terminalSealed", jinhakTerminalSealed)
                         .put("coreCoverageAudit", jinhakCoreCoverageAudit())
