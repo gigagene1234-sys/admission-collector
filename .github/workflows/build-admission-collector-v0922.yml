@@ -1,0 +1,256 @@
+name: Build Admission Collector v0.9.22 Single-WebView Stability Guard
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v0922.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    outputs:
+      source_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.9.22 renderer stability patch
+        run: python3 .github/scripts/patch_v0922.py
+
+      - name: Verify bounded change surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          changed=set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())
+          allowed={
+            'app/src/main/java/com/admissionhub/collector/MainActivity.kt',
+            'app/build.gradle.kts',
+            'app/src/main/AndroidManifest.xml',
+          }
+          extra=changed-allowed
+          missing=allowed-changed
+          if extra: raise SystemExit('Unexpected files changed: '+', '.join(sorted(extra)))
+          if missing: raise SystemExit('Required files not changed: '+', '.join(sorted(missing)))
+          print('v0.9.22 file boundary passed')
+          PY
+
+      - name: Verify v0.9.22 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          j=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          p=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt').read_text()
+          l=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
+          s=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          c=Path('app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          manifest=Path('app/src/main/AndroidManifest.xml').read_text()
+          req={
+            'version':'private const val VERSION = "0.9.22"' in m and 'private const val BUILD_CODE = 109220' in m,
+            'gradle':'versionCode = 109220' in g and 'versionName = "0.9.22"' in g,
+            'label':'Admission Collector v0.9.22 Single-WebView Stability Guard' in manifest,
+            'single-webview':'JINHAK_SINGLE_WEBVIEW_STABILITY_MODE = true' in m and 'jinhak-single-webview-slow-lane-bypass' in m,
+            'snapshot-serialization':'jinhakSnapshotOverlapDeferrals' in m and 'isSnapshotActive()' in m and 'JINHAK_SNAPSHOT_OVERLAP_RETRY_MS' in m,
+            'popup-cleanup':'destroyTransientPopup' in m and 'jinhak-transient-popup-destroyed' in m and 'setSupportMultipleWindows(false)' in m,
+            'first-crash-cooldown':'webview-renderer-recovered-cooldown' in m and 'JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS' in m,
+            'live-process-diagnostics':'previousUncleanTerminationDetected' in m and 'processHeartbeatAgeMs' in m and 'singleWebViewStabilityMode' in m,
+            'process-journal-preserved':'initializeProcessResumeJournal' in m and 'persistProcessResumeJournal' in m and 'process-resume-gate-armed' in m,
+            'cloud-checkpoint-preserved':'sendRecordCheckpoint(' in c and 'crash-safe-record-checkpoint' in c,
+            'renderer-recovery-preserved':'jinhakMissionCells.onRendererGone(' in m and 'jinhak-renderer-circuit-resume' in m,
+            'mission-cell-preserved':'JinhakMissionCellSupervisor' in m and 'legacyAgentActionInFlight' in m,
+            'auth-proof-preserved':'persistJinhakAuthProofCheckpoint' in m and 'restoreJinhakAuthProofCheckpoint' in m,
+            'real-auth-probe-preserved':'auth-route-cycle-detected' in m,
+            'target-redirect-preserved':'quarantineJinhakTargetSpecificAuthRedirect' in m,
+            'mission-stall-preserved':'recoverOrStopJinhakMissionStall' in m,
+            'same-card-preserved':'same-card-action-not-found' in m and 'MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3' in m,
+            'mission-persistence-preserved':'CREATE TABLE IF NOT EXISTS jinhak_mission_targets' in l and 'monotonicStateGuard' in l,
+            'slow-lane-existing-guard-preserved':'const val DEFAULT_MAX_WORKERS = 1' in p and 'rendererCircuitOpen' in p,
+            'jinhak-no-batch':'override val supportsBatchCrawl = false' in j,
+            'user-session-mission':'override val supportsUserSessionMissionTraversal = true' in j,
+            'susi-core-preserved':'isDefaultSusiCoreTraversalUrl' in m,
+            'snapshot-privacy':'safeCloneText' in s and 'input,textarea,select,option,form' in s,
+            'credential-vault-preserved':'CredentialVault' in m,
+            'process-privacy':'processCredentialStored' in m and 'processSessionSecretStored' in m,
+          }
+          failed=[k for k,v in req.items() if not v]
+          if failed: raise SystemExit('Missing invariant(s): '+', '.join(failed))
+          forbidden=[
+            '.put("username", credentials.username)',
+            '.put("password", credentials.password)',
+            '.putString("processPassword"',
+            '.putString("processCookie"',
+            '.putString("processToken"',
+          ]
+          hits=[x for x in forbidden if x in m]
+          if hits: raise SystemExit('privacy invariant failed: '+', '.join(hits))
+          print('v0.9.22 invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compile and build patched source
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Verify patched APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee patched-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='109220'" patched-badging.txt
+          grep -q "versionName='0.9.22'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.22 Single-WebView Stability Guard'" patched-badging.txt
+          grep -qi "db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995" patched-apksigner.txt
+
+      - name: Commit v0.9.22 source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.9.22 Single-WebView Stability Guard"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  independent-main-build:
+    needs: patch-build-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Refresh exact committed main
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(git rev-parse HEAD)" = "${{ needs.patch-build-commit.outputs.source_sha }}"
+
+      - name: Reverify committed v0.9.22
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          j=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          assert 'private const val VERSION = "0.9.22"' in m
+          assert 'private const val BUILD_CODE = 109220' in m
+          assert 'versionCode = 109220' in g
+          assert 'JINHAK_SINGLE_WEBVIEW_STABILITY_MODE = true' in m
+          assert 'jinhak-single-webview-slow-lane-bypass' in m
+          assert 'destroyTransientPopup' in m
+          assert 'jinhakSnapshotOverlapDeferrals' in m
+          assert 'webview-renderer-recovered-cooldown' in m
+          assert 'previousUncleanTerminationDetected' in m
+          assert 'initializeProcessResumeJournal' in m
+          assert 'jinhak-renderer-circuit-resume' in m
+          assert 'persistJinhakAuthProofCheckpoint' in m
+          assert 'recoverOrStopJinhakMissionStall' in m
+          assert 'same-card-action-not-found' in m
+          assert 'override val supportsBatchCrawl = false' in j
+          assert 'override val supportsUserSessionMissionTraversal = true' in j
+          print('committed v0.9.22 verified')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build exact committed main
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify and package final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.22-Single-WebView-Stability-Guard.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='109220'" badging.txt
+          grep -q "versionName='0.9.22'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.22 Single-WebView Stability Guard'" badging.txt
+          grep -qi "db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995" apksigner.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.22-Single-WebView-Stability-Guard.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.22-final
+          path: |
+            Admission-Collector-v0.9.22-Single-WebView-Stability-Guard.apk
+            Admission-Collector-v0.9.22-Single-WebView-Stability-Guard.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish v0.9.22 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="v0.9.22 is a renderer-stability release based on the v0.9.21 real-device failure log. It keeps authenticated Jinhak mission traversal on the foreground WebView by bypassing hidden slow-lane WebView creation, prevents replacement of an already-running snapshot lease, bounds and explicitly destroys transient window.open bridge WebViews, and gives the first foreground renderer crash a short blank-page cooldown before resuming from the preserved mission origin/core route. It also adds the v0.9.21 process-journal fields to live JINHAK_CRAWL_DIAGNOSTICS so a running-session export after reopening can distinguish renderer failure from whole-process termination. v0.9.21 process resume journal, v0.9.20 crash-safe cloud checkpoints, v0.9.19 mission cell ownership, renderer circuit recovery, auth proof/probe, target redirect quarantine, mission stall fence, same-card replay, SQLite monotonic mission persistence, privacy safeguards and Susi-only restrictions remain in place. No passwords, credentials, cookies, browser tokens, localStorage/sessionStorage or form values are exported. Commit: $SHA"
+          gh release create v0.9.22 Admission-Collector-v0.9.22-Single-WebView-Stability-Guard.apk Admission-Collector-v0.9.22-Single-WebView-Stability-Guard.sha256 --target "$SHA" --title "Admission Collector v0.9.22 — Single-WebView Stability Guard" --notes "$NOTES"
