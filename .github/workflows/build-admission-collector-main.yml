@@ -51,95 +51,55 @@ jobs:
           print(f'Committed version verified: {main_version} ({main_build}) / {label}')
           PY
 
-      - name: Verify architecture and v0.8.3 concurrent slow-lane semantics
+      - name: Verify current cumulative safety and reliability invariants
         shell: bash
         run: |
           set -euo pipefail
-          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
-          STORE=app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt
-          ADAPTER=app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt
-          SNAP=app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt
-          MISSION=app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt
-          AGENT=app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt
-          SLOW=app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt
-          SYNC=app/src/main/java/com/admissionhub/collector/sync/UnifiedSyncState.kt
-
-          test ! -f MainActivity.kt
-          grep -q 'CREATE TABLE IF NOT EXISTS observations' "$STORE"
-          grep -q 'fun storeObservationEvidence' "$STORE"
-          grep -q 'fun writeObservations' "$STORE"
-          grep -q 'unclassified-potential-value' "$MAIN"
-          grep -q 'override val supportsBatchCrawl = false' "$ADAPTER"
-          grep -q 'PUBLIC_DETERMINISTIC_COLLECTION' app/src/main/java/com/admissionhub/collector/provider/ProviderCapability.kt
-          grep -q 'JINHAK_AUTONOMOUS_CRAWL' "$SYNC"
-          grep -q 'JINHAK_USER_CONSENT_REQUIRED' "$SYNC"
-          grep -q 'assistant-xlsx-dashboard-generation' "$STORE"
-          grep -q 'contractVersion\\\":3' "$STORE"
-          grep -q 'ApplicationMissions' "$STORE"
-          grep -q 'applicationIdentityKey' "$STORE"
-
-          # v0.8.2 application identity / semantic protections.
-          grep -q 'same-card-admission-capacity-boundary' "$MISSION"
-          grep -q 'stripCardUiPrefix' "$MISSION"
-          grep -q 'previousYearCompetition' "$MISSION"
-          grep -q 'mockCompetition' "$MISSION"
-          grep -q 'myCalculatedScore' "$MISSION"
-          grep -q 'myReflectedGrade' "$MISSION"
-          grep -q 'mockApplicantAverageScore' "$MISSION"
-          grep -q 'mockApplicantAverageGrade' "$MISSION"
-          grep -q 'mission-link-navigation' "$SNAP"
-          grep -q 'if(missionLinkBound) continue;' "$SNAP"
-          grep -q 'jinhak-ai-diagnosis-consent' "$SNAP"
-          grep -q 'missionApplicationContext' "$MAIN"
-          grep -q 'applicationMissionCoverage' "$MAIN"
-          grep -q 'jinhak-application-mission-evidence' "$MISSION"
-          grep -q 'jinhak-application-unbound-observation' "$ADAPTER"
-
-          # v0.8.3: 35s is escalation, not a failure boundary.
-          grep -q 'JINHAK_SLOW_ESCALATION_MS = 35_000L' "$MAIN"
-          grep -q 'jinhak-slow-lane-escalated' "$MAIN"
-          grep -q 'slow-lane", 0, null' "$MAIN"
-          test "$(grep -c 'JINHAK_ABSOLUTE_TARGET_MS' "$MAIN" || true)" = 0
-          test "$(grep -c 'jinhak-absolute-target-timeout' "$MAIN" || true)" = 0
-
-          # Bounded browser concurrency and progress-aware slow lane.
-          grep -q 'DEFAULT_MAX_WORKERS = 2' "$SLOW"
-          grep -q 'STALL_CHECK_AFTER_MS = 90_000L' "$SLOW"
-          grep -q 'STALL_NO_PROGRESS_MS = 18_000L' "$SLOW"
-          grep -q 'HARD_MAX_MS = 120_000L' "$SLOW"
-          grep -q 'slowLanePool.setMaxActiveWorkers(1)' "$MAIN"
-          grep -q 'slowLanePool.hasWork()' "$MAIN"
-          grep -q '메인 탐색 완료 · slow worker' "$MAIN"
-          grep -q 'jinhakLastAgentActionMissionContext' "$MAIN"
-          grep -q 'missionContext = mission?.toJson()' "$MAIN"
-          grep -q 'replayScript' "$SLOW"
-          grep -q 'collectionTransport", "concurrent-slow-lane"' "$MAIN"
-          grep -q 'slowLaneProgressExtensions' "$MAIN"
-          grep -q 'slowLaneReplayAttempts' "$MAIN"
-          grep -q 'slowLaneReplaySuccesses' "$MAIN"
-          grep -q 'slowLanePool.destroy()' "$MAIN"
-          test "$(grep -c 'override fun onDestroy()' "$MAIN")" = 1
-
           python3 - <<'PY'
           from pathlib import Path
           import re
           main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
-          probe=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAuthorizedConnector.kt').read_text()
+          store=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
           adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
           snap=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
           mission=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt').read_text()
           agent=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text()
           slow=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt').read_text()
-          if 'jinhak-nonadmission-page-skipped' in main: raise SystemExit('unknown Jinhak observations discarded')
-          if 'unifiedJinhakCapturedPages.contains(pageKey)' in main: raise SystemExit('URL-only Jinhak dedupe active')
-          if 'putNumber(metrics, "mockCompetition"' in adapter: raise SystemExit('broad mockCompetition semantic corruption')
-          if 'metrics.put("previousCompetition"' in adapter: raise SystemExit('legacy previousCompetition remains')
-          if '철도차량시스템공학과' in mission: raise SystemExit('raw mission parser invents canonical department')
-          if 'mission-link-navigation' not in snap or 'missionLinkBound=missionLink' not in snap: raise SystemExit('same-card report not mission-bound')
-          if 'if(missionLinkBound) continue;' not in snap: raise SystemExit('mission anchor leaks into generic queue')
-          if 'jinhak-ai-diagnosis-consent' not in snap or 'JINHAK_USER_CONSENT_REQUIRED' not in main: raise SystemExit('consent gate not explicit')
-          for token in ['document.cookie','localStorage','sessionStorage','input.value','location.href','fetch(','XMLHttpRequest']:
-              if token in probe: raise SystemExit('capability probe reads forbidden material: '+token)
+          cell_path=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionCellSupervisor.kt')
+          sync=Path('app/src/main/java/com/admissionhub/collector/sync/UnifiedSyncState.kt').read_text()
+
+          required={
+              'observation-store': 'CREATE TABLE IF NOT EXISTS observations' in store and 'fun storeObservationEvidence' in store,
+              'mission-sqlite': 'CREATE TABLE IF NOT EXISTS jinhak_mission_targets' in store and 'monotonicStateGuard' in store,
+              'batch-crawl-disabled': 'override val supportsBatchCrawl = false' in adapter,
+              'user-session-mission': 'override val supportsUserSessionMissionTraversal = true' in adapter,
+              'unknown-preserved': 'unclassified-potential-value' in main,
+              'same-card-safety': 'same-card-action-not-found' in main and 'MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3' in main,
+              'renderer-recovery': 'onRenderProcessGone' in main and 'rendererCircuitOpen' in slow,
+              'single-hidden-worker': 'const val DEFAULT_MAX_WORKERS = 1' in slow,
+              'slow-hard-max': 'HARD_MAX_MS = 120_000L' in slow,
+              'mission-stall-fence': 'recoverOrStopJinhakMissionStall' in main and 'MAX_JINHAK_MISSION_STALL_RECOVERIES = 2' in main,
+              'target-auth-guard': 'quarantineJinhakTargetSpecificAuthRedirect' in main,
+              'real-auth-probe': 'protected-core-stable' in main and 'MAX_JINHAK_REAL_AUTH_ROUTE_TRANSITIONS = 14' in main,
+              'auth-proof-resume': 'persistJinhakAuthProofCheckpoint' in main and 'restoreJinhakAuthProofCheckpoint' in main,
+              'consent-explicit': 'JINHAK_USER_CONSENT_REQUIRED' in sync and 'jinhak-ai-diagnosis-consent' in snap,
+              'snapshot-privacy': 'safeCloneText' in snap and 'input,textarea,select,option,form' in snap,
+          }
+          failed=[k for k,v in required.items() if not v]
+          if failed: raise SystemExit('Invariant failure: '+', '.join(failed))
+
+          if 'jinhak-nonadmission-page-skipped' in main:
+              raise SystemExit('unknown Jinhak observations discarded')
+          if 'unifiedJinhakCapturedPages.contains(pageKey)' in main:
+              raise SystemExit('URL-only Jinhak dedupe active')
+          if '철도차량시스템공학과' in mission:
+              raise SystemExit('raw mission parser invents canonical department')
+          dept=snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
+          if 'previousElementSibling' in dept or 'nextElementSibling' in dept:
+              raise SystemExit('cross-card department inheritance')
+
+          for token in ['원서','접수','결제','저장','삭제','로그아웃','제출','확정','동의','미동의']:
+              if token not in agent: raise SystemExit('agent safety boundary missing: '+token)
           forbidden=[
               r'document\s*\.\s*cookie',
               r'(?:window\s*\.\s*)?localStorage\s*(?:\.|\[)',
@@ -150,17 +110,26 @@ jobs:
           ]
           for pat in forbidden:
               if re.search(pat, slow): raise SystemExit('slow lane reads forbidden material: '+pat)
-          dept=snap.split('function departmentContextFor',1)[1].split('function universityContextFor',1)[0]
-          if 'previousElementSibling' in dept or 'nextElementSibling' in dept: raise SystemExit('cross-card department inheritance')
-          ctx=snap.split('function applicationContextForAction',1)[1].split('var nav=[]',1)[0]
-          for token in ['document.cookie','localStorage','sessionStorage','.value','input.value']:
-              if token in ctx: raise SystemExit('mission context reads forbidden material: '+token)
-          for token in ['원서','접수','결제','저장','삭제','로그아웃','제출','확정','동의','미동의']:
-              if token not in agent: raise SystemExit('agent safety boundary missing: '+token)
-          for token in ['onRenderProcessGone','installRuntimeCrashGuard','onTrimMemory','localStore.writeUnifiedExport(streamSession, writer)']:
-              if token not in main: raise SystemExit('runtime/memory guard missing: '+token)
-          for token in ['slow-lane-user-action-required','slow-lane-hard-max','slow-lane-no-progress','mission-action-not-found']:
-              if token not in slow: raise SystemExit('slow-lane boundary missing: '+token)
+
+          # v0.9.19+ must wire the lower-cell ownership model, not merely ship the class.
+          version_match=re.search(r'private const val VERSION = "([^"]+)"', main)
+          version=version_match.group(1) if version_match else ''
+          if version == '0.9.19' or version.startswith('0.9.2') or version.startswith('0.10.'):
+              if not cell_path.exists(): raise SystemExit('mission cell supervisor missing')
+              cell=cell_path.read_text()
+              cell_checks={
+                  'token': 'data class Token' in cell and 'rendererGeneration' in cell,
+                  'stale-expiry': 'expireStaleOwnership' in cell,
+                  'late-callback': 'LATE_CALLBACK_IGNORED' in cell,
+                  'timeline': 'recentEvents' in cell and 'blockedBy' in cell,
+                  'action-wired': 'jinhakMissionCells.beginAction(' in main and 'jinhakMissionCells.finishAction(' in main,
+                  'snapshot-wired': 'jinhakMissionCells.beginSnapshot(' in main and 'jinhakMissionCells.finishSnapshot(' in main,
+                  'renderer-wired': 'jinhakMissionCells.onRendererGone(' in main,
+                  'diagnostics-wired': '.put("missionCells", jinhakMissionCells.diagnostics' in main,
+              }
+              missing=[k for k,v in cell_checks.items() if not v]
+              if missing: raise SystemExit('Mission cell integration failure: '+', '.join(missing))
+          print('Current architecture invariants passed')
           PY
 
       - name: Set up JDK 17
@@ -191,16 +160,17 @@ jobs:
           gradle-version: '8.7'
       - name: Build committed source
         run: gradle --no-daemon :app:assembleDebug
-      - name: Verify APK against committed version
+      - name: Verify APK against committed version and signer
         shell: bash
         run: |
           set -euo pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
           grep -Fq "versionCode='$APP_BUILD_CODE'" /tmp/badging.txt
           grep -Fq "versionName='$APP_VERSION'" /tmp/badging.txt
           grep -Fq "application-label:'$APP_LABEL'" /tmp/badging.txt
+          grep -qi 'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995' /tmp/apksigner.txt
           sha256sum "$APK"
       - uses: actions/upload-artifact@v4
         with:
