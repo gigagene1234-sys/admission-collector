@@ -42,6 +42,7 @@ import com.admissionhub.collector.jinhak.JinhakSlowLanePool
 import com.admissionhub.collector.jinhak.JinhakReportContextBridge
 import com.admissionhub.collector.jinhak.JinhakMissionLaneSequencer
 import com.admissionhub.collector.jinhak.JinhakMissionTargetLedger
+import com.admissionhub.collector.jinhak.JinhakMissionCellSupervisor
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -71,6 +72,7 @@ class MainActivity : Activity() {
     private lateinit var credentialVault: CredentialVault
     private lateinit var slowLaneHost: FrameLayout
     private lateinit var slowLanePool: JinhakSlowLanePool
+    private val jinhakMissionCells = JinhakMissionCellSupervisor()
 
     private val handler = Handler(Looper.getMainLooper())
     private val sessionKeepAlive = object : Runnable {
@@ -393,8 +395,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.18"
-        private const val BUILD_CODE = 109180
+        private const val VERSION = "0.9.19"
+        private const val BUILD_CODE = 109190
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -660,6 +662,7 @@ class MainActivity : Activity() {
     @Suppress("SetJavaScriptEnabled")
     private fun configureWebView() {
         runtimeRendererRecovering = false
+        jinhakMissionCells.markRendererReady("configure-webview")
         WebView.setWebContentsDebuggingEnabled(false)
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
@@ -773,6 +776,11 @@ class MainActivity : Activity() {
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
                 if (runtimeRendererRecovering) return true
                 runtimeRendererRecovering = true
+                val cellInvalidation = jinhakMissionCells.onRendererGone(
+                    reason = if (detail?.didCrash() == true) "foreground-crash" else "foreground-renderer-gone"
+                )
+                if (cellInvalidation.actionInvalidated) jinhakAgentActionInFlight = false
+                if (cellInvalidation.snapshotInvalidated) batchCollecting = false
 
                 val deadView = view ?: webView
                 val parent = deadView.parent as? ViewGroup
@@ -3051,6 +3059,7 @@ class MainActivity : Activity() {
         jinhakMissionStallFenceTrips = 0
         jinhakMissionStallRecoveryAttempts = 0
         jinhakMissionStallTerminalStops = 0
+        jinhakMissionCells.resetForRun("batch-runtime-reset")
         jinhakMissionOriginSnapshotErrorStreak = 0
         jinhakMissionOriginSnapshotErrorTotal = 0
         jinhakLastMissionOriginSnapshotErrorType = ""
@@ -3342,6 +3351,9 @@ class MainActivity : Activity() {
                 .put("jinhakCoreScopeBlockedUrls", jinhakCoreScopeBlockedUrls)
                 .put("jinhakCoreScopeBlockedLanes", JSONObject(jinhakCoreScopeBlockedLaneCounts as Map<*, *>))
                 .put("secondsSinceMeaningfulProgress", sinceProgress ?: JSONObject.NULL)
+                .put("missionCells", jinhakMissionCells.diagnostics(now))
+                .put("legacyAgentActionInFlight", jinhakAgentActionInFlight)
+                .put("legacyBatchCollecting", batchCollecting)
                 .put("activeMissionTarget", jinhakActiveMissionTargetId != null)
                 .put("slowLaneRunning", slowStats?.running ?: 0)
                 .put("slowLaneQueued", slowStats?.queued ?: 0)
@@ -3360,9 +3372,11 @@ class MainActivity : Activity() {
         val outstanding = jinhakMissionTargetLedger.outstandingCount()
         if (outstanding <= 0) return false
         val slowWork = ::slowLanePool.isInitialized && slowLanePool.hasWork()
-        if (slowWork || jinhakAgentActionInFlight || batchCollecting) return false
+        val cellBusy = jinhakMissionCells.hasActiveOwnership()
+        if (slowWork || cellBusy || jinhakAgentActionInFlight || batchCollecting) return false
 
         jinhakMissionStallFenceTrips += 1
+        jinhakMissionCells.invalidateAll("mission-stall-recovery:$trigger")
         if (countAsNoProgressFence) jinhakNoProgressFences += 1
         val pendingBefore = jinhakMissionTargetLedger.pendingCount()
         val preferredIdentity = jinhakMissionContext?.identityKey
@@ -3463,7 +3477,14 @@ class MainActivity : Activity() {
                 if (elapsed >= JINHAK_NO_PROGRESS_FENCE_MS) {
                     val slowWork = ::slowLanePool.isInitialized && slowLanePool.hasWork()
                     val ledgerOutstanding = jinhakMissionTargetLedger.outstandingCount()
-                    if (ledgerOutstanding == 0 && !slowWork && !jinhakAgentActionInFlight && !batchCollecting) {
+                    val cellExpiry = jinhakMissionCells.expireStaleOwnership(now)
+                    if (cellExpiry.actionExpired) jinhakAgentActionInFlight = false
+                    if (cellExpiry.snapshotExpired) batchCollecting = false
+                    if (cellExpiry.expiredAny) {
+                        recordRuntimeEvent("jinhak-cell-stale-ownership", cellExpiry.toJson())
+                        persistLiveJinhakDiagnostics("cell-stale-ownership", force = true)
+                    }
+                    if (ledgerOutstanding == 0 && !slowWork && !jinhakMissionCells.hasActiveOwnership() && !jinhakAgentActionInFlight && !batchCollecting) {
                         val stalled = canonicalizeBatchUrl(webView.url ?: currentBatchTarget ?: "")
                         jinhakNoProgressFences += 1
                         batchErrors.put(JSONObject()
@@ -3494,15 +3515,20 @@ class MainActivity : Activity() {
                         persistLiveJinhakDiagnostics("no-progress-fence", force = true)
                         status.text = "60초 동안 새 수집 진전이 없어 현재 일반 탐색 페이지를 종료하고 다음 대상으로 진행합니다."
                         handler.postDelayed({ if (batchRunning && !batchPausedForLogin) loadNextBatchPage() }, 220L)
-                    } else if (ledgerOutstanding > 0 && !slowWork && !jinhakAgentActionInFlight && !batchCollecting) {
-                        if (!recoverOrStopJinhakMissionStall(
-                                trigger = "no-progress-mission",
-                                countAsNoProgressFence = true
-                            )) {
+                    } else if (ledgerOutstanding > 0) {
+                        val cellBusy = jinhakMissionCells.hasActiveOwnership()
+                        if (!slowWork && !cellBusy && !jinhakAgentActionInFlight && !batchCollecting) {
+                            if (!recoverOrStopJinhakMissionStall(
+                                    trigger = "no-progress-mission",
+                                    countAsNoProgressFence = true
+                                )) {
+                                persistLiveJinhakDiagnostics("progress-wait-mission", force = true)
+                            }
+                        } else {
+                            // Lower cells own their lifecycle and expose exactly what blocks recovery.
                             persistLiveJinhakDiagnostics("progress-wait-mission", force = true)
                         }
                     } else {
-                        // A real slow worker/action/snapshot still owns the target. Do not steal it.
                         persistLiveJinhakDiagnostics("progress-wait-mission", force = true)
                     }
                 } else {
@@ -4675,8 +4701,26 @@ class MainActivity : Activity() {
 
     private fun collectSnapshotForBatch() {
         if (!batchRunning || batchPausedForLogin || batchCollecting) return
+        val snapshotCellToken = if (provider == ProviderId.JINHAK) {
+            jinhakMissionCells.beginSnapshot(
+                targetId = jinhakActiveMissionTargetId ?: jinhakMissionContext?.identityKey,
+                safePath = runtimeSafePath(webView.url ?: currentBatchTarget ?: ""),
+                detail = "batch-snapshot"
+            )
+        } else null
         batchCollecting = true
         collectSnapshot(webView) { snapshot ->
+            if (snapshotCellToken != null) {
+                val snapshotCallbackAccepted = jinhakMissionCells.finishSnapshot(
+                    snapshotCellToken,
+                    success = snapshot != null,
+                    reason = if (snapshot != null) "snapshot-ready" else "snapshot-null"
+                )
+                if (!snapshotCallbackAccepted) {
+                    persistLiveJinhakDiagnostics("late-snapshot-callback-ignored", force = true)
+                    return@collectSnapshot
+                }
+            }
             batchCollecting = false
             if (!batchRunning || snapshot == null) return@collectSnapshot
             stabilizeBatchSnapshotContext(snapshot)
@@ -5385,6 +5429,11 @@ class MainActivity : Activity() {
             )
             jinhakReportBridgeArmed += 1
         }
+        val actionCellToken = jinhakMissionCells.beginAction(
+            targetId = ledgerTargetIdForAction ?: jinhakMissionContext?.identityKey,
+            safePath = runtimeSafePath(route),
+            detail = "${candidate.kind}:${candidate.label.take(48)}"
+        )
         jinhakAgentActionInFlight = true
         jinhakAgentActionsExecuted += 1
         if (missionBudgetedAction) jinhakMissionActionsExecuted += 1 else jinhakGenericActionsExecuted += 1
@@ -5400,6 +5449,15 @@ class MainActivity : Activity() {
 
         webView.evaluateJavascript(JinhakAgentNavigator.executionScript(candidate)) { encoded ->
             val result = runCatching { JSONObject(decodeJsString(encoded)) }.getOrNull() ?: JSONObject()
+            val actionCallbackAccepted = jinhakMissionCells.finishAction(
+                actionCellToken,
+                success = result.optBoolean("ok", false),
+                reason = result.optString("reason", if (result.optBoolean("ok", false)) "ok" else "unknown-agent-action-failure")
+            )
+            if (!actionCallbackAccepted) {
+                persistLiveJinhakDiagnostics("late-action-callback-ignored", force = true)
+                return@evaluateJavascript
+            }
             jinhakAgentActionInFlight = false
             if (!batchRunning || batchPausedForLogin) return@evaluateJavascript
             if (!result.optBoolean("ok", false)) {
@@ -6021,6 +6079,9 @@ class MainActivity : Activity() {
                         .put("lastMissionOriginSnapshotErrorType", jinhakLastMissionOriginSnapshotErrorType.take(80))
                         .put("jinhakPageStateErrorTypes", JSONObject(jinhakPageStateErrorTypes as Map<*, *>))
                         .put("secondsSinceMeaningfulProgress", if (jinhakLastMeaningfulProgressAtMs > 0L) (System.currentTimeMillis() - jinhakLastMeaningfulProgressAtMs).coerceAtLeast(0L) / 1000.0 else JSONObject.NULL)
+                        .put("missionCells", jinhakMissionCells.diagnostics(System.currentTimeMillis()))
+                        .put("legacyAgentActionInFlight", jinhakAgentActionInFlight)
+                        .put("legacyBatchCollecting", batchCollecting)
                         .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
                         .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
                         .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
