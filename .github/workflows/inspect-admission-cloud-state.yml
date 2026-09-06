@@ -7,7 +7,7 @@ on:
     paths:
       - ".github/workflows/inspect-admission-cloud-state.yml"
 
-# diagnostic-trigger: 2026-09-06-v0919-crash-cloud-recovery-check
+# diagnostic-trigger: 2026-08-29-v037-year-completeness-check
 
 jobs:
   inspect:
