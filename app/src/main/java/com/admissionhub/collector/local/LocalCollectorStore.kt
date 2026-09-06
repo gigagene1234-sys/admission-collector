@@ -10,6 +10,7 @@ import com.admissionhub.collector.adiga.AdigaPlanTask
 import com.admissionhub.collector.canonical.CanonicalEntity
 import com.admissionhub.collector.canonical.ProviderEntityMapping
 import com.admissionhub.collector.canonical.CanonicalSixApplicationGraph
+import com.admissionhub.collector.canonical.AdigaOfficialAdmissionEvidence
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
@@ -26,7 +27,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "admission_collector_local_v1.db",
     null,
-    7
+    8
 ) {
     private fun ensureFoundationSchema(db: SQLiteDatabase) {
         // Content-aware captures: same route can expose different data at another time/context.
@@ -190,6 +191,19 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
               generated_at TEXT NOT NULL
             )
         """.trimIndent())
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS hub_selected_recovery_scope(
+              session_id TEXT NOT NULL,
+              application_identity_key TEXT NOT NULL,
+              missing_lanes_json TEXT NOT NULL,
+              state TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(session_id,application_identity_key)
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_hub_selected_recovery_state ON hub_selected_recovery_scope(session_id,state,updated_at)")
 
         db.execSQL("""
             CREATE TABLE IF NOT EXISTS jinhak_mission_targets(
@@ -385,6 +399,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             ensureFoundationSchema(db)
         }
         if (oldVersion < 7) {
+            ensureFoundationSchema(db)
+        }
+        if (oldVersion < 8) {
             ensureFoundationSchema(db)
         }
     }
@@ -1479,12 +1496,131 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("sessionSecretStored", false)
     }
 
+    fun providerRunIdForUnifiedSession(sessionId: String, provider: String): String? = unifiedProviderRunId(sessionId, provider)
+
+    fun adoptUnifiedSessionCollectorVersion(sessionId: String, collectorVersion: String) {
+        if (sessionId.isBlank() || collectorVersion.isBlank()) return
+        val cv = ContentValues().apply {
+            put("collector_version", collectorVersion)
+            put("updated_at", Instant.now().toString())
+        }
+        writableDatabase.update("unified_sessions", cv, "session_id=?", arrayOf(sessionId))
+    }
+
     private fun unifiedProviderRunId(sessionId: String, provider: String): String? {
         val column = if (provider == "adiga") "adiga_run_id" else if (provider == "jinhak") "jinhak_run_id" else return null
         return readableDatabase.rawQuery(
             "SELECT $column FROM unified_sessions WHERE session_id=? LIMIT 1",
             arrayOf(sessionId)
         ).use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getString(0) else null }
+    }
+
+    fun prepareSelectedSixRecovery(sessionId: String): JSONObject {
+        val slots = loadHubApplicationSlots()
+        val selected = mutableListOf<String>()
+        for (i in 0 until slots.length()) {
+            val row = slots.optJSONObject(i) ?: continue
+            if (!row.optBoolean("occupied", false)) continue
+            row.optString("applicationIdentityKey").takeIf { it.isNotBlank() }?.let(selected::add)
+        }
+        val candidates = loadCanonicalApplicationCandidates(sessionId)
+        val byIdentity = linkedMapOf<String, JSONObject>()
+        for (i in 0 until candidates.length()) {
+            val row = candidates.optJSONObject(i) ?: continue
+            byIdentity[row.optString("applicationIdentityKey")] = row
+        }
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.delete("hub_selected_recovery_scope", "session_id=?", arrayOf(sessionId))
+            for (identity in selected.distinct()) {
+                val candidate = byIdentity[identity]
+                val missing = candidate?.optJSONObject("coverage")?.optJSONArray("missing") ?: JSONArray()
+                val state = if (candidate == null) "stale" else if (missing.length() == 0) "complete" else "pending"
+                val cv = ContentValues().apply {
+                    put("session_id", sessionId)
+                    put("application_identity_key", identity)
+                    put("missing_lanes_json", missing.toString())
+                    put("state", state)
+                    put("attempt_count", 0)
+                    put("updated_at", Instant.now().toString())
+                }
+                db.insertWithOnConflict("hub_selected_recovery_scope", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return selectedSixRecoveryPlan(sessionId)
+    }
+
+    fun selectedSixRecoveryPlan(sessionId: String): JSONObject {
+        val entries = JSONArray()
+        val identities = JSONArray()
+        var pending = 0
+        var complete = 0
+        var stale = 0
+        readableDatabase.rawQuery(
+            "SELECT application_identity_key,missing_lanes_json,state,attempt_count,updated_at FROM hub_selected_recovery_scope WHERE session_id=? ORDER BY application_identity_key",
+            arrayOf(sessionId)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val state = c.getString(2)
+                when (state) { "pending", "running" -> pending += 1; "complete" -> complete += 1; else -> stale += 1 }
+                identities.put(c.getString(0))
+                entries.put(JSONObject()
+                    .put("applicationIdentityKey", c.getString(0))
+                    .put("missingLanes", runCatching { JSONArray(c.getString(1)) }.getOrDefault(JSONArray()))
+                    .put("state", state)
+                    .put("attemptCount", c.getInt(3))
+                    .put("updatedAt", c.getString(4)))
+            }
+        }
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("requiredSlots", CanonicalSixApplicationGraph.SLOT_COUNT)
+            .put("scopedIdentities", identities.length())
+            .put("identities", identities)
+            .put("pendingIdentities", pending)
+            .put("completeIdentities", complete)
+            .put("staleIdentities", stale)
+            .put("entries", entries)
+            .put("active", identities.length() == CanonicalSixApplicationGraph.SLOT_COUNT && pending > 0)
+            .put("selectedOnly", true)
+            .put("externalCollectionMayChangeSlots", false)
+    }
+
+    fun updateSelectedRecoveryFromCoverage(sessionId: String) {
+        val candidates = loadCanonicalApplicationCandidates(sessionId)
+        val byIdentity = linkedMapOf<String, JSONObject>()
+        for (i in 0 until candidates.length()) {
+            val row = candidates.optJSONObject(i) ?: continue
+            byIdentity[row.optString("applicationIdentityKey")] = row
+        }
+        val scope = selectedSixRecoveryPlan(sessionId).optJSONArray("entries") ?: JSONArray()
+        val db = writableDatabase
+        for (i in 0 until scope.length()) {
+            val row = scope.optJSONObject(i) ?: continue
+            val identity = row.optString("applicationIdentityKey")
+            val candidate = byIdentity[identity]
+            val missing = candidate?.optJSONObject("coverage")?.optJSONArray("missing") ?: JSONArray()
+            val state = if (candidate == null) "stale" else if (missing.length() == 0) "complete" else "pending"
+            val cv = ContentValues().apply {
+                put("missing_lanes_json", missing.toString())
+                put("state", state)
+                put("updated_at", Instant.now().toString())
+            }
+            db.update("hub_selected_recovery_scope", cv, "session_id=? AND application_identity_key=?", arrayOf(sessionId, identity))
+        }
+    }
+
+    fun finishSelectedSixRecoveryScope(sessionId: String, terminalState: String) {
+        if (sessionId.isBlank()) return
+        val cv = ContentValues().apply {
+            put("state", terminalState.take(40))
+            put("updated_at", Instant.now().toString())
+        }
+        writableDatabase.update("hub_selected_recovery_scope", cv, "session_id=? AND state IN ('pending','running')", arrayOf(sessionId))
     }
 
     fun rebuildCanonicalApplicationGraph(sessionId: String): JSONObject {
@@ -1498,6 +1634,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         val byUniversity = apps.groupBy { CanonicalSixApplicationGraph.normalizeUniversityKey(it.university) }
         val matches = linkedMapOf<String, LinkedHashMap<String, JSONObject>>()
         val exactFingerprints = linkedMapOf<String, MutableSet<String>>()
+        val officialAdmissionEvidence = linkedMapOf<String, MutableList<JSONObject>>()
 
         if (!adigaRunId.isNullOrBlank() && apps.isNotEmpty()) {
             readableDatabase.rawQuery(
@@ -1548,6 +1685,31 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             }
         }
 
+        if (!adigaRunId.isNullOrBlank() && apps.isNotEmpty()) {
+            readableDatabase.rawQuery(
+                "SELECT COALESCE(year,-1),university,record_type,json FROM records WHERE run_id=? AND record_type IN ('current-admission-criteria-table','historical-admission-result-table') AND university IS NOT NULL",
+                arrayOf(adigaRunId)
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val recordYear = c.getInt(0)
+                    val university = if (c.isNull(1)) null else c.getString(1)
+                    val recordType = c.getString(2)
+                    val candidates = byUniversity[CanonicalSixApplicationGraph.normalizeUniversityKey(university)].orEmpty()
+                    if (candidates.isEmpty()) continue
+                    val record = runCatching { JSONObject(c.getString(3)) }.getOrNull() ?: continue
+                    for (app in candidates) {
+                        val evidence = AdigaOfficialAdmissionEvidence.inspect(
+                            recordType,
+                            recordYear,
+                            record,
+                            AdigaOfficialAdmissionEvidence.AppRef(app.year, app.university, app.department, app.admission, app.admissionCategory)
+                        )
+                        if (evidence.isNotEmpty()) officialAdmissionEvidence.getOrPut(app.identityKey) { mutableListOf() }.addAll(evidence)
+                    }
+                }
+            }
+        }
+
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -1564,10 +1726,16 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                 val matchRows = matches[app.identityKey]?.values?.toList().orEmpty()
                 val acceptedSignatures = matchRows.count { it.optString("matchClass") == "accepted" }
                 val provisionalSignatures = matchRows.count { it.optString("matchClass") == "provisional" }
+                val officialEvidenceRows = officialAdmissionEvidence[app.identityKey].orEmpty()
+                val rowBoundCurrent = officialEvidenceRows.count { it.optString("scope") == "row-bound-current" }
+                val rowBoundRelated = officialEvidenceRows.count { it.optString("scope") == "row-bound-current-related" }
+                val currentUniversityEvidence = officialEvidenceRows.count { it.optString("scope") == "university-current" }
                 val bindingQuality = when {
                     acceptedSignatures == 1 -> "accepted"
                     acceptedSignatures > 1 -> "provisional"
-                    provisionalSignatures > 0 -> "provisional"
+                    rowBoundCurrent == 1 -> "accepted"
+                    rowBoundCurrent > 1 -> "provisional"
+                    provisionalSignatures > 0 || rowBoundRelated > 0 || currentUniversityEvidence > 0 -> "provisional"
                     else -> "provider-only"
                 }
                 val qualityState = when {
@@ -1582,7 +1750,12 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                     .put("bindingQuality", bindingQuality)
                     .put("acceptedSignatures", acceptedSignatures)
                     .put("provisionalSignatures", provisionalSignatures)
+                    .put("officialRowBoundCurrent", rowBoundCurrent)
+                    .put("officialRowBoundRelated", rowBoundRelated)
+                    .put("officialUniversityCurrent", currentUniversityEvidence)
+                    .put("officialAdmissionEvidence", JSONArray(officialEvidenceRows.take(24)))
                     .put("matches", JSONArray(matchRows))
+                    .put("sameRowRequiredForOfficialAccepted", true)
                     .put("doNotInferMissingBindings", true)
 
                 if (universityId != null && app.university != null) upsertCanonicalEntity(
@@ -1848,7 +2021,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         if (selectedIdentities.size != selected) blockers.put("duplicate-application-slot")
         if (staleSlots.length() > 0) blockers.put("stale-slot-binding")
         if (selectedFullCoverage < selected) blockers.put("selected-application-core-coverage-incomplete")
+        val repairNeededCandidates = (candidates.length() - fullCoverage).coerceAtLeast(0)
         val warnings = JSONArray()
+        if (repairNeededCandidates > 0) warnings.put("candidate-core-coverage-incomplete")
         if (selectedProvisional > 0) warnings.put("selected-provisional-adiga-binding")
         if (selectedProviderOnly > 0) warnings.put("selected-provider-only-no-safe-adiga-binding")
         val observations = observationStats(sessionId)
@@ -1868,6 +2043,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("generatedAt", Instant.now().toString())
             .put("candidateCount", candidates.length())
             .put("fullCoreCoverageCandidates", fullCoverage)
+            .put("repairNeededCandidates", repairNeededCandidates)
             .put("candidateQuality", JSONObject()
                 .put("accepted", accepted)
                 .put("provisional", provisional)
@@ -1915,6 +2091,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("candidateGraph", candidates)
             .put("slots", slots)
             .put("qualityAudit", audit)
+            .put("selectedRecoveryPlan", selectedSixRecoveryPlan(sessionId))
             .put("slotPolicy", JSONObject()
                 .put("slots", CanonicalSixApplicationGraph.SLOT_COUNT)
                 .put("userControlsAddChangeReplaceOrder", true)

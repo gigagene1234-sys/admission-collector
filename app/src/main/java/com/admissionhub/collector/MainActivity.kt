@@ -69,6 +69,7 @@ class MainActivity : Activity() {
     private lateinit var realJinhakAuthProbeButton: Button
     private lateinit var hubState: TextView
     private lateinit var hubManageButton: Button
+    private lateinit var hubRecoveryButton: Button
     private lateinit var cloudOffload: CloudOffloadCoordinator
     private lateinit var localStore: LocalCollectorStore
     private lateinit var sessionVault: SecureSessionVault
@@ -216,6 +217,9 @@ class MainActivity : Activity() {
     private var jinhakLoginUrlStateCorrections = 0
     private var jinhakTerminalSeals = 0
     private var jinhakTerminalSealed = false
+    private var selectedSixRecoveryMode = false
+    private val selectedSixRecoveryIdentityKeys = linkedSetOf<String>()
+    private var selectedSixRecoverySessionId: String? = null
     private var jinhakActiveMissionTargetId: String? = null
     private val jinhakSlowLaneMissionTargetIds = linkedMapOf<String, String>()
     private val jinhakMissionAnchorDiscoveredKeys = linkedSetOf<String>()
@@ -449,8 +453,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.10.0"
-        private const val BUILD_CODE = 110000
+        private const val VERSION = "0.10.1"
+        private const val BUILD_CODE = 110010
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -671,8 +675,13 @@ class MainActivity : Activity() {
             text = "지원 6장 관리"
             setOnClickListener { showHubSixManager() }
         }
+        hubRecoveryButton = Button(this).apply {
+            text = "선택 6장 보강"
+            setOnClickListener { startSelectedSixRecovery() }
+        }
         hubRow.addView(hubState, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         hubRow.addView(hubManageButton)
+        hubRow.addView(hubRecoveryButton)
 
         status = TextView(this).apply {
             text = "Admission Hub v$VERSION 준비 중"
@@ -764,6 +773,9 @@ class MainActivity : Activity() {
         val slots = audit.optJSONObject("sixSlots") ?: JSONObject()
         val selected = slots.optInt("selected", 0)
         val candidates = audit.optInt("candidateCount", 0)
+        val completeCandidates = audit.optInt("fullCoreCoverageCandidates", 0)
+        val repairCandidates = audit.optInt("repairNeededCandidates", (candidates - completeCandidates).coerceAtLeast(0))
+        val selectedComplete = slots.optInt("fullCoreCoverage", 0)
         val publish = audit.optString("publishState", "WAITING_FOR_USER_SELECTION")
         val readyText = when (publish) {
             "READY" -> "Hub 준비 완료"
@@ -771,7 +783,94 @@ class MainActivity : Activity() {
             "BLOCKED_QUALITY" -> "품질 점검 필요"
             else -> "6장 선택 필요"
         }
-        hubState.text = "지원 6장 $selected/6 · 후보 $candidates · $readyText"
+        hubState.text = "지원 6장 $selected/6 · 후보 $candidates · 완전 $completeCandidates · 보강 $repairCandidates · $readyText"
+        if (::hubRecoveryButton.isInitialized) {
+            hubRecoveryButton.isEnabled = selected == 6 && selectedComplete < 6 && !unifiedRunning && !batchRunning
+            hubRecoveryButton.text = if (selected == 6 && selectedComplete < 6) "선택 6장 보강 (${6 - selectedComplete})" else "선택 6장 보강"
+        }
+    }
+
+    private fun restoreSelectedSixRecoveryScope(sessionId: String): Boolean {
+        val plan = localStore.selectedSixRecoveryPlan(sessionId)
+        if (!plan.optBoolean("active", false)) return false
+        selectedSixRecoveryIdentityKeys.clear()
+        val identities = plan.optJSONArray("identities") ?: JSONArray()
+        for (i in 0 until identities.length()) identities.optString(i).takeIf { it.isNotBlank() }?.let(selectedSixRecoveryIdentityKeys::add)
+        selectedSixRecoveryMode = selectedSixRecoveryIdentityKeys.size == 6
+        selectedSixRecoverySessionId = if (selectedSixRecoveryMode) sessionId else null
+        return selectedSixRecoveryMode
+    }
+
+    private fun startSelectedSixRecovery() {
+        if (startupLoginPreflightActive || unifiedRunning || batchRunning) {
+            Toast.makeText(this, "현재 로그인/수집 작업이 끝난 뒤 보강을 시작해주세요.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val sessionId = localStore.latestUnifiedSession()
+        if (sessionId.isNullOrBlank()) {
+            Toast.makeText(this, "보강할 통합 수집 세션이 없습니다.", Toast.LENGTH_LONG).show()
+            return
+        }
+        localStore.rebuildCanonicalApplicationGraph(sessionId)
+        val plan = localStore.prepareSelectedSixRecovery(sessionId)
+        if (plan.optInt("scopedIdentities", 0) != 6) {
+            Toast.makeText(this, "먼저 '지원 6장 관리'에서 정확히 6개 지원안을 선택해주세요.", Toast.LENGTH_LONG).show()
+            refreshHubState(sessionId, localStore.canonicalHubSummary(sessionId))
+            return
+        }
+        if (plan.optInt("pendingIdentities", 0) == 0) {
+            Toast.makeText(this, "선택한 6장은 핵심 coverage가 모두 완료되어 보강이 필요하지 않습니다.", Toast.LENGTH_LONG).show()
+            refreshHubState(sessionId, localStore.canonicalHubSummary(sessionId))
+            return
+        }
+        selectedSixRecoveryIdentityKeys.clear()
+        val identities = plan.optJSONArray("identities") ?: JSONArray()
+        for (i in 0 until identities.length()) identities.optString(i).takeIf { it.isNotBlank() }?.let(selectedSixRecoveryIdentityKeys::add)
+        selectedSixRecoveryMode = selectedSixRecoveryIdentityKeys.size == 6
+        selectedSixRecoverySessionId = sessionId
+        if (!selectedSixRecoveryMode) {
+            Toast.makeText(this, "선택 6장 recovery scope를 만들지 못했습니다.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        localStore.adoptUnifiedSessionCollectorVersion(sessionId, VERSION)
+        unifiedSessionId = sessionId
+        unifiedRunning = true
+        unifiedPhase = "jinhak"
+        provider = ProviderId.JINHAK
+        localRunId = localStore.providerRunIdForUnifiedSession(sessionId, ProviderId.JINHAK.wireName)
+        unifiedPendingAdigaStart = false
+        unifiedPendingJinhakStart = false
+        unifiedJinhakAutoCapture = false
+        jinhakTransitionAuthGateActive = true
+        jinhakAuthVerifiedForBatch = false
+        jinhakCoreBootstrapState = "selected-six-recovery-auth-gate"
+        jinhakIncompleteCoverageRecoveryAttempts.clear()
+        restoreJinhakMissionPersistence(sessionId, "selected-six-recovery-start")
+        localStore.updateUnifiedSession(sessionId, "jinhak", "running", "selected-six-recovery")
+        localStore.recordSyncState(
+            sessionId,
+            UnifiedSyncState.JINHAK_USER_SESSION_MISSION.name,
+            ProviderId.JINHAK.wireName,
+            JSONObject()
+                .put("mode", "selected-six-recovery")
+                .put("selectedIdentities", selectedSixRecoveryIdentityKeys.size)
+                .put("pendingIdentities", plan.optInt("pendingIdentities", 0))
+                .put("selectedOnly", true),
+            false
+        )
+        activateProcessResumeJournal("selected-six-recovery")
+        unifiedButton.text = "선택 6장 보강 종료"
+        hubRecoveryButton.isEnabled = false
+        status.text = "선택한 6장 중 누락된 report lane만 보강하기 위해 진학사 보호경로 인증을 확인합니다."
+        val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
+        if (coreProbe.isBlank()) {
+            unifiedRunning = false
+            selectedSixRecoveryMode = false
+            Toast.makeText(this, "진학사 보호경로를 확인할 수 없습니다.", Toast.LENGTH_LONG).show()
+            return
+        }
+        webView.loadUrl(coreProbe)
     }
 
     private fun showHubSixManager() {
@@ -1717,6 +1816,7 @@ class MainActivity : Activity() {
     }
 
     private fun currentExpectedJinhakMissionIdentities(): Set<String> = when {
+        selectedSixRecoveryMode && selectedSixRecoveryIdentityKeys.isNotEmpty() -> selectedSixRecoveryIdentityKeys.toSet()
         jinhakNormalizedIdentitySeedKeys.isNotEmpty() -> jinhakNormalizedIdentitySeedKeys.toSet()
         jinhakMissionCoverage.isNotEmpty() -> jinhakMissionCoverage.keys.toSet()
         else -> emptySet()
@@ -1800,7 +1900,7 @@ class MainActivity : Activity() {
         if (expected.size < 6) return false
         val incomplete = incompleteJinhakCoverageIdentities()
         if (incomplete.isEmpty() || !jinhakIncompleteCoverageRecoveryExhausted()) return false
-        if (jinhakApplicationMissionReturns < expected.size) return false
+        if (!selectedSixRecoveryMode && jinhakApplicationMissionReturns < expected.size) return false
 
         jinhakCoreCoverageClosurePending = true
         jinhakIncompleteCoverageFinishes += 1
@@ -1829,7 +1929,7 @@ class MainActivity : Activity() {
         val audit = jinhakMissionCoverageLedger.summary(expected)
         if (!audit.optBoolean("coreComplete", false)) return
         if (jinhakMissionTargetLedger.outstandingCount() > 0) return
-        if (jinhakApplicationMissionReturns < expected.size) return
+        if (!selectedSixRecoveryMode && jinhakApplicationMissionReturns < expected.size) return
 
         jinhakCoreCoverageClosurePending = true
         jinhakCoreCoverageClosureFences += 1
@@ -2099,6 +2199,7 @@ class MainActivity : Activity() {
             unifiedPendingAdigaStart = false
             unifiedPendingJinhakStart = true
             unifiedJinhakAutoCapture = false
+            restoreSelectedSixRecoveryScope(sessionId)
             val restoredMissionTargets = restoreJinhakMissionPersistence(sessionId, "activity-resume")
             val lease = runCatching { sessionVault.restore(ProviderId.JINHAK.wireName) }.getOrNull()
             val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
@@ -3691,6 +3792,9 @@ class MainActivity : Activity() {
                 false
             )
             val canonicalSummary = localStore.rebuildCanonicalApplicationGraph(sessionId)
+            if (selectedSixRecoveryMode || selectedSixRecoverySessionId == sessionId) {
+                localStore.updateSelectedRecoveryFromCoverage(sessionId)
+            }
             val qualityAudit = canonicalSummary.optJSONObject("qualityAudit") ?: JSONObject()
             localStore.recordSyncState(
                 sessionId,
@@ -3741,8 +3845,18 @@ class MainActivity : Activity() {
                 .put("sessionIdPresent", true))
             val hubAudit = summary.optJSONObject("canonicalHub")?.optJSONObject("qualityAudit") ?: JSONObject()
             val selected = hubAudit.optJSONObject("sixSlots")?.optInt("selected", 0) ?: 0
+            val recoveryWasActive = selectedSixRecoveryMode || selectedSixRecoverySessionId == sessionId
+            if (recoveryWasActive) {
+                val selectedFull = hubAudit.optJSONObject("sixSlots")?.optInt("fullCoreCoverage", 0) ?: 0
+                localStore.finishSelectedSixRecoveryScope(sessionId, if (selectedFull == 6) "complete" else "incomplete")
+                selectedSixRecoveryMode = false
+                selectedSixRecoveryIdentityKeys.clear()
+                selectedSixRecoverySessionId = null
+            }
             status.text = if (hubAudit.optBoolean("hubReady", false)) {
                 "통합 수집 + canonical merge + quality audit 완료 · 지원 6장 Hub 준비 완료."
+            } else if (recoveryWasActive) {
+                "선택 6장 보강 종료 · 남은 누락과 공식 결합 상태를 Hub 품질 점검에서 확인하세요."
             } else {
                 "통합 수집 + canonical merge 완료 · 지원 6장 $selected/6 선택 후 Hub 게시가 완료됩니다."
             }
@@ -3846,7 +3960,12 @@ class MainActivity : Activity() {
         val preserveJinhakMissionState = provider == ProviderId.JINHAK && unifiedRunning &&
             (jinhakBatchStartCount > 0 || restoredPersistedMissionTargets > 0)
         if (provider == ProviderId.JINHAK) {
-            localRunId = localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
+            localRunId = if (selectedSixRecoveryMode) {
+                unifiedSessionId?.let { localStore.providerRunIdForUnifiedSession(it, ProviderId.JINHAK.wireName) }
+                    ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
+            } else {
+                localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
+            }
             unifiedSessionId?.takeIf { unifiedRunning }?.let { sessionId ->
                 localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId) }
             }
@@ -7225,6 +7344,8 @@ class MainActivity : Activity() {
                         .put("loginUrlStateCorrections", jinhakLoginUrlStateCorrections)
                         .put("terminalSeals", jinhakTerminalSeals)
                         .put("terminalSealed", jinhakTerminalSealed)
+                .put("selectedSixRecoveryMode", selectedSixRecoveryMode)
+                .put("selectedSixRecoveryIdentities", selectedSixRecoveryIdentityKeys.size)
                         .put("coreCoverageAudit", jinhakCoreCoverageAudit())
                         .put("missionCoveragePersistence", unifiedSessionId?.let { localStore.jinhakMissionCoveragePersistenceSummary(it) } ?: JSONObject())
                         .put("consentGatesEncountered", jinhakConsentGatesEncountered)
