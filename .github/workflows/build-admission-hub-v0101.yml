@@ -1,0 +1,167 @@
+name: Build Admission Hub v0.10.1 Selected Six Recovery
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-hub-v0101.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-verify-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.10.1-Selected-Six-Recovery.apk
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v0.10.1 patch
+        run: python3 .github/scripts/patch_v0101.py
+
+      - name: Verify roadmap and safety invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          store=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
+          evidence=Path('app/src/main/java/com/admissionhub/collector/canonical/AdigaOfficialAdmissionEvidence.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          mission=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt').read_text()
+          cell=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionCellSupervisor.kt').read_text()
+          checks={
+            'version': 'private const val VERSION = "0.10.1"' in main and 'private const val BUILD_CODE = 110010' in main,
+            'selected-six-ui': '선택 6장 보강' in main and 'startSelectedSixRecovery' in main,
+            'persistent-scope': 'hub_selected_recovery_scope' in store and 'prepareSelectedSixRecovery' in store,
+            'selected-only': 'selectedSixRecoveryMode && selectedSixRecoveryIdentityKeys.isNotEmpty()' in main,
+            'run-history-preserved': 'providerRunIdForUnifiedSession' in store and 'selectedSixRecoveryMode' in main,
+            'official-evidence': 'object AdigaOfficialAdmissionEvidence' in evidence and 'row-bound-current' in evidence,
+            'same-row-accepted': 'sameRowRequiredForOfficialAccepted' in store,
+            'no-auto-slots': 'externalCollectionAutoSelection' in main and 'externalCollectionMayChangeSlots' in store,
+            'prediction-separation': 'predictionDoesNotOverwriteHistoricalActual' in store,
+            'batch-crawl-disabled': 'override val supportsBatchCrawl = false' in adapter,
+            'user-session-mission': 'override val supportsUserSessionMissionTraversal = true' in adapter,
+            'mission-cell': 'JinhakMissionCellSupervisor' in main and 'LATE_CALLBACK_IGNORED' in cell,
+            'same-card': 'same-card-action-not-found' in main,
+            'no-invented-rail-dept': '철도차량시스템공학과' not in mission,
+            'privacy': 'credentialStored' in store and 'sessionSecretStored' in store,
+          }
+          failed=[k for k,v in checks.items() if not v]
+          if failed: raise SystemExit('v0.10.1 invariant failure: '+', '.join(failed))
+          for banned in ['autoSelectTopSix','autoReplaceHubSlot','inferMissingDepartment','inferMissingAdmission']:
+              if banned in main or banned in store or banned in evidence:
+                  raise SystemExit('forbidden automatic inference/slot mutation: '+banned)
+          print('v0.10.1 roadmap + safety invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compile patched source
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify patched APK metadata and signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -Fq "versionCode='110010'" /tmp/badging.txt
+          grep -Fq "versionName='0.10.1'" /tmp/badging.txt
+          grep -Fq "application-label:'Admission Hub v0.10.1 Selected Six Recovery'" /tmp/badging.txt
+          grep -qi 'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995' /tmp/apksigner.txt
+
+      - name: Commit v0.10.1 product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt \
+            app/src/main/java/com/admissionhub/collector/canonical/AdigaOfficialAdmissionEvidence.kt \
+            app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.10.1 Selected Six Recovery and Official Admission Binding"
+          git push origin HEAD:main
+          PRODUCT_SHA=$(git rev-parse HEAD)
+          echo "PRODUCT_SHA=$PRODUCT_SHA" >> "$GITHUB_ENV"
+          echo "Product commit: $PRODUCT_SHA"
+
+      - name: Rebuild exact committed product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git reset --hard "$PRODUCT_SHA"
+          rm -rf app/build
+          gradle --no-daemon :app:assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee /tmp/final-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/final-badging.txt
+          grep -Fq "versionCode='110010'" /tmp/final-badging.txt
+          grep -Fq "versionName='0.10.1'" /tmp/final-badging.txt
+          grep -qi 'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995' /tmp/final-apksigner.txt
+
+      - name: Package final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/$APK_NAME"
+          sha256sum "dist/$APK_NAME" | tee "dist/$APK_NAME.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.10.1-selected-six-recovery
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish v0.10.1 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release delete v0.10.1 --yes --cleanup-tag >/dev/null 2>&1 || true
+          git tag -f v0.10.1 "$PRODUCT_SHA"
+          git push origin -f v0.10.1
+          gh release create v0.10.1 \
+            "dist/$APK_NAME" "dist/$APK_NAME.sha256" \
+            --target "$PRODUCT_SHA" \
+            --title "Admission Hub v0.10.1 — Selected Six Recovery + Official Admission Binding" \
+            --notes "Moves Hub work from 27-candidate completeness to six-application precision. Adds a persistent user-selected six recovery scope, targeted Jinhak recovery for missing core report lanes only, crash-resumable recovery scope, and reuses the existing Jinhak run so prior record history is not replaced. Adds conservative Adiga official admission-table evidence extraction: only same-row current-year department+admission evidence may promote an official binding to accepted; university-level and historical mentions remain evidence without inferred binding. Hub status now shows total/full/repair-needed candidates. External collection never selects, replaces, or reorders the six user slots. Preserves Jinhak same-card mission safety, mission cells, terminal seal, observation-first storage, prediction/historical semantic separation, and privacy invariants. Product commit: $PRODUCT_SHA"
