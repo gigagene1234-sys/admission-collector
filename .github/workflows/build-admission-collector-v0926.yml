@@ -1,0 +1,173 @@
+name: Build Admission Collector v0.9.26 Incomplete Coverage Recovery Fence
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v0926.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-verify-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.9.26 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch_v0926.py
+
+      - name: Verify v0.9.26 architecture and safety invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          l=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          manifest=Path('app/src/main/AndroidManifest.xml').read_text()
+          j=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          cov=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionCoverageLedger.kt').read_text()
+          req={
+            'version':'private const val VERSION = "0.9.26"' in m and 'private const val BUILD_CODE = 109260' in m,
+            'gradle':'versionCode = 109260' in g and 'versionName = "0.9.26"' in g,
+            'label':'Admission Collector v0.9.26 Incomplete Coverage Recovery Fence' in manifest,
+            'bounded-recovery':'MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS = 2' in m and 'jinhak-incomplete-coverage-recovery-start' in m,
+            'incomplete-terminal':'completed-with-incomplete-coverage' in m and 'jinhak-incomplete-coverage-terminal-fence' in m,
+            'same-card-recovery':'recoveryCandidateForIdentity' in l and 'jinhakAgentActionSeen.remove(actionKeyFor(candidate))' in m,
+            'strong-login-evidence':'jinhak-login-url-state-correction' in m and 'batchPausedForLogin = true' in m,
+            'generic-tail-fence':'maybeFinishJinhakIncompleteCoverage("selection", route)' in m,
+            'post-mission-policy':'jinhakIncompleteCoverageRecoveryExhausted()' in m,
+            'coverage-ledger':'CORE_LANES' in cov and 'JinhakMissionCoverageLedger' in m,
+            'terminal-seal':'sealJinhakTerminalState' in m and 'JINHAK_TERMINAL_SEAL' in m,
+            'v0924-report-bridge':'inheritedReportLaneActions' in m and 'report-lane-navigation' in Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text(),
+            'v0923-auth':'finishJinhakPostMissionLoginIfReady' in m,
+            'v0922-stability':'JINHAK_SINGLE_WEBVIEW_STABILITY_MODE = true' in m,
+            'adapter':'override val supportsBatchCrawl = false' in j and 'override val supportsUserSessionMissionTraversal = true' in j,
+          }
+          failed=[k for k,v in req.items() if not v]
+          if failed: raise SystemExit('Missing invariant(s): '+', '.join(failed))
+          forbidden=[
+            '.put("password", credentials.password)',
+            '.putString("processCookie"',
+            '.putString("processToken"',
+            '.put("cookie",',
+            '.put("sessionToken",'
+          ]
+          hits=[x for x in forbidden if x in m]
+          if hits: raise SystemExit('privacy invariant failed: '+', '.join(hits))
+          print('v0.9.26 source/safety invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compile patched source
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify patched APK metadata and signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee patched-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='109260'" patched-badging.txt
+          grep -q "versionName='0.9.26'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.26 Incomplete Coverage Recovery Fence'" patched-badging.txt
+          grep -qi "db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995" patched-apksigner.txt
+
+      - name: Commit v0.9.26 product source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionTargetLedger.kt \
+            app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.9.26 Incomplete Coverage Recovery Fence"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild exact committed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA='${{ steps.commit.outputs.sha }}'
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(git rev-parse HEAD)" = "$SHA"
+          gradle --no-daemon :app:assembleDebug
+
+      - name: Package final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.26-Incomplete-Coverage-Recovery-Fence.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='109260'" badging.txt
+          grep -q "versionName='0.9.26'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.26 Incomplete Coverage Recovery Fence'" badging.txt
+          grep -qi "db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995" apksigner.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.26-Incomplete-Coverage-Recovery-Fence.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.26-final
+          path: |
+            Admission-Collector-v0.9.26-Incomplete-Coverage-Recovery-Fence.apk
+            Admission-Collector-v0.9.26-Incomplete-Coverage-Recovery-Fence.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish v0.9.26 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="v0.9.26 follows the v0.9.25 real-device run where 27/27 current-prediction targets completed and terminal sealing worked, but one application remained at 2/5 core coverage, leaving 132/135 persisted coverage. Instead of retrying only that missing application, v0.9.25 resumed generic exploration, entered university-major-predict, reached /jh/member/login while authVerifiedForBatch was still true and batchPausedForLogin false, and finished with a navigation-stall local error. This release adds a bounded SAME-APPLICATION incomplete-coverage recovery fence: after persistent targets reach outstanding=0 it reopens only an incomplete application's stored same-card candidate, at most twice per identity, and then terminates as completed-with-incomplete-coverage rather than entering an unrelated generic tail. The confirmed navigation ledger remains monotonic. A literal Jinhak login URL is now strong auth evidence and immediately corrects batch auth state to paused/unverified before recovery. Post-mission login closure no longer requires exhausting all 180 generic actions once core coverage is complete or bounded recovery is exhausted. Existing SQLite coverage persistence, terminal seal, single-WebView stability, report-lane binding, auth-proof guards, same-card restrictions, supportsBatchCrawl=false and credential/session privacy safeguards remain preserved. Commit: $SHA"
+          gh release create v0.9.26 Admission-Collector-v0.9.26-Incomplete-Coverage-Recovery-Fence.apk Admission-Collector-v0.9.26-Incomplete-Coverage-Recovery-Fence.sha256 --target "$SHA" --title "Admission Collector v0.9.26 — Incomplete Coverage Recovery Fence" --notes "$NOTES"
