@@ -267,6 +267,10 @@ class MainActivity : Activity() {
     private var jinhakPopupWebViewsCreated = 0
     private var jinhakPopupWebViewsDestroyed = 0
     private var jinhakRendererFirstCrashCooldowns = 0
+    private var jinhakLoginRecoveryEpisodeStartedAtMs = 0L
+    private var jinhakLoginRecoveryEpisodePolls = 0
+    private var jinhakLoginRecoveryFenceTrips = 0
+    private var jinhakPostMissionClosureFences = 0
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
     private var jinhakRecoveredStalls = 0
@@ -396,6 +400,8 @@ class MainActivity : Activity() {
         private const val JINHAK_SNAPSHOT_OVERLAP_RETRY_MS = 400L
         private const val JINHAK_TRANSIENT_POPUP_TIMEOUT_MS = 5_000L
         private const val JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS = 2_000L
+        private const val JINHAK_LOGIN_RECOVERY_TIMEOUT_MS = 60_000L
+        private const val MAX_JINHAK_LOGIN_RECOVERY_POLLS = 40
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val MAX_JINHAK_GENERIC_ACTIONS = 180
         private const val MAX_JINHAK_MISSION_ACTIONS = 220
@@ -426,8 +432,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.9.22"
-        private const val BUILD_CODE = 109220
+        private const val VERSION = "0.9.23"
+        private const val BUILD_CODE = 109230
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -2938,6 +2944,14 @@ class MainActivity : Activity() {
                     .put("batchRunning", batchRunning)
                     .put("batchPausedForLogin", batchPausedForLogin)
                     .put("loginRecoveryPolls", jinhakLoginRecoveryPolls)
+                    .put("loginRecoveryEpisodePolls", jinhakLoginRecoveryEpisodePolls)
+                    .put("loginRecoveryEpisodeAgeMs", if (jinhakLoginRecoveryEpisodeStartedAtMs > 0L) (System.currentTimeMillis() - jinhakLoginRecoveryEpisodeStartedAtMs).coerceAtLeast(0L) else 0L)
+                    .put("loginRecoveryTimeoutMs", JINHAK_LOGIN_RECOVERY_TIMEOUT_MS)
+                    .put("loginRecoveryMaxPolls", MAX_JINHAK_LOGIN_RECOVERY_POLLS)
+                    .put("loginRecoveryFenceTrips", jinhakLoginRecoveryFenceTrips)
+                    .put("postMissionClosureFences", jinhakPostMissionClosureFences)
+                    .put("missionOutstandingAtAuth", jinhakMissionTargetLedger.outstandingCount())
+                    .put("genericActionBudgetExhausted", jinhakGenericActionsExecuted >= MAX_JINHAK_GENERIC_ACTIONS)
                     .put("reauthCycles", jinhakReauthCycles)
                     .put("authVerificationFailures", jinhakAuthVerificationFailures)
                     .put("transitionAuthChecks", jinhakTransitionAuthChecks)
@@ -2973,17 +2987,112 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun isJinhakPostMissionClosureReady(): Boolean {
+        if (provider != ProviderId.JINHAK || !batchRunning) return false
+        val ledgerSummary = jinhakMissionTargetLedger.summary()
+        val targetCount = ledgerSummary.optInt("targets", 0)
+        if (targetCount <= 0 || jinhakMissionTargetLedger.outstandingCount() != 0) return false
+        if (jinhakActiveMissionTargetId != null || jinhakAgentActionInFlight || batchCollecting) return false
+        if (jinhakMissionCells.hasActiveOwnership()) return false
+        if (::slowLanePool.isInitialized && slowLanePool.hasWork()) return false
+        return jinhakGenericActionsExecuted >= MAX_JINHAK_GENERIC_ACTIONS
+    }
+
+    private fun finishJinhakPostMissionLoginIfReady(trigger: String): Boolean {
+        if (!isJinhakPostMissionClosureReady()) return false
+        jinhakPostMissionClosureFences += 1
+        val ledger = jinhakMissionTargetLedger.summary()
+        recordRuntimeEvent(
+            "jinhak-post-mission-login-closure",
+            JSONObject()
+                .put("trigger", trigger.take(80))
+                .put("currentSafePath", runtimeSafePath(webView.url))
+                .put("currentTargetSafePath", runtimeSafePath(currentBatchTarget))
+                .put("missionOutstanding", jinhakMissionTargetLedger.outstandingCount())
+                .put("genericActionsExecuted", jinhakGenericActionsExecuted)
+                .put("genericActionLimit", MAX_JINHAK_GENERIC_ACTIONS)
+                .put("ledger", ledger)
+                .put("reauthSkipped", true),
+            synchronous = true
+        )
+        persistJinhakAuthDiagnostics("post-mission-login-closure:$trigger")
+        persistLiveJinhakDiagnostics("post-mission-login-closure", force = true)
+        jinhakLoginRecoveryEpisodeStartedAtMs = 0L
+        jinhakLoginRecoveryEpisodePolls = 0
+        ++jinhakLoginRecoveryGeneration
+        batchPausedForLogin = false
+        status.text = "지원안 미션 27개가 모두 끝났고 일반 탐색 한도도 소진되어 추가 로그인 없이 수집을 정상 종료합니다."
+        finishBatch("completed")
+        return true
+    }
+
     private fun scheduleJinhakLoginRecovery(reason: String) {
         if (provider != ProviderId.JINHAK) return
+        val recoveryActive = startupLoginPreflightActive || jinhakTransitionAuthGateActive || (batchRunning && batchPausedForLogin)
+        if (!recoveryActive) return
+        if (batchRunning && batchPausedForLogin && finishJinhakPostMissionLoginIfReady("schedule:$reason")) return
+        if (jinhakLoginRecoveryEpisodeStartedAtMs > 0L) return
+        jinhakLoginRecoveryEpisodeStartedAtMs = System.currentTimeMillis()
+        jinhakLoginRecoveryEpisodePolls = 0
         val generation = ++jinhakLoginRecoveryGeneration
+        recordRuntimeEvent(
+            "jinhak-login-recovery-episode-started",
+            JSONObject()
+                .put("reason", reason.take(80))
+                .put("batchRunning", batchRunning)
+                .put("batchPausedForLogin", batchPausedForLogin)
+                .put("missionOutstanding", jinhakMissionTargetLedger.outstandingCount())
+                .put("genericActionsExecuted", jinhakGenericActionsExecuted)
+        )
         handler.postDelayed({ pollJinhakLoginRecovery(reason, generation) }, 120L)
     }
 
     private fun pollJinhakLoginRecovery(reason: String, generation: Int) {
         if (provider != ProviderId.JINHAK || generation != jinhakLoginRecoveryGeneration) return
         val recoveryActive = startupLoginPreflightActive || jinhakTransitionAuthGateActive || (batchRunning && batchPausedForLogin)
-        if (!recoveryActive) return
+        if (!recoveryActive) {
+            jinhakLoginRecoveryEpisodeStartedAtMs = 0L
+            jinhakLoginRecoveryEpisodePolls = 0
+            return
+        }
+        if (jinhakLoginRecoveryEpisodeStartedAtMs <= 0L) jinhakLoginRecoveryEpisodeStartedAtMs = System.currentTimeMillis()
         jinhakLoginRecoveryPolls += 1
+        jinhakLoginRecoveryEpisodePolls += 1
+        val recoveryAgeMs = (System.currentTimeMillis() - jinhakLoginRecoveryEpisodeStartedAtMs).coerceAtLeast(0L)
+        if (batchRunning && batchPausedForLogin && finishJinhakPostMissionLoginIfReady("poll:$reason")) return
+        if (batchRunning && batchPausedForLogin &&
+            (jinhakLoginRecoveryEpisodePolls >= MAX_JINHAK_LOGIN_RECOVERY_POLLS || recoveryAgeMs >= JINHAK_LOGIN_RECOVERY_TIMEOUT_MS)) {
+            jinhakLoginRecoveryFenceTrips += 1
+            val outstanding = jinhakMissionTargetLedger.outstandingCount()
+            batchErrors.put(JSONObject()
+                .put("type", "jinhak-auth-recovery-timeout")
+                .put("reason", reason.take(80))
+                .put("polls", jinhakLoginRecoveryEpisodePolls)
+                .put("elapsedMs", recoveryAgeMs)
+                .put("missionOutstanding", outstanding)
+                .put("currentSafePath", runtimeSafePath(webView.url))
+                .put("currentTargetSafePath", runtimeSafePath(currentBatchTarget)))
+            recordRuntimeEvent(
+                "jinhak-login-recovery-timeout",
+                JSONObject()
+                    .put("reason", reason.take(80))
+                    .put("polls", jinhakLoginRecoveryEpisodePolls)
+                    .put("elapsedMs", recoveryAgeMs)
+                    .put("missionOutstanding", outstanding)
+                    .put("genericActionsExecuted", jinhakGenericActionsExecuted)
+                    .put("genericActionLimit", MAX_JINHAK_GENERIC_ACTIONS),
+                synchronous = true
+            )
+            persistJinhakAuthDiagnostics("login-recovery-timeout:$reason")
+            persistLiveJinhakDiagnostics("login-recovery-timeout", force = true)
+            jinhakLoginRecoveryEpisodeStartedAtMs = 0L
+            jinhakLoginRecoveryEpisodePolls = 0
+            ++jinhakLoginRecoveryGeneration
+            batchPausedForLogin = false
+            status.text = "진학사 로그인 복구가 60초 안에 끝나지 않아 무한 반복을 차단했습니다. 수집 데이터와 미션 상태는 보존됩니다."
+            finishBatch("completed-with-local-errors")
+            return
+        }
         val currentUrl = webView.url.orEmpty()
         if (isProviderLoginUrl(ProviderId.JINHAK, currentUrl)) {
             jinhakProtectedCoreStablePasses = 0
@@ -3018,6 +3127,8 @@ class MainActivity : Activity() {
             jinhakAuthVerificationFailures += 1
             jinhakCoreBootstrapState = "core-auth-probe-missing"
             persistJinhakAuthDiagnostics("$reason-core-probe-missing")
+            jinhakLoginRecoveryEpisodeStartedAtMs = 0L
+            jinhakLoginRecoveryEpisodePolls = 0
             return
         }
         if (currentCanonical != coreCanonical) {
@@ -3079,6 +3190,8 @@ class MainActivity : Activity() {
         persistJinhakAuthProofCheckpoint(synchronous = true)
         persistJinhakMissionRuntimeState("protected-core-auth-verified")
         persistJinhakAuthDiagnostics("$reason-auth-verified")
+        jinhakLoginRecoveryEpisodeStartedAtMs = 0L
+        jinhakLoginRecoveryEpisodePolls = 0
         ++jinhakLoginRecoveryGeneration
 
         when {
@@ -3390,6 +3503,10 @@ class MainActivity : Activity() {
         jinhakMissionStallFenceTrips = 0
         jinhakMissionStallRecoveryAttempts = 0
         jinhakMissionStallTerminalStops = 0
+        jinhakLoginRecoveryEpisodeStartedAtMs = 0L
+        jinhakLoginRecoveryEpisodePolls = 0
+        jinhakLoginRecoveryFenceTrips = 0
+        jinhakPostMissionClosureFences = 0
         jinhakMissionCells.resetForRun("batch-runtime-reset")
         jinhakMissionOriginSnapshotErrorStreak = 0
         jinhakMissionOriginSnapshotErrorTotal = 0
@@ -6433,6 +6550,9 @@ class MainActivity : Activity() {
     }
 
     private fun finishBatch(reason: String) {
+        jinhakLoginRecoveryEpisodeStartedAtMs = 0L
+        jinhakLoginRecoveryEpisodePolls = 0
+        ++jinhakLoginRecoveryGeneration
         batchRunning = false
         batchPausedForLogin = false
         batchCollecting = false
@@ -6567,6 +6687,11 @@ class MainActivity : Activity() {
                         .put("jinhakLastAuthEvidence", jinhakLastAuthEvidence)
                         .put("jinhakLastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
                         .put("jinhakLoginRecoveryPolls", jinhakLoginRecoveryPolls)
+                        .put("jinhakLoginRecoveryEpisodePolls", jinhakLoginRecoveryEpisodePolls)
+                        .put("jinhakLoginRecoveryFenceTrips", jinhakLoginRecoveryFenceTrips)
+                        .put("jinhakPostMissionClosureFences", jinhakPostMissionClosureFences)
+                        .put("jinhakLoginRecoveryTimeoutMs", JINHAK_LOGIN_RECOVERY_TIMEOUT_MS)
+                        .put("jinhakLoginRecoveryMaxPolls", MAX_JINHAK_LOGIN_RECOVERY_POLLS)
                         .put("jinhakReauthCycles", jinhakReauthCycles)
                         .put("jinhakAuthVerificationFailures", jinhakAuthVerificationFailures)
                         .put("jinhakTransitionAuthChecks", jinhakTransitionAuthChecks)
