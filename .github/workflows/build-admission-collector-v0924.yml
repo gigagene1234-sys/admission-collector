@@ -1,0 +1,189 @@
+name: Build Admission Collector v0.9.24 Report Lane Mission Bridge
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-collector-v0924.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-verify-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply v0.9.24 report lane mission bridge patch
+        run: python3 .github/scripts/patch_v0924.py
+
+      - name: Verify bounded source changes and invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          changed=set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())
+          allowed={
+            'app/src/main/java/com/admissionhub/collector/MainActivity.kt',
+            'app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt',
+            'app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt',
+            'app/build.gradle.kts',
+            'app/src/main/AndroidManifest.xml',
+          }
+          if changed != allowed:
+            raise SystemExit(f'Unexpected change surface: changed={sorted(changed)} expected={sorted(allowed)}')
+
+          m=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          s=Path('app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt').read_text()
+          n=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt').read_text()
+          j=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          l=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
+          g=Path('app/build.gradle.kts').read_text()
+          manifest=Path('app/src/main/AndroidManifest.xml').read_text()
+          req={
+            'version':'private const val VERSION = "0.9.24"' in m and 'private const val BUILD_CODE = 109240' in m,
+            'gradle':'versionCode = 109240' in g and 'versionName = "0.9.24"' in g,
+            'label':'Admission Collector v0.9.24 Report Lane Mission Bridge' in manifest,
+            'static-report-lane-promotion':'reportLaneControl=reportFamilyPage' in s and "report-lane-navigation" in s,
+            'report-family-execution-fence':'requiresReportFamily' in n and 'report-family-context-mismatch' in n,
+            'mission-budget':'inheritedReportLaneAction' in m and 'jinhakInheritedReportLaneActions' in m,
+            'report-bridge':'JinhakReportContextBridge.isReportAction' in m and 'jinhak-inherited-report-lane-action' in m,
+            'v0923-closure':'finishJinhakPostMissionLoginIfReady' in m and 'jinhak-post-mission-login-closure' in m and 'MAX_JINHAK_LOGIN_RECOVERY_POLLS = 40' in m,
+            'v0922-stability':'JINHAK_SINGLE_WEBVIEW_STABILITY_MODE = true' in m and 'destroyTransientPopup' in m and 'jinhakSnapshotOverlapDeferrals' in m,
+            'mission-stall':'recoverOrStopJinhakMissionStall' in m,
+            'same-card':'same-card-action-not-found' in m and 'MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3' in m,
+            'auth-proof':'persistJinhakAuthProofCheckpoint' in m and 'auth-route-cycle-detected' in m,
+            'mission-persistence':'CREATE TABLE IF NOT EXISTS jinhak_mission_targets' in l and 'monotonicStateGuard' in l,
+            'adapter':'override val supportsBatchCrawl = false' in j and 'override val supportsUserSessionMissionTraversal = true' in j,
+            'snapshot-privacy':'safeCloneText' in s and 'input,textarea,select,option,form' in s,
+          }
+          failed=[k for k,v in req.items() if not v]
+          if failed: raise SystemExit('Missing invariant(s): '+', '.join(failed))
+          forbidden=[
+            '.put("password", credentials.password)',
+            '.putString("processCookie"',
+            '.putString("processToken"',
+            'override val supportsBatchCrawl = true',
+          ]
+          joined='\n'.join([m,s,n,j])
+          hits=[x for x in forbidden if x in joined]
+          if hits: raise SystemExit('privacy/architecture invariant failed: '+', '.join(hits))
+          print('v0.9.24 source invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compile patched source
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify patched APK metadata and signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee patched-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee patched-badging.txt
+          grep -q "versionCode='109240'" patched-badging.txt
+          grep -q "versionName='0.9.24'" patched-badging.txt
+          grep -q "application-label:'Admission Collector v0.9.24 Report Lane Mission Bridge'" patched-badging.txt
+          grep -qi "db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995" patched-apksigner.txt
+
+      - name: Commit v0.9.24 source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/capture/SnapshotScript.kt \
+            app/src/main/java/com/admissionhub/collector/jinhak/JinhakAgentNavigator.kt \
+            app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.9.24 Report Lane Mission Bridge"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild exact committed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA='${{ steps.commit.outputs.sha }}'
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(git rev-parse HEAD)" = "$SHA"
+          gradle --no-daemon :app:assembleDebug
+
+      - name: Package final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=app/build/outputs/apk/debug/app-debug.apk
+          OUT=Admission-Collector-v0.9.24-Report-Lane-Mission-Bridge.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$SRC" | tee apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$SRC" | tee badging.txt
+          grep -q "versionCode='109240'" badging.txt
+          grep -q "versionName='0.9.24'" badging.txt
+          grep -q "application-label:'Admission Collector v0.9.24 Report Lane Mission Bridge'" badging.txt
+          grep -qi "db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995" apksigner.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee Admission-Collector-v0.9.24-Report-Lane-Mission-Bridge.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-collector-main-v0.9.24-final
+          path: |
+            Admission-Collector-v0.9.24-Report-Lane-Mission-Bridge.apk
+            Admission-Collector-v0.9.24-Report-Lane-Mission-Bridge.sha256
+            apksigner.txt
+            badging.txt
+          retention-days: 14
+
+      - name: Publish v0.9.24 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          NOTES="v0.9.24 follows the successful v0.9.23 mission-closure fix. The v0.9.23 real-device export completed normally with all 27 current-prediction mission targets confirmed and the post-mission auth fence firing once, but it also exposed the next structural gap: actual-admission and grade-calculation report pages were captured many times while applicationMissionCoverage remained zero for actual-admit and score-analysis. Static report-family links were entering only the generic URL frontier instead of the active same-application mission. v0.9.24 promotes only read-only report-family lane controls into the agent candidate set, marks them as report-lane-navigation, fences execution to the exact four-year-university report path, keeps them under the existing Gate-A mission/report bridge, and charges them to the mission action budget instead of the generic budget. It does not infer identity from adjacent cards or page-wide text. v0.9.23 auth closure, v0.9.22 single-WebView stability, mission-cell stale callback recovery, same-card protections, SQLite mission persistence, supportsBatchCrawl=false, Susi-only restrictions and credential/session privacy safeguards remain preserved. Commit: $SHA"
+          gh release create v0.9.24 \
+            Admission-Collector-v0.9.24-Report-Lane-Mission-Bridge.apk \
+            Admission-Collector-v0.9.24-Report-Lane-Mission-Bridge.sha256 \
+            --target "$SHA" \
+            --title "Admission Collector v0.9.24 — Report Lane Mission Bridge" \
+            --notes "$NOTES"
