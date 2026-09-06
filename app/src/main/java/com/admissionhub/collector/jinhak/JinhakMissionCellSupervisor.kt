@@ -82,6 +82,8 @@ class JinhakMissionCellSupervisor(
     private var snapshotStarts = 0
     private var actionCompletions = 0
     private var snapshotCompletions = 0
+    private var terminalState = "ACTIVE"
+    private var terminalReason = ""
 
     @Synchronized
     fun beginAction(
@@ -212,7 +214,18 @@ class JinhakMissionCellSupervisor(
         snapshotStarts = 0
         actionCompletions = 0
         snapshotCompletions = 0
+        terminalState = "ACTIVE"
+        terminalReason = ""
         addEvent(CELL_SUPERVISOR, "RUN_RESET", null, reason, nowMs)
+    }
+
+    @Synchronized
+    fun sealComplete(reason: String, nowMs: Long = System.currentTimeMillis()): InvalidationResult {
+        val invalidated = invalidateAllInternal("terminal-seal:${reason.take(80)}", nowMs)
+        terminalState = "COMPLETE"
+        terminalReason = reason.take(120)
+        addEvent(CELL_SUPERVISOR, "COMPLETE", null, terminalReason, nowMs)
+        return invalidated
     }
 
     @Synchronized
@@ -225,6 +238,7 @@ class JinhakMissionCellSupervisor(
         events.forEach { event -> timeline.put(JSONObject(event.toString())) }
 
         val state = when {
+            terminalState == "COMPLETE" -> "COMPLETE"
             rendererState == "DEAD" -> "RENDERER_DEAD"
             actionLease != null -> "WAITING_ACTION"
             snapshotLease != null -> "WAITING_SNAPSHOT"
@@ -233,6 +247,8 @@ class JinhakMissionCellSupervisor(
 
         return JSONObject()
             .put("supervisorState", state)
+            .put("terminalState", terminalState)
+            .put("terminalReason", if (terminalReason.isBlank()) JSONObject.NULL else terminalReason)
             .put("staleOwnershipMs", staleOwnershipMs)
             .put("blockedBy", blockedBy)
             .put("renderer", JSONObject()

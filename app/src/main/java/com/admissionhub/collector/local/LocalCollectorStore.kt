@@ -25,7 +25,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "admission_collector_local_v1.db",
     null,
-    5
+    6
 ) {
     private fun ensureFoundationSchema(db: SQLiteDatabase) {
         // Content-aware captures: same route can expose different data at another time/context.
@@ -155,6 +155,19 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         """.trimIndent())
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_jinhak_mission_session_state ON jinhak_mission_targets(session_id,state,state_rank)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_jinhak_mission_session_identity ON jinhak_mission_targets(session_id,identity_key,lane)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS jinhak_mission_coverage(
+              session_id TEXT NOT NULL,
+              identity_key TEXT NOT NULL,
+              lane TEXT NOT NULL,
+              source TEXT NOT NULL,
+              confirmed_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(session_id,identity_key,lane)
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_jinhak_coverage_session_lane ON jinhak_mission_coverage(session_id,lane)")
 
         db.execSQL("""
             CREATE TABLE IF NOT EXISTS jinhak_mission_runtime(
@@ -314,6 +327,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             ensureFoundationSchema(db)
         }
         if (oldVersion < 5) {
+            ensureFoundationSchema(db)
+        }
+        if (oldVersion < 6) {
             ensureFoundationSchema(db)
         }
     }
@@ -662,6 +678,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("observationStore", observationStats(sessionId))
         out.put("jinhakDiagnosticsSummary", latestSyncStateDetail(sessionId, "JINHAK_CRAWL_DIAGNOSTICS"))
             .put("jinhakAuthDiagnosticsSummary", latestSyncStateDetail(sessionId, "JINHAK_AUTH_DIAGNOSTICS"))
+            .put("jinhakTerminalSummary", latestSyncStateDetail(sessionId, "JINHAK_TERMINAL_SEAL"))
         return out
     }
 
@@ -1334,6 +1351,74 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("skipped", counts[7])
             .put("activeTargetPersisted", runtimePresent)
             .put("monotonicStateGuard", true)
+            .put("credentialStored", false)
+            .put("sessionSecretStored", false)
+            .put("coverage", jinhakMissionCoveragePersistenceSummary(sessionId))
+    }
+
+
+    fun upsertJinhakMissionCoverage(
+        sessionId: String,
+        identityKey: String,
+        lane: String,
+        source: String
+    ): Boolean {
+        if (sessionId.isBlank() || identityKey.isBlank() || lane.isBlank() || lane == "reference") return false
+        val now = Instant.now().toString()
+        val db = writableDatabase
+        val existing = db.rawQuery(
+            "SELECT confirmed_at FROM jinhak_mission_coverage WHERE session_id=? AND identity_key=? AND lane=? LIMIT 1",
+            arrayOf(sessionId, identityKey, lane)
+        ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        val cv = ContentValues().apply {
+            put("session_id", sessionId)
+            put("identity_key", identityKey)
+            put("lane", lane)
+            put("source", source.take(80))
+            put("confirmed_at", existing ?: now)
+            put("updated_at", now)
+        }
+        db.insertWithOnConflict("jinhak_mission_coverage", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        return existing == null
+    }
+
+    fun loadJinhakMissionCoverage(sessionId: String): List<JSONObject> {
+        if (sessionId.isBlank()) return emptyList()
+        val out = mutableListOf<JSONObject>()
+        readableDatabase.rawQuery(
+            "SELECT identity_key,lane,source,confirmed_at,updated_at FROM jinhak_mission_coverage WHERE session_id=? ORDER BY identity_key,lane",
+            arrayOf(sessionId)
+        ).use { c ->
+            while (c.moveToNext()) {
+                out += JSONObject()
+                    .put("identityKey", c.getString(0))
+                    .put("lane", c.getString(1))
+                    .put("source", c.getString(2))
+                    .put("confirmedAt", c.getString(3))
+                    .put("updatedAt", c.getString(4))
+            }
+        }
+        return out
+    }
+
+    fun jinhakMissionCoveragePersistenceSummary(sessionId: String): JSONObject {
+        if (sessionId.isBlank()) return JSONObject().put("persistedCoverage", 0).put("persistedIdentities", 0)
+        val db = readableDatabase
+        val counts = db.rawQuery(
+            "SELECT COUNT(*),COUNT(DISTINCT identity_key) FROM jinhak_mission_coverage WHERE session_id=?",
+            arrayOf(sessionId)
+        ).use { c -> if (c.moveToFirst()) intArrayOf(c.getInt(0), c.getInt(1)) else intArrayOf(0, 0) }
+        val laneCounts = JSONObject()
+        db.rawQuery(
+            "SELECT lane,COUNT(DISTINCT identity_key) FROM jinhak_mission_coverage WHERE session_id=? GROUP BY lane ORDER BY lane",
+            arrayOf(sessionId)
+        ).use { c -> while (c.moveToNext()) laneCounts.put(c.getString(0), c.getInt(1)) }
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("persistedCoverage", counts[0])
+            .put("persistedIdentities", counts[1])
+            .put("laneCoverage", laneCounts)
+            .put("monotonicConfirmedOnly", true)
             .put("credentialStored", false)
             .put("sessionSecretStored", false)
     }
