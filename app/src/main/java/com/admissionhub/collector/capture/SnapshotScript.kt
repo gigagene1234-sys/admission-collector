@@ -576,9 +576,11 @@ object SnapshotScript {
         }
       }
 
-      var dynamicControl=!route || role==='tab' || a.tagName==='BUTTON' || missionLink;
+      var reportFamilyPage=isJinhakHost && /\/jh\/high3\/early\/four-year-university\/report\//i.test(location.pathname);
+      var reportLaneControl=reportFamilyPage && /(실제\s*합격자|과거\s*입시결과|모의\s*지원|지원자\s*분포|성적\s*분석|성적\s*산출|환산\s*점수|합격\s*예측|합격\s*안정성)/i.test(label);
+      var dynamicControl=!route || role==='tab' || a.tagName==='BUTTON' || missionLink || reportLaneControl;
       if(dynamicControl && label && !agentBlocked.test(label+' '+meta2) && agentAllowed.test(label)){
-        var entry={scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(missionBoundControl?'mission-bound-control':(role==='tab'?'tab-navigation':'read-navigation')),contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source};
+        var entry={scanIndex:li,label:label,tag:String(a.tagName||'').slice(0,20),kind:missionLink?'mission-link-navigation':(missionBoundControl?'mission-bound-control':(reportLaneControl?'report-lane-navigation':(role==='tab'?'tab-navigation':'read-navigation'))),contextText:applicationContext,applicationUniversity:applicationBinding.university,applicationDepartment:applicationBinding.department,applicationBindingSource:applicationBinding.source};
         var ak=li+'|'+label+'|'+String(a.tagName||'')+'|'+role;
         if(missionBoundControl && missionAgentActions.length<120 && !seenMissionAgentAction[ak]){
           missionAgentActions.push(entry);

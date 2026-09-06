@@ -92,6 +92,7 @@ object JinhakAgentNavigator {
         val admission = JSONObject.quote(candidate.applicationContext?.admission.orEmpty().take(100))
         val capacity = candidate.applicationContext?.capacity ?: -1
         val requiresSameCard = candidate.applicationContext?.identityKey != null
+        val requiresReportFamily = candidate.kind == "report-lane-navigation"
         return """
             (function(){
               function visible(el){
@@ -111,6 +112,8 @@ object JinhakAgentNavigator {
               }
               var expected=$expected, uni=$university, dept=$department, adm=$admission, capacity=$capacity;
               var requireSameCard=${if (requiresSameCard) "true" else "false"};
+              var requireReportFamily=${if (requiresReportFamily) "true" else "false"};
+              if(requireReportFamily && !/\/jh\/high3\/early\/four-year-university\/report\//i.test(location.pathname)) return JSON.stringify({ok:false,reason:'report-family-context-mismatch'});
               var blocked=/(원서\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰|동의|미동의)/i;
               var allowed=/(실제\s*합격자|과거\s*입시결과|입시\s*결과|합격\s*예측\s*리포트|모의\s*지원\s*리포트|지원자\s*분포|대학.?학과별\s*합격\s*예측|합격\s*안정성|상세|보기|조회|검색|리포트|대학\s*정보|전형\s*정보|학과\s*정보|합격\s*예측|모의\s*지원|수시\s*저장소|정시\s*저장소|추천\s*대학|성적\s*분석|성적\s*산출|입시\s*전략|입시\s*지식|경쟁률|모집\s*요강|다음|더보기|결과|탭)/i;
               var selector='a,button,[role=button],[role=tab],[onclick],[data-href],[data-url],[data-link],[data-path]';

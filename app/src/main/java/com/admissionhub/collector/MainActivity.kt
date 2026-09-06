@@ -233,6 +233,7 @@ class MainActivity : Activity() {
     private var jinhakReportBridgeArmed = 0
     private var jinhakReportBridgeApplied = 0
     private var jinhakReportBridgeConfirmed = 0
+    private var jinhakInheritedReportLaneActions = 0
     private var jinhakMissionAnchorActionsAttempted = 0
     private val jinhakAnchorRejectReasons = linkedMapOf<String, Int>()
     private val jinhakSlowLaneFailureReasons = linkedMapOf<String, Int>()
@@ -432,8 +433,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.9.23"
-        private const val BUILD_CODE = 109230
+        private const val VERSION = "0.9.24"
+        private const val BUILD_CODE = 109240
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -3573,6 +3574,7 @@ class MainActivity : Activity() {
         jinhakReportBridgeArmed = 0
         jinhakReportBridgeApplied = 0
         jinhakReportBridgeConfirmed = 0
+        jinhakInheritedReportLaneActions = 0
         jinhakMissionAnchorActionsAttempted = 0
         jinhakAnchorRejectReasons.clear()
         jinhakSlowLaneFailureReasons.clear()
@@ -5933,7 +5935,11 @@ class MainActivity : Activity() {
 
         val candidate = selection.candidate ?: return false
         val ledgerTargetIdForAction = ledgerTarget?.targetId
-        val missionBudgetedAction = ledgerTargetIdForAction != null || candidate.applicationContext?.identityKey != null
+        val inheritedReportLaneAction = jinhakMissionContext?.identityKey != null &&
+            candidate.kind == "report-lane-navigation" &&
+            selection.requestedLane != "reference" &&
+            JinhakReportContextBridge.isReportAction(candidate.label, candidate.kind)
+        val missionBudgetedAction = ledgerTargetIdForAction != null || candidate.applicationContext?.identityKey != null || inheritedReportLaneAction
         if (missionBudgetedAction) {
             if (jinhakMissionActionsExecuted >= MAX_JINHAK_MISSION_ACTIONS) {
                 jinhakMissionTargetLedger.failAllPending("mission-action-limit")
@@ -5946,6 +5952,14 @@ class MainActivity : Activity() {
             }
         } else if (jinhakGenericActionsExecuted >= MAX_JINHAK_GENERIC_ACTIONS) {
             return false
+        }
+        if (inheritedReportLaneAction) {
+            jinhakInheritedReportLaneActions += 1
+            recordRuntimeEvent("jinhak-inherited-report-lane-action", JSONObject()
+                .put("applicationIdentityHash", jinhakMissionContext?.identityKey?.take(24) ?: "")
+                .put("requestedLane", selection.requestedLane)
+                .put("label", candidate.label.take(80))
+                .put("safePath", runtimeSafePath(route)))
         }
         jinhakActiveMissionTargetId = ledgerTargetIdForAction
         if (ledgerTargetIdForAction != null) jinhakMissionTargetLedger.markAttempted(ledgerTargetIdForAction)
@@ -6735,6 +6749,7 @@ class MainActivity : Activity() {
                         .put("reportBridgeArmed", jinhakReportBridgeArmed)
                         .put("reportBridgeApplied", jinhakReportBridgeApplied)
                         .put("reportBridgeConfirmed", jinhakReportBridgeConfirmed)
+                        .put("inheritedReportLaneActions", jinhakInheritedReportLaneActions)
                         .put("consentGatesEncountered", jinhakConsentGatesEncountered)
                         .put("consentGatesResolved", jinhakConsentGatesResolved)
                         .put("unboundSavedApplicationObservations", jinhakUnboundSavedApplicationObservations)

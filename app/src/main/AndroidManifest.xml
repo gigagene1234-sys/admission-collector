@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.23 Mission Closure Auth Fence"
+        android:label="Admission Collector v0.9.24 Report Lane Mission Bridge"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
