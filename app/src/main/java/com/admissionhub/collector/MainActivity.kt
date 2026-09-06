@@ -254,6 +254,13 @@ class MainActivity : Activity() {
     private var jinhakCloudRecordCheckpointsQueued = 0
     private var jinhakCloudRecordCheckpointsSucceeded = 0
     private var jinhakCloudRecordCheckpointsFailed = 0
+    private var processRuntimeId = ""
+    private var processJournalPreviousUncleanTermination = false
+    private var processResumeGatePending = false
+    private var processResumeGateRuns = 0
+    private var processHeartbeatGeneration = 0
+    private var processHeartbeatAtMs = 0L
+    private var processLastLifecycle = "created"
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
     private var jinhakRecoveredStalls = 0
@@ -407,8 +414,10 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.20"
-        private const val BUILD_CODE = 109200
+        private const val PROCESS_HEARTBEAT_MS = 15_000L
+        private const val PROCESS_JOURNAL_SCHEMA = 1
+        private const val VERSION = "0.9.21"
+        private const val BUILD_CODE = 109210
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -436,6 +445,7 @@ class MainActivity : Activity() {
             }
         })
         configureWebView()
+        initializeProcessResumeJournal()
         restoreJinhakAuthProofCheckpoint("activity-create")
         val resumed = resumeInterruptedUnifiedSessionIfNeeded()
         if (!resumed) {
@@ -456,6 +466,7 @@ class MainActivity : Activity() {
         super.onTrimMemory(level)
         if (level >= TRIM_MEMORY_RUNNING_LOW) {
             recordRuntimeEvent("memory-trim", JSONObject().put("level", level))
+            persistProcessResumeJournal("memory-trim-$level", synchronous = true)
             if (provider == ProviderId.JINHAK) {
                 if (::slowLanePool.isInitialized) slowLanePool.setMaxActiveWorkers(1)
                 // SQLite is authoritative. Do not retain large autonomous-crawl copies in RAM.
@@ -1260,6 +1271,134 @@ class MainActivity : Activity() {
         return fresh
     }
 
+    private fun initializeProcessResumeJournal() {
+        val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
+        val previousActive = prefs.getBoolean("processJournalActive", false)
+        val previousClean = prefs.getBoolean("processJournalClean", true)
+        val previousVersion = prefs.getString("processJournalVersion", "").orEmpty()
+        val previousRuntimeId = prefs.getString("processRuntimeId", "").orEmpty().take(80)
+        val previousHeartbeat = prefs.getLong("processHeartbeatAtMs", 0L)
+        val previousLifecycle = prefs.getString("processLastLifecycle", "unknown").orEmpty().take(80)
+        val previousSafePath = prefs.getString("processLastSafePath", "").orEmpty().take(300)
+        val previousProvider = prefs.getString("processLastProvider", "").orEmpty().take(30)
+        val previousPhase = prefs.getString("processLastPhase", "").orEmpty().take(80)
+        val previousTarget = prefs.getString("processLastMissionTarget", "").orEmpty().take(96)
+        val previousAgentBusy = prefs.getBoolean("processAgentActionInFlight", false)
+        val previousSnapshotBusy = prefs.getBoolean("processBatchCollecting", false)
+        val previousLastEvent = prefs.getString("lastRuntimeEventType", "").orEmpty().take(80)
+        val now = System.currentTimeMillis()
+
+        processJournalPreviousUncleanTermination = previousActive && !previousClean && previousVersion == VERSION
+        processResumeGatePending = processJournalPreviousUncleanTermination
+        if (processJournalPreviousUncleanTermination) {
+            recordRuntimeEvent(
+                "unclean-process-termination-detected",
+                JSONObject()
+                    .put("previousRuntimeId", previousRuntimeId.ifBlank { JSONObject.NULL })
+                    .put("previousHeartbeatAgeMs", if (previousHeartbeat > 0L) (now - previousHeartbeat).coerceAtLeast(0L) else JSONObject.NULL)
+                    .put("previousLifecycle", previousLifecycle)
+                    .put("previousSafePath", previousSafePath)
+                    .put("previousProvider", previousProvider)
+                    .put("previousPhase", previousPhase)
+                    .put("previousMissionTarget", previousTarget.ifBlank { JSONObject.NULL })
+                    .put("previousAgentActionInFlight", previousAgentBusy)
+                    .put("previousBatchCollecting", previousSnapshotBusy)
+                    .put("previousLastRuntimeEventType", previousLastEvent.ifBlank { JSONObject.NULL })
+                    .put("credentialsPersisted", false)
+                    .put("sessionSecretsPersisted", false),
+                synchronous = true
+            )
+        }
+
+        processRuntimeId = java.util.UUID.randomUUID().toString()
+        processHeartbeatAtMs = now
+        processLastLifecycle = "activity-create"
+        prefs.edit()
+            .putInt("processJournalSchema", PROCESS_JOURNAL_SCHEMA)
+            .putString("processJournalVersion", VERSION)
+            .putString("processRuntimeId", processRuntimeId)
+            .putBoolean("processJournalActive", false)
+            .putBoolean("processJournalClean", true)
+            .putLong("processHeartbeatAtMs", now)
+            .putString("processLastLifecycle", processLastLifecycle)
+            .putBoolean("processCredentialStored", false)
+            .putBoolean("processSessionSecretStored", false)
+            .commit()
+    }
+
+    private fun activateProcessResumeJournal(trigger: String) {
+        processResumeGatePending = processResumeGatePending && unifiedPhase == "jinhak"
+        getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
+            .putBoolean("processJournalActive", true)
+            .putBoolean("processJournalClean", false)
+            .putString("processJournalVersion", VERSION)
+            .putString("processRuntimeId", processRuntimeId)
+            .putString("processJournalActivation", trigger.take(80))
+            .commit()
+        persistProcessResumeJournal("active:$trigger", synchronous = true)
+        armProcessResumeHeartbeat()
+    }
+
+    private fun markProcessResumeJournalClean(reason: String) {
+        processHeartbeatGeneration += 1
+        processLastLifecycle = "clean:$reason"
+        getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
+            .putBoolean("processJournalActive", false)
+            .putBoolean("processJournalClean", true)
+            .putString("processLastLifecycle", processLastLifecycle.take(120))
+            .putLong("processHeartbeatAtMs", System.currentTimeMillis())
+            .putString("processCleanReason", reason.take(120))
+            .commit()
+        processResumeGatePending = false
+    }
+
+    private fun armProcessResumeHeartbeat() {
+        val generation = ++processHeartbeatGeneration
+        handler.postDelayed(object : Runnable {
+            override fun run() {
+                if (generation != processHeartbeatGeneration) return
+                val active = unifiedRunning || batchRunning || startupLoginPreflightActive || jinhakTransitionAuthGateActive
+                if (!active) return
+                persistProcessResumeJournal("heartbeat", synchronous = false)
+                handler.postDelayed(this, PROCESS_HEARTBEAT_MS)
+            }
+        }, PROCESS_HEARTBEAT_MS)
+    }
+
+    private fun persistProcessResumeJournal(lifecycle: String, synchronous: Boolean = false) {
+        val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
+        if (!prefs.getBoolean("processJournalActive", false)) return
+        val now = System.currentTimeMillis()
+        processHeartbeatAtMs = now
+        processLastLifecycle = lifecycle.take(120)
+        val currentUrl = if (::webView.isInitialized) runCatching { webView.url.orEmpty() }.getOrDefault("") else ""
+        val safePath = runtimeSafePath(currentUrl).take(300)
+        val targetId = jinhakActiveMissionTargetId.orEmpty().take(96)
+        val summary = jinhakMissionTargetLedger.summary()
+        val editor = prefs.edit()
+            .putInt("processJournalSchema", PROCESS_JOURNAL_SCHEMA)
+            .putString("processJournalVersion", VERSION)
+            .putString("processRuntimeId", processRuntimeId)
+            .putBoolean("processJournalActive", true)
+            .putBoolean("processJournalClean", false)
+            .putLong("processHeartbeatAtMs", now)
+            .putString("processLastLifecycle", processLastLifecycle)
+            .putString("processLastSafePath", safePath)
+            .putString("processLastProvider", provider.wireName.take(30))
+            .putString("processLastPhase", unifiedPhase.take(80))
+            .putString("processLastMissionTarget", targetId)
+            .putBoolean("processAgentActionInFlight", jinhakAgentActionInFlight)
+            .putBoolean("processBatchCollecting", batchCollecting)
+            .putInt("processMissionTargets", summary.optInt("targets", 0))
+            .putInt("processMissionPending", summary.optInt("pending", 0))
+            .putInt("processMissionConfirmed", summary.optJSONObject("states")?.optInt("confirmed", 0) ?: 0)
+            .putInt("processRendererCrashCount", runtimeRendererCrashCount)
+            .putInt("processRendererCircuitBreaks", runtimeRendererCircuitBreaks)
+            .putBoolean("processCredentialStored", false)
+            .putBoolean("processSessionSecretStored", false)
+        if (synchronous) editor.commit() else editor.apply()
+    }
+
     private fun persistRuntimeCheckpoint(forceResume: Boolean = unifiedRunning) {
         runCatching {
             getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
@@ -1396,6 +1535,7 @@ class MainActivity : Activity() {
             arr.put(event)
             while (arr.length() > 40) arr.remove(0)
             val editor = prefs.edit().putString("events", arr.toString())
+                .putString("lastRuntimeEventType", type.take(80))
                 .putBoolean("hasPendingEvents", true)
             if (synchronous) editor.commit() else editor.apply()
         }
@@ -1417,6 +1557,7 @@ class MainActivity : Activity() {
                         .put("frames", frames),
                     synchronous = true
                 )
+                persistProcessResumeJournal("uncaught-exception", synchronous = true)
                 persistRuntimeCheckpoint(forceResume = unifiedRunning)
             }
             previous?.uncaughtException(thread, throwable)
@@ -1481,6 +1622,23 @@ class MainActivity : Activity() {
         jinhakConsecutiveStalls = 0
         batchRunning = false
         batchCollecting = false
+        if (processResumeGatePending && unifiedPhase == "jinhak") {
+            processResumeGateRuns += 1
+            jinhakAuthVerifiedForBatch = false
+            jinhakCoreBootstrapState = "process-resume-auth-gate"
+            jinhakTransitionAuthGateActive = false
+            currentBatchTarget = null
+            runtimeLastSafePath = ""
+            recordRuntimeEvent(
+                "process-resume-gate-armed",
+                JSONObject()
+                    .put("preservedMissionLedger", true)
+                    .put("deepRouteDiscarded", true)
+                    .put("authRevalidationRequired", true),
+                synchronous = true
+            )
+        }
+        activateProcessResumeJournal("resume-unified")
 
         return if (unifiedPhase == "adiga") {
             provider = ProviderId.ADIGA
@@ -2453,6 +2611,7 @@ class MainActivity : Activity() {
         unifiedSessionId = sessionId
         unifiedRunning = true
         unifiedPhase = "adiga"
+        activateProcessResumeJournal("start-unified")
         unifiedPendingAdigaStart = true
         unifiedPendingJinhakStart = false
         unifiedJinhakAutoCapture = false
@@ -2919,6 +3078,7 @@ class MainActivity : Activity() {
             unifiedPendingJinhakStart = false
             unifiedAutoCaptureScheduled = false
             unifiedPhase = "completed"
+            markProcessResumeJournalClean("unified-finish:${reason.take(80)}")
             startupLoginPreflightVerified = false
             startupLoginPreflightActive = false
             startupLoginStage = "idle"
@@ -6243,6 +6403,17 @@ class MainActivity : Activity() {
                         .put("missionCells", jinhakMissionCells.diagnostics(System.currentTimeMillis()))
                         .put("legacyAgentActionInFlight", jinhakAgentActionInFlight)
                         .put("legacyBatchCollecting", batchCollecting)
+                        .put("processJournalActive", getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getBoolean("processJournalActive", false))
+                        .put("processJournalClean", getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getBoolean("processJournalClean", true))
+                        .put("processRuntimeId", processRuntimeId.take(80))
+                        .put("previousUncleanTerminationDetected", processJournalPreviousUncleanTermination)
+                        .put("processResumeGateRuns", processResumeGateRuns)
+                        .put("processResumeGatePending", processResumeGatePending)
+                        .put("processHeartbeatAgeMs", if (processHeartbeatAtMs > 0L) (System.currentTimeMillis() - processHeartbeatAtMs).coerceAtLeast(0L) else JSONObject.NULL)
+                        .put("processLastLifecycle", processLastLifecycle.take(120))
+                        .put("lastRuntimeEventType", getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getString("lastRuntimeEventType", "").orEmpty().take(80))
+                        .put("processCredentialStored", false)
+                        .put("processSessionSecretStored", false)
                         .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
                         .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
                         .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
@@ -6894,6 +7065,7 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        persistProcessResumeJournal("onPause", synchronous = true)
         handler.removeCallbacks(sessionKeepAlive)
         if (unifiedRunning || batchRunning || startupLoginPreflightActive || jinhakTransitionAuthGateActive) {
             handler.postDelayed(sessionKeepAlive, 5_000L)
@@ -6903,6 +7075,7 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        persistProcessResumeJournal("onStop", synchronous = true)
         CookieManager.getInstance().flush()
         super.onStop()
     }
@@ -6913,6 +7086,11 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        if (isFinishing && !unifiedRunning && !batchRunning) {
+            markProcessResumeJournalClean("activity-finished-idle")
+        } else {
+            persistProcessResumeJournal("onDestroy-active-or-system", synchronous = true)
+        }
         if (::slowLanePool.isInitialized) slowLanePool.destroy()
         handler.removeCallbacksAndMessages(null)
         CookieManager.getInstance().flush()
