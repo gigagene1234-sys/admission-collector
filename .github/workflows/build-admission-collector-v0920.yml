@@ -27,6 +27,25 @@ jobs:
       - name: Apply v0.9.20 crash-safe checkpoint patch
         run: python3 .github/scripts/patch_v0920.py
 
+      - name: Disambiguate renderer cooldown callback label
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt')
+          s=p.read_text()
+          old='''                        handler.postDelayed({
+                            if (runtimeRendererCircuitGeneration != circuitGeneration ||
+                                !unifiedRunning || provider != ProviderId.JINHAK) return@postDelayed'''
+          new='''                        handler.postDelayed(resumeRendererCircuit@{
+                            if (runtimeRendererCircuitGeneration != circuitGeneration ||
+                                !unifiedRunning || provider != ProviderId.JINHAK) return@resumeRendererCircuit'''
+          if s.count(old) != 1:
+              raise SystemExit(f'renderer label anchor count={s.count(old)}')
+          p.write_text(s.replace(old,new,1))
+          PY
+
       - name: Verify bounded change surface
         shell: bash
         run: |
@@ -77,6 +96,7 @@ jobs:
             'renderer-cooldown':'JINHAK_RENDERER_CIRCUIT_COOLDOWN_MS = 30_000L' in m,
             'renderer-bounded':'MAX_JINHAK_RENDERER_CIRCUIT_BREAKS_PER_SESSION = 2' in m,
             'renderer-events':'jinhak-renderer-circuit-paused' in m and 'jinhak-renderer-circuit-resume' in m,
+            'renderer-label':'resumeRendererCircuit@{' in m and 'return@resumeRendererCircuit' in m,
             'mission-cell-preserved':'jinhakMissionCells.onRendererGone' in m and 'missionCells' in m,
             'auth-proof-preserved':'persistJinhakAuthProofCheckpoint' in m and 'restoreJinhakAuthProofCheckpoint' in m,
             'target-redirect-preserved':'quarantineJinhakTargetSpecificAuthRedirect' in m,
@@ -87,7 +107,7 @@ jobs:
             'susi-core-preserved':'isDefaultSusiCoreTraversalUrl' in m,
             'snapshot-privacy':'safeCloneText' in s and 'input,textarea,select,option,form' in s,
             'checkpoint-privacy':'browserSessionMaterialAccepted", false' in c and 'credentialExported", false' in c and 'sessionSecretExported", false' in c,
-            'diagnostic-file-parse':'out/status.json' in rd and 'json.load(f)' in rd and 'python3 - "$status"' not in rd,
+            'diagnostic-file-parse-staged':'out/status.json' in rd and 'json.load(f)' in rd and 'python3 - "$status"' not in rd,
           }
           failed=[k for k,v in req.items() if not v]
           if failed: raise SystemExit('Missing invariant(s): '+', '.join(failed))
@@ -151,12 +171,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The patch script also stages a diagnostic-workflow fix for verification, but the
+          # GitHub Actions app token is not permitted to push workflow-file changes. Restore
+          # that one file here; v0.9.20 app/source changes remain unchanged and verified.
+          git restore .github/workflows/read-jinhak-diagnostic.yml
+          if git diff --name-only | grep -q '^\.github/workflows/'; then
+            echo 'Unexpected workflow file remains modified' >&2
+            git diff --name-only
+            exit 1
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app/src/main/java/com/admissionhub/collector/MainActivity.kt \
                   app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt \
-                  app/build.gradle.kts app/src/main/AndroidManifest.xml \
-                  .github/workflows/read-jinhak-diagnostic.yml
+                  app/build.gradle.kts app/src/main/AndroidManifest.xml
           git commit -m "Implement v0.9.20 Crash-Safe Checkpoint"
           git push origin HEAD:main
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -193,6 +221,7 @@ jobs:
           assert m.count('checkpointJinhakCaptureToCloud("') == 3
           assert 'jinhak-renderer-circuit-paused' in m
           assert 'MAX_JINHAK_RENDERER_CIRCUIT_BREAKS_PER_SESSION = 2' in m
+          assert 'resumeRendererCircuit@{' in m and 'return@resumeRendererCircuit' in m
           assert 'fun sendRecordCheckpoint(' in c
           assert 'supportsBatchCrawl = false' in a
           assert 'supportsUserSessionMissionTraversal = true' in a
@@ -257,5 +286,5 @@ jobs:
         run: |
           set -euo pipefail
           SHA=$(git rev-parse HEAD)
-          NOTES="v0.9.20 is a crash-safety release based on the observed v0.9.19 Jinhak run where the main WebView renderer crashed twice while the SQLite mission ledger and auth proof survived. It adds incremental provider-isolated Jinhak record checkpoints to Cloudflare after each locally persisted Jinhak capture. The cloud payload is the existing bounded privacy-sanitized Jinhak digest; no DOM/HTML/query/cookie/token/localStorage/sessionStorage/form values/credentials are added. The checkpoint path does not mutate the coordinator active run, preventing cross-provider contamination. Foreground renderer recovery is now bounded: a second Jinhak renderer death inside a 90-second window opens a circuit, synchronously preserves mission/runtime diagnostics, replaces the dead browser surface without immediately reloading the failing route, waits 30 seconds, then resumes from the mission origin/core path. Repeated circuit breaks are bounded and end in a resumable safe stop instead of renderer thrashing. Existing v0.9.19 Mission Cell ownership, v0.9.18 Auth Proof Resume Gate, v0.9.16 target auth redirect quarantine, v0.9.15 stall fence, v0.9.14 slow-lane renderer circuit, v0.9.13 same-card replay, v0.9.11 monotonic SQLite mission persistence, Susi-only traversal and strict same-card binding are preserved. The Jinhak cloud diagnostic workflow also now parses large status payloads from files instead of command-line argv. Commit: $SHA"
+          NOTES="v0.9.20 is a crash-safety release based on the observed v0.9.19 Jinhak run where the main WebView renderer crashed twice while the SQLite mission ledger and auth proof survived. It adds incremental provider-isolated Jinhak record checkpoints to Cloudflare after each locally persisted Jinhak capture. The cloud payload is the existing bounded privacy-sanitized Jinhak digest; no DOM/HTML/query/cookie/token/localStorage/sessionStorage/form values/credentials are added. The checkpoint path does not mutate the coordinator active run, preventing cross-provider contamination. Foreground renderer recovery is now bounded: a second Jinhak renderer death inside a 90-second window opens a circuit, synchronously preserves mission/runtime diagnostics, replaces the dead browser surface without immediately reloading the failing route, waits 30 seconds, then resumes from the mission origin/core path. Repeated circuit breaks are bounded and end in a resumable safe stop instead of renderer thrashing. Existing v0.9.19 Mission Cell ownership, v0.9.18 Auth Proof Resume Gate, v0.9.16 target auth redirect quarantine, v0.9.15 stall fence, v0.9.14 slow-lane renderer circuit, v0.9.13 same-card replay, v0.9.11 monotonic SQLite mission persistence, Susi-only traversal and strict same-card binding are preserved. Commit: $SHA"
           gh release create v0.9.20 Admission-Collector-v0.9.20-Crash-Safe-Checkpoint.apk Admission-Collector-v0.9.20-Crash-Safe-Checkpoint.sha256 --target "$SHA" --title "Admission Collector v0.9.20 — Crash-Safe Checkpoint" --notes "$NOTES"
