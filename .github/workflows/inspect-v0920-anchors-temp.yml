@@ -1,0 +1,27 @@
+name: Inspect v0.9.20 Patch Anchors Temp
+on:
+  push:
+    branches: [ main ]
+    paths: [".github/workflows/inspect-v0920-anchors-temp.yml"]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Print anchors
+        shell: bash
+        run: |
+          set -euo pipefail
+          M=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          echo '=== FIELD/CONSTANT AREA ==='
+          sed -n '220,430p' "$M"
+          echo '=== BUILD DIGEST ==='
+          n=$(grep -n 'private fun buildJinhakDigest' "$M" | head -1 | cut -d: -f1); s=$((n-5)); e=$((n+180)); sed -n "${s},${e}p" "$M"
+          echo '=== LIVE DIAGNOSTIC END ==='
+          sed -n '3280,3385p' "$M"
+          echo '=== JINHAK MAIN CAPTURE FULL ==='
+          sed -n '5020,5140p' "$M"
+          echo '=== READ JINHAK WORKFLOW ==='
+          cat .github/workflows/read-jinhak-diagnostic.yml
