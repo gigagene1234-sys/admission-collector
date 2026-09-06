@@ -261,6 +261,12 @@ class MainActivity : Activity() {
     private var processHeartbeatGeneration = 0
     private var processHeartbeatAtMs = 0L
     private var processLastLifecycle = "created"
+    private var jinhakSingleWebViewSlowLaneBypasses = 0
+    private var jinhakSnapshotOverlapDeferrals = 0
+    private var jinhakSnapshotOverlapDeferralScheduled = false
+    private var jinhakPopupWebViewsCreated = 0
+    private var jinhakPopupWebViewsDestroyed = 0
+    private var jinhakRendererFirstCrashCooldowns = 0
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
     private var jinhakRecoveredStalls = 0
@@ -386,6 +392,10 @@ class MainActivity : Activity() {
         private const val JINHAK_SOFT_STALL_MS = 12_000L
         private const val JINHAK_HARD_STALL_MS = 24_000L
         private const val JINHAK_SLOW_ESCALATION_MS = 35_000L
+        private const val JINHAK_SINGLE_WEBVIEW_STABILITY_MODE = true
+        private const val JINHAK_SNAPSHOT_OVERLAP_RETRY_MS = 400L
+        private const val JINHAK_TRANSIENT_POPUP_TIMEOUT_MS = 5_000L
+        private const val JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS = 2_000L
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val MAX_JINHAK_GENERIC_ACTIONS = 180
         private const val MAX_JINHAK_MISSION_ACTIONS = 220
@@ -416,8 +426,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.9.21"
-        private const val BUILD_CODE = 109210
+        private const val VERSION = "0.9.22"
+        private const val BUILD_CODE = 109220
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -804,6 +814,7 @@ class MainActivity : Activity() {
                 )
                 if (cellInvalidation.actionInvalidated) jinhakAgentActionInFlight = false
                 if (cellInvalidation.snapshotInvalidated) batchCollecting = false
+                jinhakSnapshotOverlapDeferralScheduled = false
 
                 val deadView = view ?: webView
                 val parent = deadView.parent as? ViewGroup
@@ -885,20 +896,50 @@ class MainActivity : Activity() {
                         runtimeRendererRecovering = false
 
                         if (!repeatedJinhakCrash) {
-                            batchRunning = wasBatchRunning
                             batchPausedForLogin = wasBatchPausedForLogin
-                            recordRuntimeEvent(
-                                "webview-renderer-recovered-in-place",
-                                JSONObject()
-                                    .put("didCrash", didCrash)
-                                    .put("batchRunning", batchRunning)
-                                    .put("unifiedRunning", unifiedRunning)
-                                    .put("resumeSafePath", runtimeSafePath(resumeUrl))
-                                    .put("rendererCrashCountInWindow", runtimeRendererCrashCount)
-                                    .put("activityRecreated", false)
-                            )
-                            status.text = "WebView renderer 복구 완료 · 현재 수집 지점에서 재개합니다."
-                            replacement.loadUrl(resumeUrl)
+                            if (provider == ProviderId.JINHAK && wasUnifiedRunning) {
+                                batchRunning = false
+                                jinhakRendererFirstCrashCooldowns += 1
+                                val missionOrigin = jinhakMissionOriginRoute.takeIf { it.isNotBlank() }
+                                val safeResume = missionOrigin
+                                    ?: JinhakSiteTopology.missionSeeds().firstOrNull()?.takeIf { it.isNotBlank() }
+                                    ?: resumeUrl
+                                currentBatchTarget = safeResume
+                                replacement.loadUrl("about:blank")
+                                recordRuntimeEvent(
+                                    "webview-renderer-recovered-cooldown",
+                                    JSONObject()
+                                        .put("didCrash", didCrash)
+                                        .put("cooldownMs", JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS)
+                                        .put("resumeSafePath", runtimeSafePath(safeResume))
+                                        .put("resumeFromMissionOrigin", missionOrigin != null)
+                                        .put("rendererCrashCountInWindow", runtimeRendererCrashCount)
+                                        .put("activityRecreated", false),
+                                    synchronous = true
+                                )
+                                status.text = "WebView renderer 교체 완료 · 2초 안정화 후 보존된 mission 지점에서 재개합니다."
+                                handler.postDelayed({
+                                    if (!unifiedRunning || provider != ProviderId.JINHAK || runtimeRendererRecovering) return@postDelayed
+                                    batchRunning = wasBatchRunning
+                                    batchPausedForLogin = wasBatchPausedForLogin
+                                    batchCollecting = false
+                                    replacement.loadUrl(safeResume)
+                                }, JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS)
+                            } else {
+                                batchRunning = wasBatchRunning
+                                recordRuntimeEvent(
+                                    "webview-renderer-recovered-in-place",
+                                    JSONObject()
+                                        .put("didCrash", didCrash)
+                                        .put("batchRunning", batchRunning)
+                                        .put("unifiedRunning", unifiedRunning)
+                                        .put("resumeSafePath", runtimeSafePath(resumeUrl))
+                                        .put("rendererCrashCountInWindow", runtimeRendererCrashCount)
+                                        .put("activityRecreated", false)
+                                )
+                                status.text = "WebView renderer 복구 완료 · 현재 수집 지점에서 재개합니다."
+                                replacement.loadUrl(resumeUrl)
+                            }
                             return@runCatching
                         }
 
@@ -1004,22 +1045,59 @@ class MainActivity : Activity() {
             ): Boolean {
                 val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
                 val child = WebView(this@MainActivity)
-                child.settings.javaScriptEnabled = true
-                child.settings.domStorageEnabled = true
-                child.settings.javaScriptCanOpenWindowsAutomatically = true
-                child.settings.setSupportMultipleWindows(true)
+                if (provider == ProviderId.JINHAK) jinhakPopupWebViewsCreated += 1
+                var childDestroyed = false
+
+                fun destroyTransientPopup(reason: String) {
+                    if (childDestroyed) return
+                    childDestroyed = true
+                    runCatching { child.stopLoading() }
+                    runCatching { child.removeAllViews() }
+                    runCatching { child.destroy() }
+                    if (provider == ProviderId.JINHAK) {
+                        jinhakPopupWebViewsDestroyed += 1
+                        recordRuntimeEvent("jinhak-transient-popup-destroyed", JSONObject()
+                            .put("reason", reason.take(80))
+                            .put("created", jinhakPopupWebViewsCreated)
+                            .put("destroyed", jinhakPopupWebViewsDestroyed))
+                    }
+                }
+
+                child.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = false
+                    javaScriptCanOpenWindowsAutomatically = false
+                    setSupportMultipleWindows(false)
+                    cacheMode = WebSettings.LOAD_NO_CACHE
+                    mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                }
                 child.webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
-                        webView.loadUrl(request.url.toString())
+                    private fun handoff(target: String): Boolean {
+                        if (target.isBlank() || target == "about:blank") return false
+                        if (batchRunning && provider == ProviderId.JINHAK &&
+                            !ProviderRegistry.adapter(ProviderId.JINHAK).accepts(target)) {
+                            jinhakExternalNavigationsBlocked += 1
+                            recordRuntimeEvent("jinhak-popup-external-navigation-blocked", JSONObject()
+                                .put("targetSafePath", runtimeSafePath(target)))
+                            handler.post { destroyTransientPopup("external-blocked") }
+                            return true
+                        }
+                        webView.loadUrl(target)
+                        handler.post { destroyTransientPopup("main-handoff") }
                         return true
                     }
 
+                    override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean =
+                        handoff(request.url?.toString().orEmpty())
+
                     override fun onPageFinished(v: WebView, url: String) {
-                        if (url.isNotBlank() && url != "about:blank") webView.loadUrl(url)
+                        handoff(url)
                     }
                 }
                 transport.webView = child
                 resultMsg.sendToTarget()
+                handler.postDelayed({ destroyTransientPopup("timeout") }, JINHAK_TRANSIENT_POPUP_TIMEOUT_MS)
                 return true
             }
         }
@@ -3368,6 +3446,12 @@ class MainActivity : Activity() {
         jinhakSlowLaneUserActionRequired = 0
         jinhakSlowLaneCompletedDurationMs = 0L
         jinhakSlowLaneMaxDurationMs = 0L
+        jinhakSingleWebViewSlowLaneBypasses = 0
+        jinhakSnapshotOverlapDeferrals = 0
+        jinhakSnapshotOverlapDeferralScheduled = false
+        jinhakPopupWebViewsCreated = 0
+        jinhakPopupWebViewsDestroyed = 0
+        jinhakRendererFirstCrashCooldowns = 0
         jinhakReportBridgeContext = null
         jinhakReportBridgeArmed = 0
         jinhakReportBridgeApplied = 0
@@ -3665,6 +3749,20 @@ class MainActivity : Activity() {
                 .put("missionCells", jinhakMissionCells.diagnostics(now))
                 .put("legacyAgentActionInFlight", jinhakAgentActionInFlight)
                 .put("legacyBatchCollecting", batchCollecting)
+                .put("processJournalActive", getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getBoolean("processJournalActive", false))
+                .put("processJournalClean", getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getBoolean("processJournalClean", true))
+                .put("previousUncleanTerminationDetected", processJournalPreviousUncleanTermination)
+                .put("processResumeGateRuns", processResumeGateRuns)
+                .put("processResumeGatePending", processResumeGatePending)
+                .put("processHeartbeatAgeMs", if (processHeartbeatAtMs > 0L) (now - processHeartbeatAtMs).coerceAtLeast(0L) else JSONObject.NULL)
+                .put("processLastLifecycle", processLastLifecycle.take(120))
+                .put("lastRuntimeEventType", getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getString("lastRuntimeEventType", "").orEmpty().take(80))
+                .put("singleWebViewStabilityMode", JINHAK_SINGLE_WEBVIEW_STABILITY_MODE)
+                .put("singleWebViewSlowLaneBypasses", jinhakSingleWebViewSlowLaneBypasses)
+                .put("snapshotOverlapDeferrals", jinhakSnapshotOverlapDeferrals)
+                .put("popupWebViewsCreated", jinhakPopupWebViewsCreated)
+                .put("popupWebViewsDestroyed", jinhakPopupWebViewsDestroyed)
+                .put("rendererFirstCrashCooldowns", jinhakRendererFirstCrashCooldowns)
                 .put("cloudRecordCheckpointsQueued", jinhakCloudRecordCheckpointsQueued)
                 .put("cloudRecordCheckpointsSucceeded", jinhakCloudRecordCheckpointsSucceeded)
                 .put("cloudRecordCheckpointsFailed", jinhakCloudRecordCheckpointsFailed)
@@ -3997,6 +4095,18 @@ class MainActivity : Activity() {
                 priority = priority,
                 reason = "foreground-35s-slow-escalation"
             )
+            if (JINHAK_SINGLE_WEBVIEW_STABILITY_MODE) {
+                jinhakSingleWebViewSlowLaneBypasses += 1
+                recordRuntimeEvent("jinhak-single-webview-slow-lane-bypass", JSONObject()
+                    .put("targetSafePath", runtimeSafePath(target))
+                    .put("currentSafePath", runtimeSafePath(current))
+                    .put("elapsedMs", System.currentTimeMillis() - startedAt)
+                    .put("missionBound", mission?.identityKey != null)
+                    .put("hiddenWebViewCreated", false))
+                persistLiveJinhakDiagnostics("single-webview-slow-lane-bypass", force = true)
+                status.text = "안정성 모드: 숨김 WebView를 만들지 않고 메인 WebView + mission fence로 계속합니다."
+                return@postDelayed
+            }
             val slowLaneCircuitOpen = ::slowLanePool.isInitialized && slowLanePool.stats().rendererCircuitOpen
             val accepted = !slowLaneCircuitOpen && ::slowLanePool.isInitialized && slowLanePool.enqueue(task)
             val ledgerTargetForSlowLane = jinhakActiveMissionTargetId
@@ -5021,6 +5131,19 @@ class MainActivity : Activity() {
 
     private fun collectSnapshotForBatch() {
         if (!batchRunning || batchPausedForLogin || batchCollecting) return
+        if (provider == ProviderId.JINHAK && jinhakMissionCells.isSnapshotActive()) {
+            jinhakSnapshotOverlapDeferrals += 1
+            if (!jinhakSnapshotOverlapDeferralScheduled) {
+                jinhakSnapshotOverlapDeferralScheduled = true
+                handler.postDelayed({
+                    jinhakSnapshotOverlapDeferralScheduled = false
+                    if (batchRunning && !batchPausedForLogin && provider == ProviderId.JINHAK) {
+                        collectSnapshotForBatch()
+                    }
+                }, JINHAK_SNAPSHOT_OVERLAP_RETRY_MS)
+            }
+            return
+        }
         val snapshotCellToken = if (provider == ProviderId.JINHAK) {
             jinhakMissionCells.beginSnapshot(
                 targetId = jinhakActiveMissionTargetId ?: jinhakMissionContext?.identityKey,
@@ -6414,6 +6537,12 @@ class MainActivity : Activity() {
                         .put("lastRuntimeEventType", getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).getString("lastRuntimeEventType", "").orEmpty().take(80))
                         .put("processCredentialStored", false)
                         .put("processSessionSecretStored", false)
+                        .put("singleWebViewStabilityMode", JINHAK_SINGLE_WEBVIEW_STABILITY_MODE)
+                        .put("singleWebViewSlowLaneBypasses", jinhakSingleWebViewSlowLaneBypasses)
+                        .put("snapshotOverlapDeferrals", jinhakSnapshotOverlapDeferrals)
+                        .put("popupWebViewsCreated", jinhakPopupWebViewsCreated)
+                        .put("popupWebViewsDestroyed", jinhakPopupWebViewsDestroyed)
+                        .put("rendererFirstCrashCooldowns", jinhakRendererFirstCrashCooldowns)
                         .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
                         .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
                         .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
