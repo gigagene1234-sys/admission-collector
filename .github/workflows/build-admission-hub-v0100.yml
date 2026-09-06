@@ -45,7 +45,7 @@ jobs:
             'graph-builder': 'object CanonicalSixApplicationGraph' in canon and 'missionApplications' in canon,
             'semantic-separation': 'predictionDoesNotOverwriteHistoricalActual' in store and 'officialBaseline' in store,
             'six-slot-user-control': 'userControlsAddChangeReplaceOrder' in store and 'externalCollectionAutoSelection' in main,
-            'no-auto-slot-write-from-collector': 'setHubApplicationSlot(sessionId, slot' in store and 'showHubCandidatePicker' in main,
+            'six-slot-editor-wired': 'fun setHubApplicationSlot(' in store and 'showHubCandidatePicker' in main and 'localStore.setHubApplicationSlot' in main,
             'quality-audit': 'UnifiedSyncState.QUALITY_AUDIT.name' in main and 'refreshCanonicalQualityAudit' in store,
             'hub-publish': 'UnifiedSyncState.HUB_PUBLISH.name' in main,
             'batch-crawl-disabled': 'override val supportsBatchCrawl = false' in adapter,
@@ -57,7 +57,6 @@ jobs:
           }
           failed=[k for k,v in checks.items() if not v]
           if failed: raise SystemExit('v0.10.0 invariant failure: '+', '.join(failed))
-          # The builder may normalize comparison keys, but must not fill missing fields.
           for banned in ['autoSelectTopSix','autoReplaceHubSlot','inferMissingDepartment','inferMissingAdmission']:
               if banned in canon or banned in store or banned in main:
                   raise SystemExit('forbidden automatic inference/slot mutation: '+banned)
