@@ -27,6 +27,9 @@ class CloudOffloadCoordinator(context: Context) {
     private var creatingRun = false
     private val pendingChunks = ArrayDeque<PendingChunk>()
     private var pendingFinish: PendingFinish? = null
+    private val recordCheckpointRunIds = linkedMapOf<String, String>()
+    private val recordCheckpointRunResolving = linkedSetOf<String>()
+    private val pendingRecordCheckpoints = linkedMapOf<String, ArrayDeque<RecordCheckpointRequest>>()
 
     @Volatile private var lastError: String? = null
     @Volatile private var uploadedChunks: Int = 0
@@ -49,6 +52,13 @@ class CloudOffloadCoordinator(context: Context) {
     data class PendingFinish(
         val reason: String,
         val summaryJson: String
+    )
+
+    data class RecordCheckpointRequest(
+        val provider: String,
+        val collectorVersion: String,
+        val recordsJson: String,
+        val callback: (Result<String>) -> Unit
     )
 
     fun isConfigured(): Boolean = workerUrl().isNotBlank() && token().isNotBlank()
@@ -313,6 +323,133 @@ class CloudOffloadCoordinator(context: Context) {
      * Sends only a compact operational diagnostic after local collection.
      * It uses a separate provider/run and does not change activeRunId or upload admission records.
      */
+    /**
+     * Persist privacy-sanitized admission records to a provider-specific cloud run without
+     * mutating the coordinator's active batch run. This is used by Jinhak user-session mission
+     * traversal as a crash-safe incremental checkpoint, not as an unattended crawler.
+     */
+    fun sendRecordCheckpoint(
+        sourceProvider: String,
+        collectorVersion: String,
+        records: JSONArray,
+        callback: (Result<String>) -> Unit = {}
+    ) {
+        if (!isConfigured()) {
+            callback(Result.failure(IllegalStateException("cloud-offload-not-configured")))
+            return
+        }
+        if (records.length() <= 0) {
+            callback(Result.failure(IllegalArgumentException("empty-record-checkpoint")))
+            return
+        }
+        val provider = sourceProvider.trim().take(40)
+        if (provider.isBlank()) {
+            callback(Result.failure(IllegalArgumentException("blank-record-checkpoint-provider")))
+            return
+        }
+        val request = RecordCheckpointRequest(provider, collectorVersion.take(40), records.toString(), callback)
+        var readyRun: String? = null
+        var shouldResolve = false
+        var queueRejected = false
+        synchronized(lock) {
+            ensureClientLocked()
+            readyRun = recordCheckpointRunIds[provider]
+            if (readyRun == null) {
+                val queue = pendingRecordCheckpoints.getOrPut(provider) { ArrayDeque() }
+                if (queue.size >= MAX_RECORD_CHECKPOINT_QUEUE) {
+                    queueRejected = true
+                } else {
+                    queue.addLast(request)
+                    shouldResolve = recordCheckpointRunResolving.add(provider)
+                }
+            }
+        }
+        if (queueRejected) {
+            callback(Result.failure(IllegalStateException("record-checkpoint-queue-full")))
+            return
+        }
+        readyRun?.let {
+            uploadRecordCheckpoint(it, request)
+            return
+        }
+        if (shouldResolve) resolveRecordCheckpointRun(provider, collectorVersion)
+    }
+
+    private fun resolveRecordCheckpointRun(provider: String, collectorVersion: String) {
+        val currentClient = synchronized(lock) { ensureClientLocked(); client }
+        if (currentClient == null) {
+            completeRecordCheckpointRunResolution(provider, null, IllegalStateException("cloud-client-unavailable"))
+            return
+        }
+        currentClient.getLatestActiveRun(provider) { lookup ->
+            lookup.fold(
+                onSuccess = { existing ->
+                    if (!existing.isNullOrBlank()) {
+                        completeRecordCheckpointRunResolution(provider, existing, null)
+                    } else {
+                        currentClient.createRun(
+                            provider,
+                            collectorVersion,
+                            JSONObject()
+                                .put("mode", "crash-safe-record-checkpoint")
+                                .put("source", "android-user-session-mission")
+                                .put("browserSessionMaterialAccepted", false)
+                                .put("credentialExported", false)
+                                .put("sessionSecretExported", false)
+                        ) { created ->
+                            created.fold(
+                                onSuccess = { completeRecordCheckpointRunResolution(provider, it, null) },
+                                onFailure = { completeRecordCheckpointRunResolution(provider, null, it) }
+                            )
+                        }
+                    }
+                },
+                onFailure = { completeRecordCheckpointRunResolution(provider, null, it) }
+            )
+        }
+    }
+
+    private fun completeRecordCheckpointRunResolution(provider: String, runId: String?, error: Throwable?) {
+        val queued = mutableListOf<RecordCheckpointRequest>()
+        synchronized(lock) {
+            recordCheckpointRunResolving.remove(provider)
+            if (!runId.isNullOrBlank()) recordCheckpointRunIds[provider] = runId
+            pendingRecordCheckpoints.remove(provider)?.let { q ->
+                while (q.isNotEmpty()) queued += q.removeFirst()
+            }
+        }
+        if (runId.isNullOrBlank()) {
+            val failure = error ?: IllegalStateException("record-checkpoint-run-unavailable")
+            lastError = failure.message
+            queued.forEach { it.callback(Result.failure(failure)) }
+            return
+        }
+        queued.forEach { uploadRecordCheckpoint(runId, it) }
+    }
+
+    private fun uploadRecordCheckpoint(runId: String, request: RecordCheckpointRequest) {
+        val parsed = runCatching { JSONArray(request.recordsJson) }
+        if (parsed.isFailure) {
+            request.callback(Result.failure(parsed.exceptionOrNull() ?: IllegalArgumentException("record-checkpoint-json-invalid")))
+            return
+        }
+        val currentClient = synchronized(lock) { ensureClientLocked(); client }
+        if (currentClient == null) {
+            request.callback(Result.failure(IllegalStateException("cloud-client-unavailable")))
+            return
+        }
+        currentClient.uploadChunk(
+            runId = runId,
+            provider = request.provider,
+            records = parsed.getOrThrow(),
+            page = null,
+            error = null
+        ) { result ->
+            result.onFailure { lastError = it.message }
+            request.callback(result.map { runId })
+        }
+    }
+
     fun sendDiagnostic(
         sourceProvider: String,
         collectorVersion: String,
@@ -530,5 +667,6 @@ class CloudOffloadCoordinator(context: Context) {
         private const val KEY_ACTIVE_PROVIDER = "active_provider"
         private const val KEY_FRONTIER_CLIENT_ID = "frontier_client_id"
         private const val MAX_PENDING_CHUNKS = 200
+        private const val MAX_RECORD_CHECKPOINT_QUEUE = 64
     }
 }

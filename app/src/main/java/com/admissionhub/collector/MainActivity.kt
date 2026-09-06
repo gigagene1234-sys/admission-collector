@@ -246,6 +246,14 @@ class MainActivity : Activity() {
     private var batchSkipSnapshotUntilMs = 0L
     private var runtimeLastSafePath = ""
     private var runtimeRendererRecovering = false
+    private var runtimeRendererCrashWindowStartedAtMs = 0L
+    private var runtimeRendererCrashCount = 0
+    private var runtimeRendererLastCrashAtMs = 0L
+    private var runtimeRendererCircuitBreaks = 0
+    private var runtimeRendererCircuitGeneration = 0
+    private var jinhakCloudRecordCheckpointsQueued = 0
+    private var jinhakCloudRecordCheckpointsSucceeded = 0
+    private var jinhakCloudRecordCheckpointsFailed = 0
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
     private var jinhakRecoveredStalls = 0
@@ -386,6 +394,10 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_REAL_AUTH_ROUTE_REVISITS = 4
         private const val MAX_JINHAK_REAL_AUTH_UNEXPECTED_ROUTES = 3
         private const val JINHAK_LIVE_DIAGNOSTIC_MIN_INTERVAL_MS = 10_000L
+        private const val JINHAK_RENDERER_CRASH_WINDOW_MS = 90_000L
+        private const val JINHAK_RENDERER_CIRCUIT_COOLDOWN_MS = 30_000L
+        private const val MAX_JINHAK_RENDERER_CRASHES_PER_WINDOW = 2
+        private const val MAX_JINHAK_RENDERER_CIRCUIT_BREAKS_PER_SESSION = 2
         private const val AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = true
         private const val LOGIN_PREFLIGHT_DOM_SETTLE_MS = 300L
         private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
@@ -395,8 +407,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_SAME_CARD_REPLAY_ATTEMPTS = 3
         private const val MAX_CLOUD_FRONTIER_CLAIM_ATTEMPTS = 3
         private const val RUNTIME_PREFS = "collector_runtime_v064"
-        private const val VERSION = "0.9.19"
-        private const val BUILD_CODE = 109190
+        private const val VERSION = "0.9.20"
+        private const val BUILD_CODE = 109200
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -797,6 +809,18 @@ class MainActivity : Activity() {
                     }
                 val didCrash = detail?.didCrash() ?: false
                 val webViewPackage = runCatching { WebView.getCurrentWebViewPackage() }.getOrNull()
+                val now = System.currentTimeMillis()
+                if (runtimeRendererCrashWindowStartedAtMs <= 0L ||
+                    now - runtimeRendererCrashWindowStartedAtMs > JINHAK_RENDERER_CRASH_WINDOW_MS) {
+                    runtimeRendererCrashWindowStartedAtMs = now
+                    runtimeRendererCrashCount = 0
+                }
+                runtimeRendererCrashCount += 1
+                runtimeRendererLastCrashAtMs = now
+                val repeatedJinhakCrash = provider == ProviderId.JINHAK && wasUnifiedRunning &&
+                    runtimeRendererCrashCount >= MAX_JINHAK_RENDERER_CRASHES_PER_WINDOW
+                if (repeatedJinhakCrash) runtimeRendererCircuitBreaks += 1
+                val circuitGeneration = if (repeatedJinhakCrash) ++runtimeRendererCircuitGeneration else runtimeRendererCircuitGeneration
 
                 recordRuntimeEvent(
                     "webview-renderer-gone",
@@ -809,14 +833,30 @@ class MainActivity : Activity() {
                         .put("batchPausedForLogin", wasBatchPausedForLogin)
                         .put("unifiedRunning", wasUnifiedRunning)
                         .put("resumeSafePath", runtimeSafePath(resumeUrl))
-                        .put("recoveryMode", "replace-main-webview-in-place")
+                        .put("rendererCrashCountInWindow", runtimeRendererCrashCount)
+                        .put("rendererCrashWindowMs", JINHAK_RENDERER_CRASH_WINDOW_MS)
+                        .put("rendererCircuitOpen", repeatedJinhakCrash)
+                        .put("rendererCircuitBreaks", runtimeRendererCircuitBreaks)
+                        .put("missionTargetLedger", jinhakMissionTargetLedger.summary())
+                        .put("missionCells", jinhakMissionCells.diagnostics(now))
+                        .put("recoveryMode", if (repeatedJinhakCrash) "checkpoint-cooldown-mission-origin" else "replace-main-webview-in-place")
                 )
+
                 // Renderer death is an interrupted render, not a terminal document failure.
-                // Pause browser execution only; keep queue, mission ledger and target state intact.
+                // Pause browser execution only; keep SQLite queue/mission/auth checkpoints intact.
                 batchRunning = false
                 batchCollecting = false
                 disarmBatchNavigationWatchdog()
                 persistRuntimeCheckpoint(forceResume = wasUnifiedRunning)
+                if (provider == ProviderId.JINHAK && wasUnifiedRunning) {
+                    persistJinhakMissionRuntimeState(
+                        if (repeatedJinhakCrash) "renderer-circuit-checkpoint" else "renderer-gone-checkpoint"
+                    )
+                    persistLiveJinhakDiagnostics(
+                        if (repeatedJinhakCrash) "renderer-circuit-open" else "renderer-gone",
+                        force = true
+                    )
+                }
 
                 handler.postDelayed({
                     val recovery = runCatching {
@@ -829,25 +869,77 @@ class MainActivity : Activity() {
                         webView = replacement
                         parent.addView(replacement, childIndex, oldLayoutParams)
                         configureWebView()
-
-                        // Restore exactly the pre-crash execution flags after replacing only
-                        // the browser surface. Activity/session/mission objects stay alive.
-                        batchRunning = wasBatchRunning
-                        batchPausedForLogin = wasBatchPausedForLogin
                         batchCollecting = false
                         currentBatchTarget = currentBatchTarget?.takeIf { it.isNotBlank() } ?: resumeUrl
                         runtimeRendererRecovering = false
+
+                        if (!repeatedJinhakCrash) {
+                            batchRunning = wasBatchRunning
+                            batchPausedForLogin = wasBatchPausedForLogin
+                            recordRuntimeEvent(
+                                "webview-renderer-recovered-in-place",
+                                JSONObject()
+                                    .put("didCrash", didCrash)
+                                    .put("batchRunning", batchRunning)
+                                    .put("unifiedRunning", unifiedRunning)
+                                    .put("resumeSafePath", runtimeSafePath(resumeUrl))
+                                    .put("rendererCrashCountInWindow", runtimeRendererCrashCount)
+                                    .put("activityRecreated", false)
+                            )
+                            status.text = "WebView renderer 복구 완료 · 현재 수집 지점에서 재개합니다."
+                            replacement.loadUrl(resumeUrl)
+                            return@runCatching
+                        }
+
+                        // Repeated renderer death is treated as a circuit-open event. Keep the
+                        // replacement WebView idle during cooldown so a bad report route cannot
+                        // immediately kill the renderer again. Mission/ledger remain resumable.
+                        batchRunning = false
+                        batchPausedForLogin = wasBatchPausedForLogin
+                        replacement.loadUrl("about:blank")
                         recordRuntimeEvent(
-                            "webview-renderer-recovered-in-place",
+                            "jinhak-renderer-circuit-paused",
                             JSONObject()
-                                .put("didCrash", didCrash)
-                                .put("batchRunning", batchRunning)
-                                .put("unifiedRunning", unifiedRunning)
+                                .put("circuitBreaks", runtimeRendererCircuitBreaks)
+                                .put("cooldownMs", JINHAK_RENDERER_CIRCUIT_COOLDOWN_MS)
                                 .put("resumeSafePath", runtimeSafePath(resumeUrl))
-                                .put("activityRecreated", false)
+                                .put("missionOriginSafePath", runtimeSafePath(jinhakMissionOriginRoute))
+                                .put("automaticResumeEligible", runtimeRendererCircuitBreaks <= MAX_JINHAK_RENDERER_CIRCUIT_BREAKS_PER_SESSION),
+                            synchronous = true
                         )
-                        status.text = "WebView renderer 복구 완료 · 현재 수집 지점에서 재개합니다."
-                        replacement.loadUrl(resumeUrl)
+                        persistRuntimeCheckpoint(forceResume = wasUnifiedRunning)
+
+                        if (runtimeRendererCircuitBreaks > MAX_JINHAK_RENDERER_CIRCUIT_BREAKS_PER_SESSION) {
+                            status.text = "WebView renderer 반복 충돌 · 체크포인트 저장 후 안전 정지했습니다. 앱을 다시 열면 이어서 복구합니다."
+                            return@runCatching
+                        }
+
+                        status.text = "WebView renderer 반복 충돌 · 체크포인트 저장 완료 · 30초 안전 대기 후 재개합니다."
+                        handler.postDelayed({
+                            if (runtimeRendererCircuitGeneration != circuitGeneration ||
+                                !unifiedRunning || provider != ProviderId.JINHAK) return@postDelayed
+                            runtimeRendererCrashWindowStartedAtMs = System.currentTimeMillis()
+                            runtimeRendererCrashCount = 0
+                            batchRunning = wasBatchRunning
+                            batchPausedForLogin = wasBatchPausedForLogin
+                            batchCollecting = false
+                            val missionOrigin = jinhakMissionOriginRoute.takeIf { it.isNotBlank() }
+                            val safeResume = missionOrigin
+                                ?: JinhakSiteTopology.missionSeeds().firstOrNull()?.takeIf { it.isNotBlank() }
+                                ?: resumeUrl
+                            currentBatchTarget = currentBatchTarget?.takeIf { it.isNotBlank() } ?: safeResume
+                            recordRuntimeEvent(
+                                "jinhak-renderer-circuit-resume",
+                                JSONObject()
+                                    .put("circuitBreaks", runtimeRendererCircuitBreaks)
+                                    .put("resumeSafePath", runtimeSafePath(safeResume))
+                                    .put("resumeFromMissionOrigin", missionOrigin != null)
+                                    .put("batchRunning", batchRunning),
+                                synchronous = true
+                            )
+                            status.text = "WebView renderer 안전 대기 종료 · 보존된 mission 지점에서 재개합니다."
+                            replacement.loadUrl(safeResume)
+                        }, JINHAK_RENDERER_CIRCUIT_COOLDOWN_MS)
                     }
                     recovery.onFailure { error ->
                         runtimeRendererRecovering = false
@@ -859,6 +951,7 @@ class MainActivity : Activity() {
                             JSONObject()
                                 .put("errorClass", error.javaClass.simpleName.take(80))
                                 .put("resumeSafePath", runtimeSafePath(resumeUrl))
+                                .put("rendererCircuitBreaks", runtimeRendererCircuitBreaks)
                                 .put("activityRecreated", false),
                             synchronous = true
                         )
@@ -3279,6 +3372,64 @@ class MainActivity : Activity() {
         persistLiveJinhakDiagnostics(reason, forceDiagnostics)
     }
 
+    private fun checkpointJinhakCaptureToCloud(
+        trigger: String,
+        digest: JSONObject,
+        safeRoute: String,
+        pageType: String
+    ) {
+        if (!cloudOffload.isConfigured() || safeRoute.isBlank()) return
+        val explicitContext = ObservationEvidence.explicitContextFromDigest(digest)
+        val identity = ObservationEvidence.identity(
+            ProviderId.JINHAK.wireName,
+            safeRoute,
+            explicitContext,
+            digest
+        )
+        val checkpointRecord = JSONObject()
+            .put("provider", ProviderId.JINHAK.wireName)
+            .put("recordType", "jinhak-capture-checkpoint")
+            .put("sourceRowFingerprint", "jinhak-capture:${identity.observationId}")
+            .put("year", JSONObject.NULL)
+            .put("university", JSONObject.NULL)
+            .put("department", JSONObject.NULL)
+            .put("admission", JSONObject.NULL)
+            .put("metrics", JSONObject()
+                .put("pageType", pageType.take(80))
+                .put("trigger", trigger.take(80))
+                .put("recordCount", digest.optInt("recordCount", 0))
+                .put("schemaVersion", digest.optInt("schemaVersion", 0))
+                .put("privacy", "sanitized-visible-admission-text-only"))
+            .put("sourcePage", safeRoute.take(500))
+            .put("sourceRowOrdinal", 0)
+            .put("confidence", "crash-safe-checkpoint")
+            .put("rawEvidence", digest.toString())
+
+        jinhakCloudRecordCheckpointsQueued += 1
+        cloudOffload.sendRecordCheckpoint(
+            ProviderId.JINHAK.wireName,
+            VERSION,
+            JSONArray().put(checkpointRecord)
+        ) { result ->
+            runOnUiThread {
+                if (result.isSuccess) {
+                    jinhakCloudRecordCheckpointsSucceeded += 1
+                } else {
+                    jinhakCloudRecordCheckpointsFailed += 1
+                    recordRuntimeEvent(
+                        "jinhak-cloud-record-checkpoint-failed",
+                        JSONObject()
+                            .put("safePath", safeRoute.take(300))
+                            .put("pageType", pageType.take(80))
+                            .put("trigger", trigger.take(80))
+                            .put("failureCount", jinhakCloudRecordCheckpointsFailed)
+                            .put("errorClass", result.exceptionOrNull()?.javaClass?.simpleName?.take(80) ?: JSONObject.NULL)
+                    )
+                }
+            }
+        }
+    }
+
     private fun persistLiveJinhakDiagnostics(trigger: String, force: Boolean = false) {
         if (provider != ProviderId.JINHAK || !unifiedRunning || unifiedPhase != "jinhak") return
         val sessionId = unifiedSessionId ?: return
@@ -3354,6 +3505,13 @@ class MainActivity : Activity() {
                 .put("missionCells", jinhakMissionCells.diagnostics(now))
                 .put("legacyAgentActionInFlight", jinhakAgentActionInFlight)
                 .put("legacyBatchCollecting", batchCollecting)
+                .put("cloudRecordCheckpointsQueued", jinhakCloudRecordCheckpointsQueued)
+                .put("cloudRecordCheckpointsSucceeded", jinhakCloudRecordCheckpointsSucceeded)
+                .put("cloudRecordCheckpointsFailed", jinhakCloudRecordCheckpointsFailed)
+                .put("rendererCrashCountInWindow", runtimeRendererCrashCount)
+                .put("rendererCrashWindowAgeMs", if (runtimeRendererCrashWindowStartedAtMs > 0L) (now - runtimeRendererCrashWindowStartedAtMs).coerceAtLeast(0L) else JSONObject.NULL)
+                .put("rendererLastCrashAgeMs", if (runtimeRendererLastCrashAtMs > 0L) (now - runtimeRendererLastCrashAtMs).coerceAtLeast(0L) else JSONObject.NULL)
+                .put("rendererCircuitBreaks", runtimeRendererCircuitBreaks)
                 .put("activeMissionTarget", jinhakActiveMissionTargetId != null)
                 .put("slowLaneRunning", slowStats?.running ?: 0)
                 .put("slowLaneQueued", slowStats?.queued ?: 0)
@@ -3859,6 +4017,7 @@ class MainActivity : Activity() {
                     captureVersion = VERSION
                 )
                 localStore.updateUnifiedSession(sessionId, "jinhak", "running", null)
+                checkpointJinhakCaptureToCloud("slow-lane-completed", digest, safeRoute, pageType)
             }
             batchSnapshots.put(snapshotForLocalExport(snapshot))
             batchPageCount += 1
@@ -4409,7 +4568,8 @@ class MainActivity : Activity() {
                             payload = lastJinhakDigest
                         )
                         localStore.updateUnifiedSession(sessionId, "jinhak", "running", null)
-                    persistLiveJinhakDiagnostics("capture")
+                        checkpointJinhakCaptureToCloud("unified-user-viewed-page", lastJinhakDigest, safeRouteKey, pageType)
+                        persistLiveJinhakDiagnostics("capture")
                         unifiedJinhakCapturedPages.add(localPageKey)
                         // The bundle is already privacy-sanitized by buildJinhakDigest.
                         // One explicit unified-session start authorizes these user-viewed page captures.
@@ -5101,6 +5261,7 @@ class MainActivity : Activity() {
                         captureVersion = VERSION
                     )
                     localStore.updateUnifiedSession(sessionId, "jinhak", "running", null)
+                    checkpointJinhakCaptureToCloud("batch-capture", digest, safeRoute, batchPageType)
                 }
             }
             if (activeAction != null && LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
