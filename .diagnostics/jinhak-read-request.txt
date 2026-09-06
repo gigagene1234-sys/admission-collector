@@ -1,1 +1,1 @@
-2026-08-30 v0.5.7 context-probe diagnostic read request
+2026-09-06 v0.9.20 post-crash diagnostic read request
