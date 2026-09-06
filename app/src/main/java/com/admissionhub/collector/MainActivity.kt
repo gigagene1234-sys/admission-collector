@@ -67,6 +67,8 @@ class MainActivity : Activity() {
     private lateinit var diagnosticButton: Button
     private lateinit var unifiedButton: Button
     private lateinit var realJinhakAuthProbeButton: Button
+    private lateinit var hubState: TextView
+    private lateinit var hubManageButton: Button
     private lateinit var cloudOffload: CloudOffloadCoordinator
     private lateinit var localStore: LocalCollectorStore
     private lateinit var sessionVault: SecureSessionVault
@@ -447,8 +449,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.9.26"
-        private const val BUILD_CODE = 109260
+        private const val VERSION = "0.10.0"
+        private const val BUILD_CODE = 110000
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -462,6 +464,7 @@ class MainActivity : Activity() {
         sessionVault = SecureSessionVault(this)
         credentialVault = CredentialVault(this)
         buildUi()
+        handler.postDelayed({ rebuildCanonicalHubFromLatestSessionIfReady("app-start") }, 1800L)
         slowLanePool = JinhakSlowLanePool(this, slowLaneHost, object : JinhakSlowLanePool.Listener {
             override fun onSlowLaneCompleted(task: JinhakSlowLanePool.Task, snapshot: JSONObject, stats: JinhakSlowLanePool.ResultStats) {
                 handleJinhakSlowLaneCompleted(task, snapshot, stats)
@@ -656,8 +659,23 @@ class MainActivity : Activity() {
         actions3.addView(diagnosticButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         actions3.addView(realJinhakAuthProbeButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
+        val hubRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        hubState = TextView(this).apply {
+            text = "지원 6장: 데이터 준비 중"
+            setPadding(8, 8, 8, 8)
+        }
+        hubManageButton = Button(this).apply {
+            text = "지원 6장 관리"
+            setOnClickListener { showHubSixManager() }
+        }
+        hubRow.addView(hubState, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        hubRow.addView(hubManageButton)
+
         status = TextView(this).apply {
-            text = "Admission Collector v$VERSION 준비 중"
+            text = "Admission Hub v$VERSION 준비 중"
             setPadding(8, 8, 8, 8)
         }
 
@@ -707,10 +725,144 @@ class MainActivity : Activity() {
         root.addView(actions1)
         root.addView(actions2)
         root.addView(actions3)
+        root.addView(hubRow)
         root.addView(status)
         root.addView(browserStack, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f))
         root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 2f))
         setContentView(root)
+    }
+
+    private fun rebuildCanonicalHubFromLatestSessionIfReady(trigger: String) {
+        if (unifiedRunning || batchRunning) return
+        val sessionId = localStore.latestUnifiedSession()
+        if (sessionId.isNullOrBlank()) {
+            refreshHubState(null)
+            return
+        }
+        val persisted = localStore.jinhakMissionCoveragePersistenceSummary(sessionId)
+        if (persisted.optInt("persistedIdentities", 0) <= 0) {
+            refreshHubState(sessionId)
+            return
+        }
+        val summary = runCatching { localStore.rebuildCanonicalApplicationGraph(sessionId) }.getOrElse { error ->
+            recordRuntimeEvent("canonical-hub-rebuild-failed", JSONObject()
+                .put("trigger", trigger.take(80))
+                .put("exceptionClass", error.javaClass.name.take(120)))
+            localStore.canonicalHubSummary(sessionId)
+        }
+        refreshHubState(sessionId, summary)
+    }
+
+    private fun refreshHubState(sessionId: String?, supplied: JSONObject? = null) {
+        if (!::hubState.isInitialized) return
+        if (sessionId.isNullOrBlank()) {
+            hubState.text = "지원 6장: 아직 통합 수집 데이터가 없습니다."
+            return
+        }
+        val summary = supplied ?: localStore.canonicalHubSummary(sessionId)
+        val audit = summary.optJSONObject("qualityAudit") ?: JSONObject()
+        val slots = audit.optJSONObject("sixSlots") ?: JSONObject()
+        val selected = slots.optInt("selected", 0)
+        val candidates = audit.optInt("candidateCount", 0)
+        val publish = audit.optString("publishState", "WAITING_FOR_USER_SELECTION")
+        val readyText = when (publish) {
+            "READY" -> "Hub 준비 완료"
+            "READY_WITH_WARNINGS" -> "Hub 준비 · 일부 결합 확인 필요"
+            "BLOCKED_QUALITY" -> "품질 점검 필요"
+            else -> "6장 선택 필요"
+        }
+        hubState.text = "지원 6장 $selected/6 · 후보 $candidates · $readyText"
+    }
+
+    private fun showHubSixManager() {
+        val sessionId = localStore.latestUnifiedSession()
+        if (sessionId.isNullOrBlank()) {
+            Toast.makeText(this, "먼저 통합 수집을 완료해주세요.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val summary = if (localStore.canonicalHubSummary(sessionId).optJSONArray("candidateGraph")?.length() == 0) {
+            localStore.rebuildCanonicalApplicationGraph(sessionId)
+        } else localStore.canonicalHubSummary(sessionId)
+        val slots = summary.optJSONArray("slots") ?: JSONArray()
+        val items = Array(7) { "" }
+        for (slot in 1..6) {
+            val row = slots.optJSONObject(slot - 1)
+            items[slot - 1] = if (row?.optBoolean("occupied", false) == true) {
+                "$slot. ${row.optString("displayLabel")}"
+            } else "$slot. — 비어 있음 —"
+        }
+        items[6] = "품질 재분석 / 상태 새로고침"
+        AlertDialog.Builder(this)
+            .setTitle("지원 6장 관리 · 수집기가 자동 변경하지 않습니다")
+            .setItems(items) { _, which ->
+                if (which in 0..5) showHubCandidatePicker(sessionId, which + 1)
+                else rebuildCanonicalHubFromLatestSessionIfReady("manual-refresh")
+            }
+            .setNegativeButton("닫기", null)
+            .show()
+    }
+
+    private fun showHubCandidatePicker(sessionId: String, slot: Int) {
+        val candidates = localStore.loadCanonicalApplicationCandidates(sessionId)
+        if (candidates.length() == 0) {
+            Toast.makeText(this, "선택 가능한 canonical 지원안이 없습니다.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val labels = Array(candidates.length() + 1) { index ->
+            if (index == 0) "— 이 슬롯 비우기 —"
+            else {
+                val item = candidates.optJSONObject(index - 1) ?: JSONObject()
+                val quality = item.optString("qualityState", "unknown")
+                "${item.optString("displayLabel", "미확인 지원안")} · $quality"
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle("${slot}번 지원안 선택")
+            .setItems(labels) { _, which ->
+                val result = if (which == 0) {
+                    localStore.clearHubApplicationSlot(sessionId, slot)
+                } else {
+                    val item = candidates.optJSONObject(which - 1) ?: JSONObject()
+                    localStore.setHubApplicationSlot(sessionId, slot, item.optString("applicationIdentityKey"))
+                }
+                val summary = localStore.canonicalHubSummary(sessionId)
+                refreshHubState(sessionId, summary)
+                publishHubAuditState(sessionId, summary, "slot-$slot")
+                if (!result.optBoolean("ok", false)) {
+                    Toast.makeText(this, "지원안 변경에 실패했습니다: ${result.optString("error", "unknown")}", Toast.LENGTH_LONG).show()
+                } else {
+                    handler.postDelayed({ showHubSixManager() }, 120L)
+                }
+            }
+            .setNegativeButton("취소", null)
+            .show()
+    }
+
+    private fun publishHubAuditState(sessionId: String, summary: JSONObject, trigger: String) {
+        val audit = summary.optJSONObject("qualityAudit") ?: return
+        val ready = audit.optBoolean("hubReady", false)
+        localStore.recordSyncState(
+            sessionId,
+            UnifiedSyncState.HUB_PUBLISH.name,
+            null,
+            JSONObject()
+                .put("trigger", trigger.take(80))
+                .put("publishState", audit.optString("publishState"))
+                .put("hubReady", ready)
+                .put("sixSlots", audit.optJSONObject("sixSlots") ?: JSONObject())
+                .put("externalCollectionAutoSelection", false),
+            !ready
+        )
+        if (ready) {
+            localStore.updateUnifiedSession(sessionId, "completed", "completed", "hub-ready-after-user-selection")
+            localStore.recordSyncState(
+                sessionId,
+                UnifiedSyncState.COMPLETE.name,
+                null,
+                JSONObject().put("trigger", trigger.take(80)).put("hubReady", true),
+                false
+            )
+        }
     }
 
     @Suppress("SetJavaScriptEnabled")
@@ -3531,8 +3683,40 @@ class MainActivity : Activity() {
                 status.text = "종료할 통합 수집 세션이 없습니다."
                 return
             }
-            localStore.updateUnifiedSession(sessionId, "completed", "completed", reason)
+            localStore.recordSyncState(
+                sessionId,
+                UnifiedSyncState.CANONICAL_MERGE.name,
+                null,
+                JSONObject().put("source", "jinhak-mission-ledger+adiga-official-baseline").put("doNotInferMissingBindings", true),
+                false
+            )
+            val canonicalSummary = localStore.rebuildCanonicalApplicationGraph(sessionId)
+            val qualityAudit = canonicalSummary.optJSONObject("qualityAudit") ?: JSONObject()
+            localStore.recordSyncState(
+                sessionId,
+                UnifiedSyncState.QUALITY_AUDIT.name,
+                null,
+                qualityAudit,
+                false
+            )
+            val hubReady = qualityAudit.optBoolean("hubReady", false)
+            localStore.recordSyncState(
+                sessionId,
+                UnifiedSyncState.HUB_PUBLISH.name,
+                null,
+                JSONObject()
+                    .put("publishState", qualityAudit.optString("publishState"))
+                    .put("hubReady", hubReady)
+                    .put("sixSlots", qualityAudit.optJSONObject("sixSlots") ?: JSONObject())
+                    .put("externalCollectionAutoSelection", false),
+                !hubReady
+            )
+            localStore.updateUnifiedSession(sessionId, if (hubReady) "completed" else "hub-publish", "completed", reason)
+            if (hubReady) {
+                localStore.recordSyncState(sessionId, UnifiedSyncState.COMPLETE.name, null, JSONObject().put("hubReady", true), false)
+            }
             getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit().putBoolean("resumeUnified", false).apply()
+            refreshHubState(sessionId, canonicalSummary)
 
             val summary = localStore.unifiedStatus(sessionId)
             lastJson = JSONObject()
@@ -3555,7 +3739,13 @@ class MainActivity : Activity() {
             recordRuntimeEvent("unified-finish-memory-safe", JSONObject()
                 .put("reason", reason.take(120))
                 .put("sessionIdPresent", true))
-            status.text = "통합 수집 종료 완료 · 전체 데이터는 SQLite에 보존됨 · JSON 저장 시 메모리에 올리지 않고 스트리밍합니다."
+            val hubAudit = summary.optJSONObject("canonicalHub")?.optJSONObject("qualityAudit") ?: JSONObject()
+            val selected = hubAudit.optJSONObject("sixSlots")?.optInt("selected", 0) ?: 0
+            status.text = if (hubAudit.optBoolean("hubReady", false)) {
+                "통합 수집 + canonical merge + quality audit 완료 · 지원 6장 Hub 준비 완료."
+            } else {
+                "통합 수집 + canonical merge 완료 · 지원 6장 $selected/6 선택 후 Hub 게시가 완료됩니다."
+            }
         } catch (t: Throwable) {
             recordRuntimeEvent("unified-finish-failure", JSONObject()
                 .put("exceptionClass", t.javaClass.name.take(160)), synchronous = true)

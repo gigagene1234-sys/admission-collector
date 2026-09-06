@@ -9,6 +9,7 @@ import com.admissionhub.collector.observation.ObservationEvidence
 import com.admissionhub.collector.adiga.AdigaPlanTask
 import com.admissionhub.collector.canonical.CanonicalEntity
 import com.admissionhub.collector.canonical.ProviderEntityMapping
+import com.admissionhub.collector.canonical.CanonicalSixApplicationGraph
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
@@ -25,7 +26,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "admission_collector_local_v1.db",
     null,
-    6
+    7
 ) {
     private fun ensureFoundationSchema(db: SQLiteDatabase) {
         // Content-aware captures: same route can expose different data at another time/context.
@@ -138,6 +139,57 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_adiga_plan_identity ON adiga_plan_tasks(academic_year,university_code,task_type)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_adiga_plan_state ON adiga_plan_tasks(state,updated_at)")
 
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS canonical_applications(
+              session_id TEXT NOT NULL,
+              application_identity_key TEXT NOT NULL,
+              canonical_application_id TEXT NOT NULL,
+              academic_year INTEGER NOT NULL,
+              canonical_university_id TEXT,
+              canonical_campus_id TEXT,
+              canonical_recruitment_unit_id TEXT,
+              canonical_admission_track_id TEXT,
+              university TEXT,
+              campus TEXT,
+              department TEXT,
+              admission TEXT,
+              admission_category TEXT,
+              capacity INTEGER,
+              jinhak_confidence TEXT NOT NULL,
+              parse_source TEXT NOT NULL,
+              coverage_json TEXT NOT NULL,
+              coverage_count INTEGER NOT NULL DEFAULT 0,
+              adiga_binding_quality TEXT NOT NULL,
+              adiga_match_count INTEGER NOT NULL DEFAULT 0,
+              adiga_binding_json TEXT NOT NULL,
+              quality_state TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(session_id,application_identity_key)
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_canonical_apps_session_quality ON canonical_applications(session_id,quality_state,university,department)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_canonical_apps_canonical_id ON canonical_applications(canonical_application_id)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS hub_application_slots(
+              slot INTEGER PRIMARY KEY,
+              canonical_application_id TEXT NOT NULL,
+              application_identity_key TEXT NOT NULL,
+              display_label TEXT NOT NULL,
+              user_pinned INTEGER NOT NULL DEFAULT 1,
+              updated_at TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_hub_slot_identity ON hub_application_slots(application_identity_key)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS hub_quality_audits(
+              session_id TEXT PRIMARY KEY,
+              audit_json TEXT NOT NULL,
+              generated_at TEXT NOT NULL
+            )
+        """.trimIndent())
 
         db.execSQL("""
             CREATE TABLE IF NOT EXISTS jinhak_mission_targets(
@@ -330,6 +382,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             ensureFoundationSchema(db)
         }
         if (oldVersion < 6) {
+            ensureFoundationSchema(db)
+        }
+        if (oldVersion < 7) {
             ensureFoundationSchema(db)
         }
     }
@@ -679,6 +734,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         out.put("jinhakDiagnosticsSummary", latestSyncStateDetail(sessionId, "JINHAK_CRAWL_DIAGNOSTICS"))
             .put("jinhakAuthDiagnosticsSummary", latestSyncStateDetail(sessionId, "JINHAK_AUTH_DIAGNOSTICS"))
             .put("jinhakTerminalSummary", latestSyncStateDetail(sessionId, "JINHAK_TERMINAL_SEAL"))
+            .put("canonicalHub", canonicalHubSummary(sessionId))
         return out
     }
 
@@ -885,7 +941,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
 
         writer.write("{\"schemaVersion\":4,\"type\":\"admission-unified-two-provider-export\",\"session\":")
         writer.write(status.toString())
-        writer.write(",\"analysisReady\":{\"contractVersion\":3,\"purpose\":\"assistant-xlsx-dashboard-generation\",\"authoritativeLayers\":[\"sources.adiga.records\",\"sources.jinhak.records\",\"sources.jinhak.pageAnalyses\",\"observationEvidence\",\"errorEvidence\",\"syncDiagnostics\"],\"recommendedWorkbookSheets\":[\"Dashboard\",\"ApplicationMissions\",\"UnifiedRecords\",\"JinhakPredictions\",\"HistoricalResults\",\"Observations\",\"Coverage\",\"Errors\"],\"rowKeyFields\":[\"provider\",\"year\",\"university\",\"department\",\"admission\",\"applicationIdentityKey\",\"recordType\",\"observedAt\"],\"flattenMetricsForSpreadsheet\":true,\"preserveRawEvidence\":true,\"doNotInferMissingBindings\":true,\"observationFirst\":true},\"combinationPolicy\":{\"officialBaseline\":\"adiga\",\"predictionAnalysis\":\"jinhak\",\"keepProviderSemanticsSeparate\":true,\"doNotOverwriteHistoricalWithPrediction\":true},\"sources\":{\"adiga\":{\"runId\":")
+        writer.write(",\"analysisReady\":{\"contractVersion\":4,\"purpose\":\"canonical-six-application-hub-generation\",\"authoritativeLayers\":[\"sources.adiga.records\",\"sources.jinhak.records\",\"sources.jinhak.pageAnalyses\",\"observationEvidence\",\"errorEvidence\",\"syncDiagnostics\"],\"recommendedWorkbookSheets\":[\"Dashboard\",\"SixApplications\",\"CanonicalApplications\",\"ApplicationMissions\",\"UnifiedRecords\",\"JinhakPredictions\",\"HistoricalResults\",\"Observations\",\"Coverage\",\"QualityAudit\",\"Errors\"],\"rowKeyFields\":[\"provider\",\"year\",\"university\",\"department\",\"admission\",\"applicationIdentityKey\",\"recordType\",\"observedAt\"],\"flattenMetricsForSpreadsheet\":true,\"preserveRawEvidence\":true,\"doNotInferMissingBindings\":true,\"observationFirst\":true},\"combinationPolicy\":{\"officialBaseline\":\"adiga\",\"predictionAnalysis\":\"jinhak\",\"keepProviderSemanticsSeparate\":true,\"doNotOverwriteHistoricalWithPrediction\":true},\"sources\":{\"adiga\":{\"runId\":")
         writeNullableString(adigaRun)
         writer.write(",\"records\":")
         writeRecords(adigaRun)
@@ -1421,6 +1477,448 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("monotonicConfirmedOnly", true)
             .put("credentialStored", false)
             .put("sessionSecretStored", false)
+    }
+
+    private fun unifiedProviderRunId(sessionId: String, provider: String): String? {
+        val column = if (provider == "adiga") "adiga_run_id" else if (provider == "jinhak") "jinhak_run_id" else return null
+        return readableDatabase.rawQuery(
+            "SELECT $column FROM unified_sessions WHERE session_id=? LIMIT 1",
+            arrayOf(sessionId)
+        ).use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getString(0) else null }
+    }
+
+    fun rebuildCanonicalApplicationGraph(sessionId: String): JSONObject {
+        if (sessionId.isBlank()) return JSONObject().put("error", "missing-session")
+        val apps = CanonicalSixApplicationGraph.missionApplications(
+            loadJinhakMissionTargets(sessionId),
+            loadJinhakMissionCoverage(sessionId)
+        )
+        val adigaRunId = unifiedProviderRunId(sessionId, "adiga")
+        val jinhakRunId = unifiedProviderRunId(sessionId, "jinhak")
+        val byUniversity = apps.groupBy { CanonicalSixApplicationGraph.normalizeUniversityKey(it.university) }
+        val matches = linkedMapOf<String, LinkedHashMap<String, JSONObject>>()
+        val exactFingerprints = linkedMapOf<String, MutableSet<String>>()
+
+        if (!adigaRunId.isNullOrBlank() && apps.isNotEmpty()) {
+            readableDatabase.rawQuery(
+                "SELECT fingerprint,COALESCE(year,-1),university,department,admission,record_type FROM records WHERE run_id=? AND university IS NOT NULL",
+                arrayOf(adigaRunId)
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val university = if (c.isNull(2)) null else c.getString(2)
+                    val candidates = byUniversity[CanonicalSixApplicationGraph.normalizeUniversityKey(university)].orEmpty()
+                    if (candidates.isEmpty()) continue
+                    val year = c.getInt(1)
+                    val department = if (c.isNull(3)) null else c.getString(3)
+                    val admission = if (c.isNull(4)) null else c.getString(4)
+                    val recordType = if (c.isNull(5)) "unknown" else c.getString(5)
+                    for (app in candidates) {
+                        if (year > 0 && app.year > 0 && year != app.year) continue
+                        val deptQuality = CanonicalSixApplicationGraph.departmentMatchQuality(app.department, department)
+                        if (deptQuality == "none" || deptQuality == "missing") continue
+                        val admissionQuality = CanonicalSixApplicationGraph.admissionMatchQuality(app.admission, admission)
+                        if (admissionQuality == "none") continue
+                        val matchClass = if (deptQuality == "exact" && admissionQuality == "exact") "accepted" else "provisional"
+                        val signature = listOf(
+                            CanonicalSixApplicationGraph.normalizeUniversityKey(university),
+                            CanonicalSixApplicationGraph.normalizeDepartmentKey(department),
+                            CanonicalSixApplicationGraph.normalizeAdmissionKey(admission)
+                        ).joinToString("|")
+                        val bucket = matches.getOrPut(app.identityKey) { linkedMapOf() }
+                        val row = bucket[signature]
+                        if (row == null) {
+                            bucket[signature] = JSONObject()
+                                .put("matchClass", matchClass)
+                                .put("university", university ?: JSONObject.NULL)
+                                .put("department", department ?: JSONObject.NULL)
+                                .put("admission", admission ?: JSONObject.NULL)
+                                .put("departmentMatch", deptQuality)
+                                .put("admissionMatch", admissionQuality)
+                                .put("recordCount", 1)
+                                .put("recordTypes", JSONArray().put(recordType))
+                        } else {
+                            row.put("recordCount", row.optInt("recordCount", 0) + 1)
+                            val types = row.optJSONArray("recordTypes") ?: JSONArray().also { row.put("recordTypes", it) }
+                            if ((0 until types.length()).none { types.optString(it) == recordType }) types.put(recordType)
+                            if (row.optString("matchClass") != "accepted" && matchClass == "accepted") row.put("matchClass", "accepted")
+                        }
+                        if (matchClass == "accepted") exactFingerprints.getOrPut(app.identityKey) { linkedSetOf() }.add(c.getString(0))
+                    }
+                }
+            }
+        }
+
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.delete("canonical_applications", "session_id=?", arrayOf(sessionId))
+            for (app in apps) {
+                val universityId = CanonicalSixApplicationGraph.canonicalUniversityId(app.university)
+                val campusId = CanonicalSixApplicationGraph.canonicalCampusId(universityId, app.campus)
+                val unitId = CanonicalSixApplicationGraph.canonicalRecruitmentUnitId(universityId, app.year, app.department)
+                val trackId = CanonicalSixApplicationGraph.canonicalAdmissionTrackId(unitId, app.year, app.admission, app.admissionCategory)
+                val canonicalApplicationId = CanonicalSixApplicationGraph.canonicalApplicationId(app)
+                val coverage = CanonicalSixApplicationGraph.coverageJson(app)
+                val coverageCount = coverage.optInt("coveredCount", 0)
+                val fullCoverage = coverage.optBoolean("complete", false)
+                val matchRows = matches[app.identityKey]?.values?.toList().orEmpty()
+                val acceptedSignatures = matchRows.count { it.optString("matchClass") == "accepted" }
+                val provisionalSignatures = matchRows.count { it.optString("matchClass") == "provisional" }
+                val bindingQuality = when {
+                    acceptedSignatures == 1 -> "accepted"
+                    acceptedSignatures > 1 -> "provisional"
+                    provisionalSignatures > 0 -> "provisional"
+                    else -> "provider-only"
+                }
+                val qualityState = when {
+                    !fullCoverage -> "incomplete"
+                    bindingQuality == "accepted" -> "accepted"
+                    bindingQuality == "provisional" -> "provisional"
+                    else -> "provider-only"
+                }
+                val bindingJson = JSONObject()
+                    .put("schemaVersion", 1)
+                    .put("officialBaseline", "adiga")
+                    .put("bindingQuality", bindingQuality)
+                    .put("acceptedSignatures", acceptedSignatures)
+                    .put("provisionalSignatures", provisionalSignatures)
+                    .put("matches", JSONArray(matchRows))
+                    .put("doNotInferMissingBindings", true)
+
+                if (universityId != null && app.university != null) upsertCanonicalEntity(
+                    CanonicalEntity(universityId, com.admissionhub.collector.canonical.CanonicalEntityType.UNIVERSITY, null, app.university),
+                    JSONObject().put("source", "jinhak-same-card-mission").put("rawLabelPreserved", true)
+                )
+                if (campusId != null && app.campus != null) upsertCanonicalEntity(
+                    CanonicalEntity(campusId, com.admissionhub.collector.canonical.CanonicalEntityType.CAMPUS, null, app.campus, universityId),
+                    JSONObject().put("source", "jinhak-same-card-mission")
+                )
+                if (unitId != null && app.department != null) upsertCanonicalEntity(
+                    CanonicalEntity(unitId, com.admissionhub.collector.canonical.CanonicalEntityType.RECRUITMENT_UNIT, app.year, app.department, campusId ?: universityId),
+                    JSONObject().put("source", "jinhak-same-card-mission").put("canonicalization", "comparison-key-only")
+                )
+                if (trackId != null && app.admission != null) upsertCanonicalEntity(
+                    CanonicalEntity(trackId, com.admissionhub.collector.canonical.CanonicalEntityType.ADMISSION_TRACK, app.year, app.admission, unitId),
+                    JSONObject().put("source", "jinhak-same-card-mission").put("admissionCategory", app.admissionCategory ?: JSONObject.NULL)
+                )
+
+                val cv = ContentValues().apply {
+                    put("session_id", sessionId)
+                    put("application_identity_key", app.identityKey)
+                    put("canonical_application_id", canonicalApplicationId)
+                    put("academic_year", app.year)
+                    putNullable("canonical_university_id", universityId)
+                    putNullable("canonical_campus_id", campusId)
+                    putNullable("canonical_recruitment_unit_id", unitId)
+                    putNullable("canonical_admission_track_id", trackId)
+                    putNullable("university", app.university)
+                    putNullable("campus", app.campus)
+                    putNullable("department", app.department)
+                    putNullable("admission", app.admission)
+                    putNullable("admission_category", app.admissionCategory)
+                    if (app.capacity == null) putNull("capacity") else put("capacity", app.capacity)
+                    put("jinhak_confidence", app.confidence)
+                    put("parse_source", app.parseSource)
+                    put("coverage_json", coverage.toString())
+                    put("coverage_count", coverageCount)
+                    put("adiga_binding_quality", bindingQuality)
+                    put("adiga_match_count", matchRows.size)
+                    put("adiga_binding_json", bindingJson.toString())
+                    put("quality_state", qualityState)
+                    put("updated_at", Instant.now().toString())
+                }
+                db.insertOrThrow("canonical_applications", null, cv)
+
+                if (!jinhakRunId.isNullOrBlank()) {
+                    val update = ContentValues().apply {
+                        put("quality_state", qualityState)
+                        putNullable("canonical_university_id", universityId)
+                        putNullable("canonical_department_id", unitId)
+                        putNullable("canonical_admission_id", trackId)
+                    }
+                    db.update("records", update, "run_id=? AND application_identity_key=?", arrayOf(jinhakRunId, app.identityKey))
+                }
+                if (bindingQuality == "accepted" && !adigaRunId.isNullOrBlank()) {
+                    exactFingerprints[app.identityKey].orEmpty().forEach { fp ->
+                        val update = ContentValues().apply {
+                            put("quality_state", "accepted")
+                            putNullable("canonical_university_id", universityId)
+                            putNullable("canonical_department_id", unitId)
+                            putNullable("canonical_admission_id", trackId)
+                            put("application_identity_key", app.identityKey)
+                        }
+                        db.update("records", update, "run_id=? AND fingerprint=?", arrayOf(adigaRunId, fp))
+                    }
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        val audit = refreshCanonicalQualityAudit(sessionId)
+        return canonicalHubSummary(sessionId).put("rebuild", JSONObject()
+            .put("missionApplications", apps.size)
+            .put("qualityAuditGenerated", true)
+            .put("qualityAuditPublishState", audit.optString("publishState")))
+    }
+
+    fun loadCanonicalApplicationCandidates(sessionId: String): JSONArray {
+        val out = JSONArray()
+        if (sessionId.isBlank()) return out
+        readableDatabase.rawQuery(
+            "SELECT application_identity_key,canonical_application_id,academic_year,university,campus,department,admission,admission_category,capacity,jinhak_confidence,coverage_json,adiga_binding_quality,adiga_match_count,adiga_binding_json,quality_state,updated_at FROM canonical_applications WHERE session_id=? ORDER BY university,admission,department,application_identity_key",
+            arrayOf(sessionId)
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.put(JSONObject()
+                    .put("applicationIdentityKey", c.getString(0))
+                    .put("canonicalApplicationId", c.getString(1))
+                    .put("academicYear", c.getInt(2))
+                    .put("university", if (c.isNull(3)) JSONObject.NULL else c.getString(3))
+                    .put("campus", if (c.isNull(4)) JSONObject.NULL else c.getString(4))
+                    .put("department", if (c.isNull(5)) JSONObject.NULL else c.getString(5))
+                    .put("admission", if (c.isNull(6)) JSONObject.NULL else c.getString(6))
+                    .put("admissionCategory", if (c.isNull(7)) JSONObject.NULL else c.getString(7))
+                    .put("capacity", if (c.isNull(8)) JSONObject.NULL else c.getInt(8))
+                    .put("jinhakConfidence", c.getString(9))
+                    .put("coverage", runCatching { JSONObject(c.getString(10)) }.getOrDefault(JSONObject()))
+                    .put("adigaBindingQuality", c.getString(11))
+                    .put("adigaMatchCount", c.getInt(12))
+                    .put("adigaBinding", runCatching { JSONObject(c.getString(13)) }.getOrDefault(JSONObject()))
+                    .put("qualityState", c.getString(14))
+                    .put("displayLabel", CanonicalSixApplicationGraph.displayLabel(
+                        if (c.isNull(3)) null else c.getString(3),
+                        if (c.isNull(6)) null else c.getString(6),
+                        if (c.isNull(5)) null else c.getString(5),
+                        if (c.isNull(4)) null else c.getString(4)
+                    ))
+                    .put("updatedAt", c.getString(15)))
+            }
+        }
+        return out
+    }
+
+    fun loadHubApplicationSlots(): JSONArray {
+        val rows = linkedMapOf<Int, JSONObject>()
+        readableDatabase.rawQuery(
+            "SELECT slot,canonical_application_id,application_identity_key,display_label,user_pinned,updated_at FROM hub_application_slots ORDER BY slot",
+            emptyArray()
+        ).use { c ->
+            while (c.moveToNext()) rows[c.getInt(0)] = JSONObject()
+                .put("slot", c.getInt(0))
+                .put("occupied", true)
+                .put("canonicalApplicationId", c.getString(1))
+                .put("applicationIdentityKey", c.getString(2))
+                .put("displayLabel", c.getString(3))
+                .put("userPinned", c.getInt(4) != 0)
+                .put("updatedAt", c.getString(5))
+        }
+        val out = JSONArray()
+        for (slot in 1..CanonicalSixApplicationGraph.SLOT_COUNT) {
+            out.put(rows[slot] ?: JSONObject().put("slot", slot).put("occupied", false).put("userPinned", false))
+        }
+        return out
+    }
+
+    fun setHubApplicationSlot(sessionId: String, slot: Int, identityKey: String): JSONObject {
+        require(slot in 1..CanonicalSixApplicationGraph.SLOT_COUNT) { "slot out of range" }
+        val candidate = readableDatabase.rawQuery(
+            "SELECT canonical_application_id,university,admission,department,campus FROM canonical_applications WHERE session_id=? AND application_identity_key=? LIMIT 1",
+            arrayOf(sessionId, identityKey)
+        ).use { c ->
+            if (!c.moveToFirst()) null else JSONObject()
+                .put("canonicalApplicationId", c.getString(0))
+                .put("university", if (c.isNull(1)) JSONObject.NULL else c.getString(1))
+                .put("admission", if (c.isNull(2)) JSONObject.NULL else c.getString(2))
+                .put("department", if (c.isNull(3)) JSONObject.NULL else c.getString(3))
+                .put("campus", if (c.isNull(4)) JSONObject.NULL else c.getString(4))
+        } ?: return JSONObject().put("ok", false).put("error", "candidate-not-found")
+
+        fun existingSlotRow(db: SQLiteDatabase, targetSlot: Int): JSONObject? = db.rawQuery(
+            "SELECT canonical_application_id,application_identity_key,display_label,user_pinned,updated_at FROM hub_application_slots WHERE slot=? LIMIT 1",
+            arrayOf(targetSlot.toString())
+        ).use { c -> if (!c.moveToFirst()) null else JSONObject()
+            .put("canonicalApplicationId", c.getString(0))
+            .put("applicationIdentityKey", c.getString(1))
+            .put("displayLabel", c.getString(2))
+            .put("userPinned", c.getInt(3) != 0)
+            .put("updatedAt", c.getString(4)) }
+
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val currentAtTarget = existingSlotRow(db, slot)
+            val duplicateSlot = db.rawQuery(
+                "SELECT slot FROM hub_application_slots WHERE application_identity_key=? LIMIT 1",
+                arrayOf(identityKey)
+            ).use { c -> if (c.moveToFirst()) c.getInt(0) else null }
+            if (duplicateSlot != null && duplicateSlot != slot) {
+                if (currentAtTarget == null) {
+                    db.delete("hub_application_slots", "slot=?", arrayOf(duplicateSlot.toString()))
+                } else {
+                    val moved = ContentValues().apply {
+                        put("slot", duplicateSlot)
+                        put("canonical_application_id", currentAtTarget.getString("canonicalApplicationId"))
+                        put("application_identity_key", currentAtTarget.getString("applicationIdentityKey"))
+                        put("display_label", currentAtTarget.getString("displayLabel"))
+                        put("user_pinned", 1)
+                        put("updated_at", Instant.now().toString())
+                    }
+                    db.insertWithOnConflict("hub_application_slots", null, moved, SQLiteDatabase.CONFLICT_REPLACE)
+                }
+            }
+            val display = CanonicalSixApplicationGraph.displayLabel(
+                candidate.optString("university").takeIf { it.isNotBlank() && it != "null" },
+                candidate.optString("admission").takeIf { it.isNotBlank() && it != "null" },
+                candidate.optString("department").takeIf { it.isNotBlank() && it != "null" },
+                candidate.optString("campus").takeIf { it.isNotBlank() && it != "null" }
+            )
+            val cv = ContentValues().apply {
+                put("slot", slot)
+                put("canonical_application_id", candidate.getString("canonicalApplicationId"))
+                put("application_identity_key", identityKey)
+                put("display_label", display)
+                put("user_pinned", 1)
+                put("updated_at", Instant.now().toString())
+            }
+            db.insertWithOnConflict("hub_application_slots", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        val audit = refreshCanonicalQualityAudit(sessionId)
+        return JSONObject().put("ok", true).put("slot", slot).put("qualityAudit", audit)
+    }
+
+    fun clearHubApplicationSlot(sessionId: String, slot: Int): JSONObject {
+        require(slot in 1..CanonicalSixApplicationGraph.SLOT_COUNT) { "slot out of range" }
+        writableDatabase.delete("hub_application_slots", "slot=?", arrayOf(slot.toString()))
+        return JSONObject().put("ok", true).put("slot", slot).put("qualityAudit", refreshCanonicalQualityAudit(sessionId))
+    }
+
+    fun refreshCanonicalQualityAudit(sessionId: String): JSONObject {
+        val candidates = loadCanonicalApplicationCandidates(sessionId)
+        val byIdentity = linkedMapOf<String, JSONObject>()
+        var accepted = 0
+        var provisional = 0
+        var providerOnly = 0
+        var incomplete = 0
+        var fullCoverage = 0
+        for (i in 0 until candidates.length()) {
+            val item = candidates.optJSONObject(i) ?: continue
+            byIdentity[item.optString("applicationIdentityKey")] = item
+            if (item.optJSONObject("coverage")?.optBoolean("complete", false) == true) fullCoverage += 1
+            when (item.optString("qualityState")) {
+                "accepted" -> accepted += 1
+                "provisional" -> provisional += 1
+                "provider-only" -> providerOnly += 1
+                else -> incomplete += 1
+            }
+        }
+        val slots = loadHubApplicationSlots()
+        var selected = 0
+        var resolvable = 0
+        var selectedFullCoverage = 0
+        var selectedAccepted = 0
+        var selectedProvisional = 0
+        var selectedProviderOnly = 0
+        val selectedIdentities = linkedSetOf<String>()
+        val staleSlots = JSONArray()
+        for (i in 0 until slots.length()) {
+            val slot = slots.optJSONObject(i) ?: continue
+            if (!slot.optBoolean("occupied", false)) continue
+            selected += 1
+            val identity = slot.optString("applicationIdentityKey")
+            if (identity.isNotBlank()) selectedIdentities += identity
+            val candidate = byIdentity[identity]
+            if (candidate == null) {
+                staleSlots.put(slot.optInt("slot"))
+                continue
+            }
+            resolvable += 1
+            if (candidate.optJSONObject("coverage")?.optBoolean("complete", false) == true) selectedFullCoverage += 1
+            when (candidate.optString("qualityState")) {
+                "accepted" -> selectedAccepted += 1
+                "provisional" -> selectedProvisional += 1
+                "provider-only" -> selectedProviderOnly += 1
+            }
+        }
+        val blockers = JSONArray()
+        if (selected < CanonicalSixApplicationGraph.SLOT_COUNT) blockers.put("six-application-selection-incomplete")
+        if (selectedIdentities.size != selected) blockers.put("duplicate-application-slot")
+        if (staleSlots.length() > 0) blockers.put("stale-slot-binding")
+        if (selectedFullCoverage < selected) blockers.put("selected-application-core-coverage-incomplete")
+        val warnings = JSONArray()
+        if (selectedProvisional > 0) warnings.put("selected-provisional-adiga-binding")
+        if (selectedProviderOnly > 0) warnings.put("selected-provider-only-no-safe-adiga-binding")
+        val observations = observationStats(sessionId)
+        if (observations.optInt("unknownOrPotential", 0) > 0) warnings.put("unclassified-observations-preserved")
+        val hubReady = selected == CanonicalSixApplicationGraph.SLOT_COUNT &&
+            selectedIdentities.size == CanonicalSixApplicationGraph.SLOT_COUNT &&
+            resolvable == CanonicalSixApplicationGraph.SLOT_COUNT &&
+            selectedFullCoverage == CanonicalSixApplicationGraph.SLOT_COUNT
+        val publishState = when {
+            !hubReady && selected < CanonicalSixApplicationGraph.SLOT_COUNT -> "WAITING_FOR_USER_SELECTION"
+            !hubReady -> "BLOCKED_QUALITY"
+            selectedProvisional > 0 || selectedProviderOnly > 0 -> "READY_WITH_WARNINGS"
+            else -> "READY"
+        }
+        val audit = JSONObject()
+            .put("schemaVersion", 1)
+            .put("generatedAt", Instant.now().toString())
+            .put("candidateCount", candidates.length())
+            .put("fullCoreCoverageCandidates", fullCoverage)
+            .put("candidateQuality", JSONObject()
+                .put("accepted", accepted)
+                .put("provisional", provisional)
+                .put("providerOnly", providerOnly)
+                .put("incomplete", incomplete))
+            .put("sixSlots", JSONObject()
+                .put("required", CanonicalSixApplicationGraph.SLOT_COUNT)
+                .put("selected", selected)
+                .put("uniqueSelected", selectedIdentities.size)
+                .put("resolvable", resolvable)
+                .put("fullCoreCoverage", selectedFullCoverage)
+                .put("accepted", selectedAccepted)
+                .put("provisional", selectedProvisional)
+                .put("providerOnly", selectedProviderOnly)
+                .put("staleSlots", staleSlots)
+                .put("userControlled", true)
+                .put("externalCollectionMayMutate", false))
+            .put("hubReady", hubReady)
+            .put("publishState", publishState)
+            .put("blockers", blockers)
+            .put("warnings", warnings)
+            .put("observationCoverage", observations)
+            .put("predictionDoesNotOverwriteHistoricalActual", true)
+            .put("doNotInferMissingBindings", true)
+        val cv = ContentValues().apply {
+            put("session_id", sessionId)
+            put("audit_json", audit.toString())
+            put("generated_at", Instant.now().toString())
+        }
+        writableDatabase.insertWithOnConflict("hub_quality_audits", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        return audit
+    }
+
+    fun canonicalHubSummary(sessionId: String): JSONObject {
+        val candidates = loadCanonicalApplicationCandidates(sessionId)
+        val slots = loadHubApplicationSlots()
+        val audit = readableDatabase.rawQuery(
+            "SELECT audit_json FROM hub_quality_audits WHERE session_id=? LIMIT 1",
+            arrayOf(sessionId)
+        ).use { c ->
+            if (c.moveToFirst()) runCatching { JSONObject(c.getString(0)) }.getOrNull() else null
+        } ?: refreshCanonicalQualityAudit(sessionId)
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("candidateGraph", candidates)
+            .put("slots", slots)
+            .put("qualityAudit", audit)
+            .put("slotPolicy", JSONObject()
+                .put("slots", CanonicalSixApplicationGraph.SLOT_COUNT)
+                .put("userControlsAddChangeReplaceOrder", true)
+                .put("externalCollectionAutoSelection", false))
     }
 
     private fun nullableInt(obj: JSONObject, key: String): Int? =

@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Collector v0.9.26 Incomplete Coverage Recovery Fence"
+        android:label="Admission Hub v0.10.0 Canonical Six Graph"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
