@@ -1,0 +1,33 @@
+name: Inspect v0.9.19 Source Temp
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/inspect-v0919-source-temp.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect relevant source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== VERSION FILES ==='
+          grep -RIn --exclude-dir=.git -E '0\.9\.19|109190|Mission Cell|VERSION=' app build.gradle* gradle.properties .github/workflows 2>/dev/null | head -120 || true
+          echo '=== RENDERER HANDLERS ==='
+          grep -nE 'RenderProcessGone|onRenderProcessGone|renderer.*Gone|didCrash|runtimeRenderer' app/src/main/java/com/admissionhub/collector/MainActivity.kt | head -100 || true
+          echo '=== CLOUD OFFLOAD CALLS IN MAIN ==='
+          grep -nE 'cloudOffload\.|CloudOffload|upload|checkpoint|enqueue|finishRun|createRun' app/src/main/java/com/admissionhub/collector/MainActivity.kt | head -180 || true
+          echo '=== CLOUD COORDINATOR API ==='
+          grep -RIn -E 'class CloudOffload|fun |suspend fun|/v1/runs|chunks|finish' app/src/main/java/com/admissionhub/collector/cloud | head -220 || true
+          echo '=== JINHAK CAPTURE STORE CALLS ==='
+          grep -nE 'storeUnifiedAnalysisCapture|storeObservationEvidence|batchRecords|lastJinhakDigest|mission-target-confirmed|persistLiveJinhakDiagnostics' app/src/main/java/com/admissionhub/collector/MainActivity.kt | head -220 || true
+          echo '=== RELEVANT MAIN CONTEXT ==='
+          for n in $(grep -nE 'onRenderProcessGone|storeUnifiedAnalysisCapture|mission-target-confirmed' app/src/main/java/com/admissionhub/collector/MainActivity.kt | cut -d: -f1 | head -20); do
+            s=$((n>18?n-18:1)); e=$((n+45)); echo "--- lines $s-$e ---"; sed -n "${s},${e}p" app/src/main/java/com/admissionhub/collector/MainActivity.kt; done
