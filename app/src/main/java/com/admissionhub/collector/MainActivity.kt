@@ -23,7 +23,6 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -35,6 +34,7 @@ import com.admissionhub.collector.capture.SnapshotScript
 import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.hub.HubDashboardModel
+import com.admissionhub.collector.hub.HubFirstLayoutPolicy
 import com.admissionhub.collector.observation.ObservationEvidence
 import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
 import com.admissionhub.collector.jinhak.JinhakAgentNavigator
@@ -74,7 +74,9 @@ class MainActivity : Activity() {
     private lateinit var hubManageButton: Button
     private lateinit var hubRecoveryButton: Button
     private lateinit var hubDashboardStatus: TextView
-    private lateinit var hubDashboardScroll: HorizontalScrollView
+    private lateinit var hubDashboardGrid: LinearLayout
+    private lateinit var hubAdvancedPanel: LinearLayout
+    private lateinit var hubAdvancedToggle: Button
     private val hubDashboardCards = mutableListOf<TextView>()
     private var hubDashboardLastModel = JSONObject()
     private lateinit var cloudOffload: CloudOffloadCoordinator
@@ -486,8 +488,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.11.0"
-        private const val BUILD_CODE = 111000
+        private const val VERSION = "0.11.1"
+        private const val BUILD_CODE = 111010
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -723,37 +725,51 @@ class MainActivity : Activity() {
 
         hubDashboardStatus = TextView(this).apply {
             text = "대시보드 상태를 불러오는 중…"
-            textSize = 16f
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            textSize = 17f
+            gravity = Gravity.CENTER_VERTICAL
+            setTextColor(android.graphics.Color.WHITE)
+            setBackgroundColor(android.graphics.Color.rgb(37, 52, 78))
+            setPadding(dp(16), dp(12), dp(16), dp(12))
             setOnClickListener { refreshHubDashboardFromStore("manual-banner-refresh") }
         }
-        val dashboardCardRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.TOP
-            setPadding(dp(4), dp(4), dp(4), dp(4))
+        val dashboardWidthDp = resources.configuration.screenWidthDp.takeIf { it > 0 } ?: 720
+        val dashboardColumns = HubFirstLayoutPolicy.columnsForWidthDp(dashboardWidthDp)
+        val dashboardCardHeight = dp(HubFirstLayoutPolicy.cardHeightDp(dashboardWidthDp))
+        hubDashboardGrid = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), dp(6), dp(6), dp(8))
         }
         hubDashboardCards.clear()
-        repeat(6) { index ->
-            val card = TextView(this).apply {
-                text = "${index + 1}. 지원안 데이터 준비 중"
-                textSize = 15f
+        var cardIndex = 0
+        while (cardIndex < 6) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.TOP
-                minHeight = dp(150)
-                setPadding(dp(14), dp(12), dp(14), dp(12))
-                setLineSpacing(0f, 1.12f)
-                isClickable = true
-                isFocusable = true
-                setBackgroundColor(android.graphics.Color.rgb(246, 246, 246))
-                setOnClickListener { showHubDashboardCard(index + 1) }
             }
-            hubDashboardCards.add(card)
-            dashboardCardRow.addView(card, LinearLayout.LayoutParams(dp(292), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(dp(4), dp(2), dp(4), dp(6))
-            })
-        }
-        hubDashboardScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = true
-            addView(dashboardCardRow)
+            repeat(dashboardColumns) {
+                if (cardIndex < 6) {
+                    val index = cardIndex
+                    val card = TextView(this).apply {
+                        text = "${index + 1}. 지원안 데이터 준비 중"
+                        textSize = 16f
+                        gravity = Gravity.TOP
+                        minHeight = dashboardCardHeight
+                        setPadding(dp(14), dp(14), dp(14), dp(14))
+                        isClickable = true
+                        isFocusable = true
+                        setBackgroundColor(android.graphics.Color.rgb(246, 246, 246))
+                        setOnClickListener { showHubDashboardCard(index + 1) }
+                    }
+                    hubDashboardCards.add(card)
+                    row.addView(card, LinearLayout.LayoutParams(0, dashboardCardHeight, 1f).apply {
+                        setMargins(dp(5), dp(5), dp(5), dp(5))
+                    })
+                    cardIndex += 1
+                } else {
+                    row.addView(View(this), LinearLayout.LayoutParams(0, dashboardCardHeight, 1f))
+                }
+            }
+            hubDashboardGrid.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         }
 
         status = TextView(this).apply {
@@ -802,17 +818,45 @@ class MainActivity : Activity() {
         }
         val scroll = ScrollView(this).apply { addView(preview) }
 
-        root.addView(tabs)
-        root.addView(sessionRow)
-        root.addView(actions1)
-        root.addView(actions2)
-        root.addView(actions3)
-        root.addView(hubRow)
+        actions3.removeView(unifiedButton)
+        hubRow.removeView(hubManageButton)
+        hubRow.removeView(hubRecoveryButton)
+
+        val primaryActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+        }
+        primaryActions.addView(unifiedButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        primaryActions.addView(hubManageButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        primaryActions.addView(hubRecoveryButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        hubAdvancedToggle = Button(this).apply { text = "고급 도구" }
+        primaryActions.addView(hubAdvancedToggle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        hubAdvancedPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = if (HubFirstLayoutPolicy.advancedToolsInitiallyVisible) View.VISIBLE else View.GONE
+            setPadding(dp(4), dp(4), dp(4), dp(8))
+        }
+        hubAdvancedPanel.addView(tabs)
+        hubAdvancedPanel.addView(sessionRow)
+        hubAdvancedPanel.addView(actions1)
+        hubAdvancedPanel.addView(actions2)
+        hubAdvancedPanel.addView(actions3)
+        hubAdvancedPanel.addView(hubRow)
+        hubAdvancedPanel.addView(status)
+        hubAdvancedPanel.addView(browserStack, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(320)))
+        hubAdvancedPanel.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(180)))
+        hubAdvancedToggle.setOnClickListener {
+            val opening = hubAdvancedPanel.visibility != View.VISIBLE
+            hubAdvancedPanel.visibility = if (opening) View.VISIBLE else View.GONE
+            hubAdvancedToggle.text = if (opening) "고급 도구 닫기" else "고급 도구"
+        }
+
         root.addView(hubDashboardStatus)
-        root.addView(hubDashboardScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        root.addView(status)
-        root.addView(browserStack, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f))
-        root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 2f))
+        root.addView(primaryActions)
+        root.addView(hubDashboardGrid, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        root.addView(hubAdvancedPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         setContentView(root)
     }
 
@@ -869,6 +913,12 @@ class MainActivity : Activity() {
             if (providerOnly > 0) append(" · 공식결합없음 ").append(providerOnly)
         }
         hubDashboardStatus.text = "${sync.optString("stateLabel", "대기")} · ${sync.optString("progressText", "진행 수치 대기")}$ageText\n지원 6장 ${summary.optInt("resolvable", 0)}/6 · 핵심자료 ${summary.optInt("fullCoreCoverage", 0)}/6 · $qualityText"
+        if (::sessionState.isInitialized) {
+            sessionState.text = "통합 상태: ${sync.optString("stateLabel", "대기")} · ${sync.optString("progressText", "진행 수치 대기")}$ageText"
+        }
+        if (::hubState.isInitialized) {
+            hubState.text = "지원 6장 ${summary.optInt("resolvable", 0)}/6 · 핵심자료 ${summary.optInt("fullCoreCoverage", 0)}/6 · $qualityText"
+        }
 
         val cards = model.optJSONArray("cards") ?: JSONArray()
         for (index in hubDashboardCards.indices) {
@@ -876,6 +926,16 @@ class MainActivity : Activity() {
             val card = cards.optJSONObject(index) ?: JSONObject().put("slot", index + 1).put("occupied", false)
             val occupied = card.optBoolean("occupied", false)
             val resolvable = card.optBoolean("resolvable", false)
+            val qualityState = card.optString("qualityState", "unknown")
+            view.setBackgroundColor(when {
+                !occupied -> android.graphics.Color.rgb(247, 247, 247)
+                !resolvable -> android.graphics.Color.rgb(255, 239, 239)
+                qualityState == "accepted" -> android.graphics.Color.rgb(236, 247, 239)
+                qualityState == "provisional" -> android.graphics.Color.rgb(255, 249, 226)
+                qualityState == "provider-only" -> android.graphics.Color.rgb(242, 244, 247)
+                else -> android.graphics.Color.rgb(246, 246, 246)
+            })
+            view.setTextColor(android.graphics.Color.rgb(32, 36, 43))
             view.text = when {
                 !occupied -> "${index + 1}. — 비어 있음 —\n\n지원 6장 관리에서 선택"
                 !resolvable -> "${index + 1}. ${card.optString("title", "연결 확인 필요")}\n\ncanonical 연결 복구 필요"
@@ -886,7 +946,7 @@ class MainActivity : Activity() {
                     val capacity = if (card.has("capacity") && !card.isNull("capacity")) "모집 ${card.optInt("capacity")}명" else "모집인원 미확인"
                     val coverage = "Jinhak 핵심 ${card.optInt("coverageCount", 0)}/5"
                     val official = card.optString("qualityLabel", "데이터 품질 확인 필요")
-                    "${index + 1}. $university\n$department\n$subtitle\n\n$capacity · $coverage\n$official"
+                    "${index + 1}. $university\n$department\n$subtitle\n\n$capacity\n$coverage\n$official"
                 }
             }
         }
