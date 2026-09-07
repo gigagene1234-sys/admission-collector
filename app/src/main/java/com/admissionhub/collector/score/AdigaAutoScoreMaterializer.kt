@@ -1,6 +1,7 @@
 package com.admissionhub.collector.score
 
 import com.admissionhub.collector.canonical.AdigaApplicationEvidenceAnalyzer
+import com.admissionhub.collector.canonical.AdigaFullEvidenceRescan
 import com.admissionhub.collector.local.LocalCollectorStore
 import org.json.JSONArray
 import org.json.JSONObject
@@ -10,7 +11,7 @@ import org.json.JSONObject
  * No slot is added, removed, reordered or replaced here.
  */
 object AdigaAutoScoreMaterializer {
-    const val SCHEMA_VERSION = 1
+    const val SCHEMA_VERSION = 2
 
     fun materializeSelected(store: LocalCollectorStore, sessionId: String, profile: JSONObject = store.currentStudentScoreProfile()): JSONObject {
         if (sessionId.isBlank()) return JSONObject().put("schemaVersion", SCHEMA_VERSION).put("error", "missing-session")
@@ -20,10 +21,14 @@ object AdigaAutoScoreMaterializer {
         val slots = store.loadHubApplicationSlots()
         val selected = (0 until slots.length()).mapNotNull { slots.optJSONObject(it)?.optString("applicationIdentityKey") }
             .filter { it.isNotBlank() }.distinct()
+        val selectedCandidates = selected.mapNotNull { byIdentity[it] }
+        val fullRescan = AdigaFullEvidenceRescan.scanSelected(store, sessionId, selectedCandidates)
+        val fullByIdentity = fullRescan.optJSONObject("byIdentity") ?: JSONObject()
 
         var conversionsVerified = 0
         var conversionsHeld = 0
         var historicalOutcomesStored = 0
+        var directHistoricalRowsFound = 0
         val results = JSONArray()
 
         for (identity in selected) {
@@ -32,6 +37,7 @@ object AdigaAutoScoreMaterializer {
             val calculated = OfficialUniversityScoreCalculator.calculate(candidate, profile)
             val verified = calculated.optBoolean("verified", false) && calculated.optString("status") == "verified"
             val directIdentityBinding = official.optInt("currentApplicationBoundCount", 0) > 0
+            val scoringScopeBinding = verified && official.optBoolean("currentComponentsVerified", false)
             store.upsertUniversityConversionResult(
                 applicationIdentityKey = identity,
                 academicYear = candidate.optInt("academicYear"),
@@ -46,12 +52,30 @@ object AdigaAutoScoreMaterializer {
                 status = calculated.optString("status", "unverified"),
                 detail = JSONObject(calculated.optJSONObject("detail")?.toString() ?: "{}")
                     .put("currentComponentsVerified", official.optBoolean("currentComponentsVerified", false))
+                    .put("scoringScopeBindingVerified", scoringScopeBinding)
                     .put("directCurrentApplicationBinding", directIdentityBinding)
                     .put("officialEvidenceCode", official.optString("code"))
+                    .put("fullAdigaRescan", true)
             )
             if (verified) conversionsVerified++ else conversionsHeld++
 
-            val historical = official.optJSONArray("historicalOutcomes") ?: JSONArray()
+            val fullEvidence = fullByIdentity.optJSONArray(identity) ?: JSONArray()
+            val historical = JSONArray()
+            val seenHistorical = linkedSetOf<String>()
+            for (i in 0 until fullEvidence.length()) {
+                val evidence = fullEvidence.optJSONObject(i) ?: continue
+                if (evidence.optString("scope") !in setOf("historical", "table-segment-historical")) continue
+                if (evidence.optString("departmentMatch") !in setOf("exact", "suffix-equivalent")) continue
+                if (evidence.optString("admissionMatch") != "exact") continue
+                val outcome = evidence.optJSONObject("historicalOutcome") ?: continue
+                val key = listOf(
+                    outcome.optInt("historicalResultYear", outcome.optInt("recordYear", 0)),
+                    outcome.optString("admissionLabel"), outcome.optString("recruitmentUnit"), outcome.optString("rowEvidence")
+                ).joinToString("|")
+                if (seenHistorical.add(key)) historical.put(JSONObject(outcome.toString()).put("sourcePage", evidence.optString("sourcePage")))
+            }
+            directHistoricalRowsFound += historical.length()
+
             for (i in 0 until historical.length()) {
                 val outcome = historical.optJSONObject(i) ?: continue
                 val resultYear = outcome.optInt("historicalResultYear", outcome.optInt("recordYear", 0))
@@ -102,6 +126,7 @@ object AdigaAutoScoreMaterializer {
                 .put("officialEvidenceCode", official.optString("code"))
                 .put("currentComponentsVerified", official.optBoolean("currentComponentsVerified", false))
                 .put("directCurrentBinding", directIdentityBinding)
+                .put("scoringScopeBindingVerified", scoringScopeBinding)
                 .put("conversionStatus", calculated.optString("status"))
                 .put("conversionVerified", verified)
                 .put("historicalOutcomeRows", historical.length()))
@@ -112,9 +137,12 @@ object AdigaAutoScoreMaterializer {
             .put("selected", selected.size)
             .put("conversionsVerified", conversionsVerified)
             .put("conversionsHeld", conversionsHeld)
+            .put("directHistoricalRowsFound", directHistoricalRowsFound)
             .put("historicalOutcomesStored", historicalOutcomesStored)
+            .put("fullAdigaRecordsScanned", fullRescan.optInt("recordsScanned"))
             .put("results", results)
             .put("slotsMutated", false)
+            .put("networkUsed", false)
             .put("probabilityInferred", false)
     }
 
