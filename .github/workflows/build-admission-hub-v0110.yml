@@ -26,6 +26,9 @@ jobs:
       - name: Apply v0.11.0 dashboard patch
         run: python3 .github/scripts/patch_v0110.py
 
+      - name: Apply v0.11.0 compile hotfix
+        run: python3 .github/scripts/patch_v0110_compile_hotfix.py
+
       - name: Verify cumulative safety and dashboard invariants
         shell: bash
         run: |
