@@ -73,4 +73,16 @@ class AdigaApplicationEvidenceAnalyzerTest {
         assertEquals(0, out.getInt("historicalApplicationBoundCount"))
         assertTrue(out.getJSONArray("missing").toString().contains("과거 입결"))
     }
+
+    @Test fun authoritativeHistoricalSegmentCountSurvivesBoundedSampleTruncation() {
+        val matches = JSONArray().put(JSONObject().put("departmentMatch", "exact").put("admissionMatch", "missing"))
+        val ev = JSONArray().put(row(2027, "university-current", "none", "exact", "지역인재교과"))
+        val c = candidate(ev, matches, 59)
+        c.getJSONObject("adigaBinding").put("officialTableSegmentHistorical", 1)
+        val out = AdigaApplicationEvidenceAnalyzer.analyze(c)
+        assertEquals("CURRENT_COMPONENTS_AND_HISTORICAL_BOUND", out.getString("code"))
+        assertEquals(1, out.getInt("historicalApplicationBoundCount"))
+        assertTrue(out.getBoolean("boundedEvidenceSampleTruncated"))
+        assertTrue(out.getString("label").contains("과거 동일 조합 입결"))
+    }
 }
