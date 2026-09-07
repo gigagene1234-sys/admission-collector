@@ -24,11 +24,24 @@ class ScoreDecisionEngineTest {
     }
 
     @Test
-    fun provisionalCanonicalBindingBlocksDecisionWithoutIndependentBindingProof() {
+    fun provisionalCanonicalBindingBlocksDecisionWithoutDirectOrScoringScopeProof() {
         val conversion = verifiedConversion(930.0, "points-1000", "higher-is-better")
         val outcomes = JSONArray().put(verifiedOutcome(920.0, "points-1000", true))
         val result = ScoreDecisionEngine.evaluate("provisional", conversion, outcomes, null)
-        assertEquals("UNVERIFIED_APPLICATION_BINDING", result.getString("decisionCode"))
+        assertEquals("UNVERIFIED_SCORING_SCOPE", result.getString("decisionCode"))
+    }
+
+    @Test
+    fun explicitScoringScopeCanCompareWithoutPretendingDirectRowBinding() {
+        val conversion = verifiedConversion(930.0, "points-1000", "higher-is-better")
+            .put("identityBindingVerified", false)
+            .put("detail", JSONObject().put("scoringScopeBindingVerified", true))
+        val outcomes = JSONArray().put(verifiedOutcome(920.0, "points-1000", true))
+        val result = ScoreDecisionEngine.evaluate("provisional", conversion, outcomes, null)
+        assertFalse(result.getBoolean("hold"))
+        assertTrue(result.getBoolean("scoringScopeBindingVerified"))
+        assertFalse(result.getBoolean("directApplicationBindingVerified"))
+        assertEquals("ABOVE_REFERENCE", result.getString("decisionCode"))
     }
 
     @Test
