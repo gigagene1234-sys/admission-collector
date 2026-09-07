@@ -1,5 +1,6 @@
 package com.admissionhub.collector.canonical
 
+import org.json.JSONArray
 import org.json.JSONObject
 
 object AdigaOfficialAdmissionEvidence {
@@ -18,9 +19,7 @@ object AdigaOfficialAdmissionEvidence {
         val rows = mutableListOf<List<String>>()
         for (ri in 0 until rowsJson.length()) {
             val row = rowsJson.optJSONArray(ri)
-            val cells = if (row == null) emptyList() else (0 until row.length())
-                .map { row.optString(it).trim() }
-                .filter { it.isNotBlank() }
+            val cells = if (row == null) emptyList() else (0 until row.length()).map { row.optString(it).trim() }
             rows += cells
         }
         val out = mutableListOf<JSONObject>()
@@ -28,7 +27,7 @@ object AdigaOfficialAdmissionEvidence {
 
         for (ri in rows.indices) {
             val cells = rows[ri]
-            if (cells.isEmpty()) continue
+            if (cells.all { it.isBlank() }) continue
             val admissionQuality = AdigaOfficialTableBindingPolicy.admissionEvidenceQuality(cells, app.admission, app.admissionCategory)
             if (admissionQuality == "none") continue
             val departmentQuality = AdigaOfficialTableBindingPolicy.departmentEvidenceQuality(cells, app.department)
@@ -38,12 +37,13 @@ object AdigaOfficialAdmissionEvidence {
                 currentYear -> "university-current"
                 else -> "historical"
             }
-            out += baseEvidence(recordType, recordYear, record)
+            out += baseEvidence(recordType, recordYear, record, metrics)
                 .put("rowIndex", ri)
                 .put("scope", scope)
                 .put("departmentMatch", departmentQuality)
                 .put("admissionMatch", admissionQuality)
-                .put("rowEvidence", cells.joinToString(" | ").take(1200))
+                .put("rowEvidence", cells.filter { it.isNotBlank() }.joinToString(" | ").take(1600))
+                .put("rowCells", JSONArray(cells))
                 .put("bindingMethod", "same-row-or-university-evidence")
         }
 
@@ -53,24 +53,35 @@ object AdigaOfficialAdmissionEvidence {
         for (binding in segmentBindings) {
             val scopeCells = rows.getOrElse(binding.scopeRowIndex) { emptyList() }
             val departmentCells = rows.getOrElse(binding.departmentRowIndex) { emptyList() }
-            out += baseEvidence(recordType, recordYear, record)
+            val evidence = baseEvidence(recordType, recordYear, record, metrics)
                 .put("scope", if (currentYear) "table-segment-current" else "table-segment-historical")
                 .put("scopeRowIndex", binding.scopeRowIndex)
                 .put("departmentRowIndex", binding.departmentRowIndex)
                 .put("scopeLabel", binding.scopeLabel)
                 .put("departmentMatch", binding.departmentMatch)
                 .put("admissionMatch", binding.admissionMatch)
-                .put("scopeRowEvidence", scopeCells.joinToString(" | ").take(1000))
-                .put("departmentRowEvidence", departmentCells.joinToString(" | ").take(1000))
+                .put("scopeRowEvidence", scopeCells.filter { it.isNotBlank() }.joinToString(" | ").take(1200))
+                .put("departmentRowEvidence", departmentCells.filter { it.isNotBlank() }.joinToString(" | ").take(1600))
+                .put("scopeCells", JSONArray(scopeCells))
+                .put("departmentCells", JSONArray(departmentCells))
                 .put("bindingMethod", "same-official-table-explicit-scope-segment")
                 .put("sameOfficialTableSegment", true)
+            if (recordType == "historical-admission-result-table") {
+                AdigaHistoricalOutcomeExtractor.extract(rows, binding.scopeRowIndex, binding.departmentRowIndex, metrics, recordYear)?.let {
+                    evidence.put("historicalOutcome", it)
+                }
+            }
+            out += evidence
         }
         return dedupe(out)
     }
 
-    private fun baseEvidence(recordType: String, recordYear: Int, record: JSONObject): JSONObject = JSONObject()
+    private fun baseEvidence(recordType: String, recordYear: Int, record: JSONObject, metrics: JSONObject): JSONObject = JSONObject()
         .put("recordType", recordType)
         .put("recordYear", recordYear)
+        .put("admissionYear", metrics.optInt("admissionYear", 0))
+        .put("historicalResultYear", metrics.optInt("historicalResultYear", 0))
+        .put("tableIndex", metrics.optInt("tableIndex", -1))
         .put("sourcePage", record.optString("sourcePage").take(500))
         .put("sourceRowFingerprint", record.optString("sourceRowFingerprint").take(100))
         .put("officialSource", true)
