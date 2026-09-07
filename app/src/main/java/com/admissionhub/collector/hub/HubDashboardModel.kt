@@ -6,7 +6,7 @@ import com.admissionhub.collector.score.ApplicationReviewEngine
 
 /** Read-only presentation model over persisted canonical, sync, and score-decision evidence. */
 object HubDashboardModel {
-    const val SCHEMA_VERSION = 2
+    const val SCHEMA_VERSION = 3
     const val SLOT_COUNT = 6
 
     fun build(
@@ -91,6 +91,7 @@ object HubDashboardModel {
 
         val coverage = candidate.optJSONObject("coverage") ?: JSONObject()
         val binding = candidate.optJSONObject("adigaBinding") ?: JSONObject()
+        val official = com.admissionhub.collector.canonical.AdigaApplicationEvidenceAnalyzer.analyze(candidate)
         val university = candidate.nullableString("university")
         val department = candidate.nullableString("department")
         val admission = candidate.nullableString("admission")
@@ -106,7 +107,8 @@ object HubDashboardModel {
             .put("capacity", capacity ?: JSONObject.NULL)
             .put("title", listOfNotNull(university, department).joinToString(" · ").ifBlank { "$slot. 지원안" })
             .put("subtitle", listOfNotNull(admission, campus?.let { "[$it]" }).joinToString(" · "))
-            .put("qualityState", quality).put("qualityLabel", qualityLabel(quality))
+            .put("qualityState", quality).put("qualityLabel", official.optString("label", qualityLabel(quality)))
+            .put("officialEvidence", official)
             .put("coverageCount", coverage.optInt("coveredCount", 0)).put("coverageComplete", coverage.optBoolean("complete", false))
             .put("missingLanes", coverage.optJSONArray("missing") ?: JSONArray())
             .put("updatedAt", candidate.optString("updatedAt"))
@@ -171,9 +173,9 @@ object HubDashboardModel {
     }
 
     fun qualityLabel(state: String): String = when (state) {
-        "accepted" -> "공식 전형 연결 확인"
-        "provisional" -> "공식 전형 연결 확인 필요"
-        "provider-only" -> "진학사 중심 · 공식 결합 없음"
+        "accepted" -> "공식 전형·모집단위 직접 연결"
+        "provisional" -> "공식자료 연결 근거를 항목별로 확인하세요"
+        "provider-only" -> "진학사 중심 · 어디가 직접 결합 없음"
         "incomplete" -> "수집 보강 필요"
         "stale" -> "canonical 연결 복구 필요"
         "empty" -> "지원안 미선택"

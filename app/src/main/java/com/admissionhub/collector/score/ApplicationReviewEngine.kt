@@ -52,13 +52,18 @@ object ApplicationReviewEngine {
         val identity = candidate.optString("applicationIdentityKey")
         val binding = rawInput.optString("applicationIdentityKey") == identity && rawInput.optInt("academicYear") == year && identity.isNotBlank()
         val sourceReviewed = binding && input.optBoolean("sourceReviewConfirmed")
+        val officialEvidence = com.admissionhub.collector.canonical.AdigaApplicationEvidenceAnalyzer.analyze(candidate)
         val completeProfile = profile.optString("status") == "IMPORTED" && profile.optInt("academicYear") == year && profile.optBoolean("completeTranscriptConfirmedByUser")
         val profileCurrent = completeProfile && profile.optString("fingerprint").isNotBlank() && input.optString("profileFingerprint") == profile.optString("fingerprint")
         fun required(ok: Boolean, text: String) { if (!ok) missing.put(text) }
         required(binding, "이 지원안에 연결된 근거 등록")
         required(completeProfile, "과목별 성적 입력 및 전체 입력 확인")
         required(profileCurrent, "현재 성적을 기준으로 대학 환산값 재확인")
-        required(sourceReviewed, "공식 출처의 전형·학과·산식·입결 행 확인")
+        if (!sourceReviewed) {
+            val officialMissing = officialEvidence.optJSONArray("missing") ?: JSONArray()
+            if (officialMissing.length() == 0) missing.put("공식 원문에서 전형·모집단위·연도와 현재 성적 기준을 사용자 확인")
+            else for (i in 0 until officialMissing.length()) missing.put("어디가 연결: ${officialMissing.optString(i)}")
+        }
         required(officialUrl(input.optString("formulaSource")) && input.optString("formulaExcerpt").isNotBlank(), "공식 환산 출처와 산식 근거")
         required(officialUrl(input.optString("outcomeSource")) && input.optString("outcomeExcerpt").isNotBlank(), "공식 과거 입결 출처와 해당 행 근거")
         required(input.optString("scoreScale").isNotBlank() && input.optString("scoreScale") !in setOf("null", "미확인", "unknown", "-") && input.optString("methodDescription").isNotBlank(), "동일한 점수 척도·반영방법 확인")
@@ -104,6 +109,7 @@ object ApplicationReviewEngine {
             else -> "자료 보완 후 판단"
         }
         return JSONObject().put("applicationIdentityKey", identity).put("academicYear", year).put("code", code).put("label", label)
+            .put("officialEvidence", officialEvidence)
             .put("comparisonReady", comparisonReady).put("relation", relation).put("advantageMargin", margin ?: JSONObject.NULL)
             .put("missing", missing).put("risks", risks).put("reasons", reasons).put("input", input.put("applicationIdentityKey", rawInput.optString("applicationIdentityKey")).put("academicYear", rawInput.optInt("academicYear")))
             .put("prediction", prediction ?: JSONObject.NULL).put("evaluatedAt", now.toString())
