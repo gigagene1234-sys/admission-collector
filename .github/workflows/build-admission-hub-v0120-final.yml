@@ -1,0 +1,150 @@
+name: Build Admission Hub v0.12 Score Decision Final
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-hub-v0120-final.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.12-Score-Decision.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply final v0.12 patch
+        run: python3 .github/scripts/patch_v0120_final.py
+      - name: Verify cumulative invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          store=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
+          model=Path('app/src/main/java/com/admissionhub/collector/hub/HubDashboardModel.kt').read_text()
+          layout=Path('app/src/main/java/com/admissionhub/collector/hub/HubFirstLayoutPolicy.kt').read_text()
+          engine=Path('app/src/main/java/com/admissionhub/collector/score/ScoreDecisionEngine.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          cell=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionCellSupervisor.kt').read_text()
+          checks={
+            'version': 'private const val VERSION = "0.12.0"' in main and 'private const val BUILD_CODE = 112000' in main,
+            'db-v9': '\n    9\n) {' in store and 'score_student_profiles' in store and 'score_decision_assessments' in store,
+            'score-engine': 'UNKNOWN_COMPARISON_DIRECTION' in engine and 'NO_COMPARABLE_OFFICIAL_OUTCOME' in engine,
+            'no-invented-probability': 'probabilityInferred' in engine and 'unsupportedThresholdsUsed' in engine,
+            'dashboard-score': 'scoreDecisionSummary' in store and 'scoreDecision' in model and 'hubDecisionSummary' in main,
+            'responsive': 'widthDp >= 900 -> 3' in layout and '3 -> 236' in layout,
+            'batch-disabled': 'override val supportsBatchCrawl = false' in adapter,
+            'mission-user-session': 'override val supportsUserSessionMissionTraversal = true' in adapter,
+            'hard-lease': 'expireStaleOwnership' in cell and 'LATE_CALLBACK_IGNORED' in cell,
+            'prediction-history': 'predictionDoesNotOverwriteHistoricalActual' in store,
+            'privacy': 'credentialExported' in main and 'sessionSecretExported' in main,
+          }
+          failed=[k for k,v in checks.items() if not v]
+          if failed: raise SystemExit('v0.12 invariant failure: '+', '.join(failed))
+          print('v0.12 invariants passed')
+          PY
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Run Score Decision Mission Lab tests
+        run: gradle --no-daemon :app:testDebugUnitTest
+      - name: Compile product
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Verify APK metadata and stable signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -Fq "versionCode='112000'" /tmp/badging.txt
+          grep -Fq "versionName='0.12.0'" /tmp/badging.txt
+          grep -Fq "application-label:'Admission Hub v0.12 Score Decision'" /tmp/badging.txt
+          grep -qi 'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995' /tmp/apksigner.txt
+      - name: Commit v0.12 product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+                  app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt \
+                  app/src/main/java/com/admissionhub/collector/hub/HubDashboardModel.kt \
+                  app/src/main/java/com/admissionhub/collector/hub/HubFirstLayoutPolicy.kt \
+                  app/src/main/java/com/admissionhub/collector/score/ScoreDecisionEngine.kt \
+                  app/src/test/java/com/admissionhub/collector/score/ScoreDecisionEngineTest.kt \
+                  app/src/test/java/com/admissionhub/collector/hub/HubScoreDecisionPresentationTest.kt \
+                  app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.12 evidence-safe Score and Decision model"
+          git push origin HEAD:main
+          PRODUCT_SHA=$(git rev-parse HEAD)
+          echo "PRODUCT_SHA=$PRODUCT_SHA" >> "$GITHUB_ENV"
+      - name: Rebuild and retest exact committed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git reset --hard "$PRODUCT_SHA"
+          rm -rf app/build
+          gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee /tmp/final-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/final-badging.txt
+          grep -Fq "versionCode='112000'" /tmp/final-badging.txt
+          grep -Fq "versionName='0.12.0'" /tmp/final-badging.txt
+          grep -Fq "application-label:'Admission Hub v0.12 Score Decision'" /tmp/final-badging.txt
+          grep -qi 'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995' /tmp/final-apksigner.txt
+      - name: Package APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/$APK_NAME"
+          sha256sum "dist/$APK_NAME" | tee "dist/$APK_NAME.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.12-score-decision
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish v0.12 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release delete v0.12.0 --yes --cleanup-tag >/dev/null 2>&1 || true
+          git tag -f v0.12.0 "$PRODUCT_SHA"
+          git push origin -f v0.12.0
+          gh release create v0.12.0 "dist/$APK_NAME" "dist/$APK_NAME.sha256" \
+            --target "$PRODUCT_SHA" \
+            --title "Admission Hub v0.12 — Evidence-Safe Score & Decision Model" \
+            --notes "Adds the persistent score-decision evidence layer without inventing missing admissions data. SQLite v9 separates student score profiles, university conversion results, official historical outcomes, Jinhak prediction snapshots and decision assessments. Comparisons require a verified formula, explicit score scale, comparison direction, verified application binding, and exactly one compatible official reference; otherwise the result is explicitly held. No admission probability or unsupported safe/target/reach threshold is inferred. Existing current-prediction mission coverage is surfaced only as collected-unstructured evidence until a numeric snapshot is verified. The 3x2 cards expose university conversion, official outcome, Jinhak prediction readiness and decision state, while all existing collection, auth, local-rebind, six-slot ownership, hard-lease, prediction/history separation and privacy invariants remain intact. Product commit: $PRODUCT_SHA"
