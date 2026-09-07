@@ -464,8 +464,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.10.2"
-        private const val BUILD_CODE = 110020
+        private const val VERSION = "0.10.3"
+        private const val BUILD_CODE = 110030
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -790,7 +790,9 @@ class MainActivity : Activity() {
             "BLOCKED_QUALITY" -> "품질 점검 필요"
             else -> "6장 선택 필요"
         }
-        hubState.text = "지원 6장 $selected/6 · 후보 $candidates · 완전 $completeCandidates · 보강 $repairCandidates · $readyText"
+        val selectedAccepted = slots.optInt("accepted", 0)
+        val selectedProvisional = slots.optInt("provisional", 0)
+        hubState.text = "지원 6장 $selected/6 · 후보 $candidates · 완전 $completeCandidates · 공식결합 $selectedAccepted/6 · 확인필요 $selectedProvisional · 보강 $repairCandidates · $readyText"
         if (::hubRecoveryButton.isInitialized) {
             hubRecoveryButton.isEnabled = selected == 6 && selectedComplete < 6 && !unifiedRunning && !batchRunning
             hubRecoveryButton.text = if (selected == 6 && selectedComplete < 6) "선택 6장 보강 (${6 - selectedComplete})" else "선택 6장 보강"

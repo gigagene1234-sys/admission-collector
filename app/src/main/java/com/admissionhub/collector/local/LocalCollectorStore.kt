@@ -1634,6 +1634,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         val byUniversity = apps.groupBy { CanonicalSixApplicationGraph.normalizeUniversityKey(it.university) }
         val matches = linkedMapOf<String, LinkedHashMap<String, JSONObject>>()
         val exactFingerprints = linkedMapOf<String, MutableSet<String>>()
+        val officialStructuralFingerprints = linkedMapOf<String, MutableSet<String>>()
         val officialAdmissionEvidence = linkedMapOf<String, MutableList<JSONObject>>()
 
         if (!adigaRunId.isNullOrBlank() && apps.isNotEmpty()) {
@@ -1687,24 +1688,30 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
 
         if (!adigaRunId.isNullOrBlank() && apps.isNotEmpty()) {
             readableDatabase.rawQuery(
-                "SELECT COALESCE(year,-1),university,record_type,json FROM records WHERE run_id=? AND record_type IN ('current-admission-criteria-table','historical-admission-result-table') AND university IS NOT NULL",
+                "SELECT fingerprint,COALESCE(year,-1),university,record_type,json FROM records WHERE run_id=? AND record_type IN ('current-admission-criteria-table','historical-admission-result-table') AND university IS NOT NULL",
                 arrayOf(adigaRunId)
             ).use { c ->
                 while (c.moveToNext()) {
-                    val recordYear = c.getInt(0)
-                    val university = if (c.isNull(1)) null else c.getString(1)
-                    val recordType = c.getString(2)
+                    val recordFingerprint = c.getString(0)
+                    val recordYear = c.getInt(1)
+                    val university = if (c.isNull(2)) null else c.getString(2)
+                    val recordType = c.getString(3)
                     val candidates = byUniversity[CanonicalSixApplicationGraph.normalizeUniversityKey(university)].orEmpty()
                     if (candidates.isEmpty()) continue
-                    val record = runCatching { JSONObject(c.getString(3)) }.getOrNull() ?: continue
+                    val record = runCatching { JSONObject(c.getString(4)) }.getOrNull() ?: continue
                     for (app in candidates) {
                         val evidence = AdigaOfficialAdmissionEvidence.inspect(
                             recordType,
                             recordYear,
                             record,
                             AdigaOfficialAdmissionEvidence.AppRef(app.year, app.university, app.department, app.admission, app.admissionCategory)
-                        )
-                        if (evidence.isNotEmpty()) officialAdmissionEvidence.getOrPut(app.identityKey) { mutableListOf() }.addAll(evidence)
+                        ).onEach { it.put("recordFingerprint", recordFingerprint) }
+                        if (evidence.isNotEmpty()) {
+                            officialAdmissionEvidence.getOrPut(app.identityKey) { mutableListOf() }.addAll(evidence)
+                            if (evidence.any { it.optString("scope") in setOf("row-bound-current", "table-segment-current") }) {
+                                officialStructuralFingerprints.getOrPut(app.identityKey) { linkedSetOf() }.add(recordFingerprint)
+                            }
+                        }
                     }
                 }
             }
@@ -1729,13 +1736,15 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                 val officialEvidenceRows = officialAdmissionEvidence[app.identityKey].orEmpty()
                 val rowBoundCurrent = officialEvidenceRows.count { it.optString("scope") == "row-bound-current" }
                 val rowBoundRelated = officialEvidenceRows.count { it.optString("scope") == "row-bound-current-related" }
+                val tableSegmentCurrent = officialEvidenceRows.count { it.optString("scope") == "table-segment-current" }
+                val tableSegmentHistorical = officialEvidenceRows.count { it.optString("scope") == "table-segment-historical" }
                 val currentUniversityEvidence = officialEvidenceRows.count { it.optString("scope") == "university-current" }
+                val structuralCurrentEvidence = rowBoundCurrent + tableSegmentCurrent
                 val bindingQuality = when {
                     acceptedSignatures == 1 -> "accepted"
                     acceptedSignatures > 1 -> "provisional"
-                    rowBoundCurrent == 1 -> "accepted"
-                    rowBoundCurrent > 1 -> "provisional"
-                    provisionalSignatures > 0 || rowBoundRelated > 0 || currentUniversityEvidence > 0 -> "provisional"
+                    structuralCurrentEvidence > 0 -> "accepted"
+                    provisionalSignatures > 0 || rowBoundRelated > 0 || currentUniversityEvidence > 0 || tableSegmentHistorical > 0 -> "provisional"
                     else -> "provider-only"
                 }
                 val qualityState = when {
@@ -1745,17 +1754,23 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                     else -> "provider-only"
                 }
                 val bindingJson = JSONObject()
-                    .put("schemaVersion", 1)
+                    .put("schemaVersion", 2)
+                    .put("bindingPolicyVersion", "official-structural-v2")
                     .put("officialBaseline", "adiga")
                     .put("bindingQuality", bindingQuality)
                     .put("acceptedSignatures", acceptedSignatures)
                     .put("provisionalSignatures", provisionalSignatures)
                     .put("officialRowBoundCurrent", rowBoundCurrent)
                     .put("officialRowBoundRelated", rowBoundRelated)
+                    .put("officialTableSegmentCurrent", tableSegmentCurrent)
+                    .put("officialTableSegmentHistorical", tableSegmentHistorical)
+                    .put("officialStructuralCurrent", structuralCurrentEvidence)
                     .put("officialUniversityCurrent", currentUniversityEvidence)
-                    .put("officialAdmissionEvidence", JSONArray(officialEvidenceRows.take(24)))
+                    .put("officialAdmissionEvidence", JSONArray(officialEvidenceRows.take(36)))
                     .put("matches", JSONArray(matchRows))
-                    .put("sameRowRequiredForOfficialAccepted", true)
+                    .put("sameRowRequiredForOfficialAccepted", false)
+                    .put("sameRowOrExplicitTableScopeRequiredForOfficialAccepted", true)
+                    .put("acceptedBindingMethods", JSONArray(listOf("same-row", "same-official-table-explicit-scope-segment")))
                     .put("doNotInferMissingBindings", true)
 
                 if (universityId != null && app.university != null) upsertCanonicalEntity(
@@ -1812,7 +1827,11 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                     db.update("records", update, "run_id=? AND application_identity_key=?", arrayOf(jinhakRunId, app.identityKey))
                 }
                 if (bindingQuality == "accepted" && !adigaRunId.isNullOrBlank()) {
-                    exactFingerprints[app.identityKey].orEmpty().forEach { fp ->
+                    val acceptedEvidenceFingerprints = linkedSetOf<String>().apply {
+                        addAll(exactFingerprints[app.identityKey].orEmpty())
+                        addAll(officialStructuralFingerprints[app.identityKey].orEmpty())
+                    }
+                    acceptedEvidenceFingerprints.forEach { fp ->
                         val update = ContentValues().apply {
                             put("quality_state", "accepted")
                             putNullable("canonical_university_id", universityId)
@@ -2067,6 +2086,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("warnings", warnings)
             .put("observationCoverage", observations)
             .put("predictionDoesNotOverwriteHistoricalActual", true)
+            .put("officialBindingPolicy", "same-row-or-explicit-same-table-scope")
             .put("doNotInferMissingBindings", true)
         val cv = ContentValues().apply {
             put("session_id", sessionId)
