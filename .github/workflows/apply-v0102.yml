@@ -1,0 +1,31 @@
+name: Apply v0.10.2 Product Patch
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/apply-v0102.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply bounded architecture patch
+        run: python3 .github/scripts/patch_v0102.py
+      - name: Commit product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main app/src/test app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.10.2 Auth Domain Separation and Mission Ownership Repair"
+          git push origin HEAD:main
