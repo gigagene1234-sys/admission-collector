@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.10.4 Local Rebind Continuity"
+        android:label="Admission Hub v0.11 Six-Card Dashboard"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

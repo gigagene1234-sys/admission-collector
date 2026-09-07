@@ -23,6 +23,7 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -33,6 +34,7 @@ import org.json.JSONTokener
 import com.admissionhub.collector.capture.SnapshotScript
 import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.local.LocalCollectorStore
+import com.admissionhub.collector.hub.HubDashboardModel
 import com.admissionhub.collector.observation.ObservationEvidence
 import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
 import com.admissionhub.collector.jinhak.JinhakAgentNavigator
@@ -71,6 +73,10 @@ class MainActivity : Activity() {
     private lateinit var hubState: TextView
     private lateinit var hubManageButton: Button
     private lateinit var hubRecoveryButton: Button
+    private lateinit var hubDashboardStatus: TextView
+    private lateinit var hubDashboardScroll: HorizontalScrollView
+    private val hubDashboardCards = mutableListOf<TextView>()
+    private var hubDashboardLastModel = JSONObject()
     private lateinit var cloudOffload: CloudOffloadCoordinator
     private lateinit var localStore: LocalCollectorStore
     private lateinit var sessionVault: SecureSessionVault
@@ -80,6 +86,14 @@ class MainActivity : Activity() {
     private val jinhakMissionCells = JinhakMissionCellSupervisor()
 
     private val handler = Handler(Looper.getMainLooper())
+    private val hubDashboardTicker = object : Runnable {
+        override fun run() {
+            if (::hubDashboardStatus.isInitialized && !isFinishing) {
+                refreshHubDashboardFromStore("ticker")
+                handler.postDelayed(this, if (unifiedRunning || batchRunning || startupLoginPreflightActive) 2_000L else 7_500L)
+            }
+        }
+    }
     private val sessionKeepAlive = object : Runnable {
         override fun run() {
             val active = unifiedRunning || batchRunning || startupLoginPreflightActive || jinhakTransitionAuthGateActive
@@ -472,8 +486,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.10.4"
-        private const val BUILD_CODE = 110040
+        private const val VERSION = "0.11.0"
+        private const val BUILD_CODE = 111000
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -519,6 +533,9 @@ class MainActivity : Activity() {
             }
         }
         handler.postDelayed({ sendPendingRuntimeEvents() }, 1200L)
+        handler.postDelayed({ refreshHubDashboardFromStore("app-start") }, 900L)
+        handler.removeCallbacks(hubDashboardTicker)
+        handler.postDelayed(hubDashboardTicker, 3_500L)
     }
 
     override fun onTrimMemory(level: Int) {
@@ -704,6 +721,41 @@ class MainActivity : Activity() {
         hubRow.addView(hubManageButton)
         hubRow.addView(hubRecoveryButton)
 
+        hubDashboardStatus = TextView(this).apply {
+            text = "대시보드 상태를 불러오는 중…"
+            textSize = 16f
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setOnClickListener { refreshHubDashboardFromStore("manual-banner-refresh") }
+        }
+        val dashboardCardRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.TOP
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        hubDashboardCards.clear()
+        repeat(6) { index ->
+            val card = TextView(this).apply {
+                text = "${index + 1}. 지원안 데이터 준비 중"
+                textSize = 15f
+                gravity = Gravity.TOP
+                minHeight = dp(150)
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                setLineSpacing(0f, 1.12f)
+                isClickable = true
+                isFocusable = true
+                setBackgroundColor(android.graphics.Color.rgb(246, 246, 246))
+                setOnClickListener { showHubDashboardCard(index + 1) }
+            }
+            hubDashboardCards.add(card)
+            dashboardCardRow.addView(card, LinearLayout.LayoutParams(dp(292), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(4), dp(2), dp(4), dp(6))
+            })
+        }
+        hubDashboardScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = true
+            addView(dashboardCardRow)
+        }
+
         status = TextView(this).apply {
             text = "Admission Hub v$VERSION 준비 중"
             setPadding(8, 8, 8, 8)
@@ -756,10 +808,122 @@ class MainActivity : Activity() {
         root.addView(actions2)
         root.addView(actions3)
         root.addView(hubRow)
+        root.addView(hubDashboardStatus)
+        root.addView(hubDashboardScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(status)
         root.addView(browserStack, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f))
         root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 2f))
         setContentView(root)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun runtimeHubDashboardState(): JSONObject {
+        val now = System.currentTimeMillis()
+        val lastProgressAgeSeconds = if (jinhakLastMeaningfulProgressAtMs > 0L) {
+            ((now - jinhakLastMeaningfulProgressAtMs).coerceAtLeast(0L) / 1000L)
+        } else -1L
+        return JSONObject()
+            .put("running", unifiedRunning || batchRunning || startupLoginPreflightActive || jinhakTransitionAuthGateActive)
+            .put("phase", unifiedPhase)
+            .put("loginRequired", batchPausedForLogin)
+            .put("loginChecking", startupLoginPreflightActive || jinhakTransitionAuthGateActive)
+            .put("recovering", runtimeRendererRecovering || selectedSixRecoveryMode || jinhakMissionCells.diagnostics().optString("supervisorState") == "RECOVERING")
+            .put("provider", provider.wireName)
+            .put("mission", jinhakMissionTargetLedger.summary())
+            .put("lastProgressAgeSeconds", lastProgressAgeSeconds)
+    }
+
+    private fun refreshHubDashboardFromStore(trigger: String) {
+        if (!::hubDashboardStatus.isInitialized || !::localStore.isInitialized) return
+        val canonicalSession = canonicalHubSessionId()
+        if (canonicalSession.isNullOrBlank()) {
+            renderHubDashboard(HubDashboardModel.build(JSONObject(), JSONObject(), runtimeHubDashboardState()))
+            return
+        }
+        val canonical = runCatching { localStore.canonicalHubSummary(canonicalSession) }.getOrDefault(JSONObject())
+        val syncSession = if (unifiedRunning && !unifiedSessionId.isNullOrBlank()) unifiedSessionId else canonicalSession
+        val sync = runCatching { localStore.unifiedStatus(syncSession ?: canonicalSession) }.getOrDefault(JSONObject())
+        val model = HubDashboardModel.build(canonical, sync, runtimeHubDashboardState())
+        hubDashboardLastModel = model
+        renderHubDashboard(model)
+        if (trigger != "ticker") {
+            recordRuntimeEvent("hub-dashboard-refresh", JSONObject()
+                .put("trigger", trigger.take(80))
+                .put("canonicalSessionId", canonicalSession)
+                .put("syncState", model.optJSONObject("sync")?.optString("state")))
+        }
+    }
+
+    private fun renderHubDashboard(model: JSONObject) {
+        hubDashboardLastModel = model
+        val sync = model.optJSONObject("sync") ?: JSONObject()
+        val summary = model.optJSONObject("summary") ?: JSONObject()
+        val age = sync.optLong("lastProgressAgeSeconds", -1L)
+        val ageText = if (age >= 0 && age < 86_400) " · 마지막 진행 ${age}초 전" else ""
+        val qualityText = buildString {
+            append("공식연결 ").append(summary.optInt("accepted", 0)).append("/6")
+            val provisional = summary.optInt("provisional", 0)
+            val providerOnly = summary.optInt("providerOnly", 0)
+            if (provisional > 0) append(" · 확인필요 ").append(provisional)
+            if (providerOnly > 0) append(" · 공식결합없음 ").append(providerOnly)
+        }
+        hubDashboardStatus.text = "${sync.optString("stateLabel", "대기")} · ${sync.optString("progressText", "진행 수치 대기")}$ageText\n지원 6장 ${summary.optInt("resolvable", 0)}/6 · 핵심자료 ${summary.optInt("fullCoreCoverage", 0)}/6 · $qualityText"
+
+        val cards = model.optJSONArray("cards") ?: JSONArray()
+        for (index in hubDashboardCards.indices) {
+            val view = hubDashboardCards[index]
+            val card = cards.optJSONObject(index) ?: JSONObject().put("slot", index + 1).put("occupied", false)
+            val occupied = card.optBoolean("occupied", false)
+            val resolvable = card.optBoolean("resolvable", false)
+            view.text = when {
+                !occupied -> "${index + 1}. — 비어 있음 —\n\n지원 6장 관리에서 선택"
+                !resolvable -> "${index + 1}. ${card.optString("title", "연결 확인 필요")}\n\ncanonical 연결 복구 필요"
+                else -> {
+                    val university = card.optString("university").takeIf { it.isNotBlank() && it != "null" }.orEmpty()
+                    val department = card.optString("department").takeIf { it.isNotBlank() && it != "null" }.orEmpty()
+                    val subtitle = card.optString("subtitle")
+                    val capacity = if (card.has("capacity") && !card.isNull("capacity")) "모집 ${card.optInt("capacity")}명" else "모집인원 미확인"
+                    val coverage = "Jinhak 핵심 ${card.optInt("coverageCount", 0)}/5"
+                    val official = card.optString("qualityLabel", "데이터 품질 확인 필요")
+                    "${index + 1}. $university\n$department\n$subtitle\n\n$capacity · $coverage\n$official"
+                }
+            }
+        }
+    }
+
+    private fun showHubDashboardCard(slot: Int) {
+        if (slot !in 1..6) return
+        if (hubDashboardLastModel.length() == 0) refreshHubDashboardFromStore("card-open")
+        val card = hubDashboardLastModel.optJSONArray("cards")?.optJSONObject(slot - 1)
+        if (card == null || !card.optBoolean("occupied", false)) {
+            Toast.makeText(this, "$slot 번 슬롯은 비어 있습니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val missing = card.optJSONArray("missingLanes") ?: JSONArray()
+        val missingText = if (missing.length() == 0) "없음" else (0 until missing.length()).joinToString(", ") { missing.optString(it) }
+        val message = buildString {
+            append(card.optString("university", "미확인")).append('\n')
+            append(card.optString("department", "미확인")).append('\n')
+            val admission = card.optString("admission").takeIf { it.isNotBlank() && it != "null" }
+            val campus = card.optString("campus").takeIf { it.isNotBlank() && it != "null" }
+            if (admission != null) append("전형: ").append(admission).append('\n')
+            if (campus != null) append("캠퍼스: ").append(campus).append('\n')
+            if (card.has("capacity") && !card.isNull("capacity")) append("모집인원: ").append(card.optInt("capacity")).append("명\n")
+            append("\n데이터 품질: ").append(card.optString("qualityLabel")).append('\n')
+            append("Jinhak 핵심 coverage: ").append(card.optInt("coverageCount", 0)).append("/5\n")
+            append("누락 lane: ").append(missingText).append('\n')
+            append("Adiga 구조적 현재연도 근거: ").append(card.optInt("officialStructuralCurrent", 0)).append("건\n")
+            append("Adiga 같은 행 근거: ").append(card.optInt("officialRowBoundCurrent", 0)).append("건\n")
+            append("Adiga 명시적 표 구간 근거: ").append(card.optInt("officialTableSegmentCurrent", 0)).append("건\n")
+            val updated = card.optString("updatedAt")
+            if (updated.isNotBlank()) append("마지막 canonical 갱신: ").append(updated)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("지원 $slot 상세")
+            .setMessage(message)
+            .setPositiveButton("확인", null)
+            .show()
     }
 
     private fun canonicalHubSessionId(): String? =
@@ -807,6 +971,7 @@ class MainActivity : Activity() {
             .put("accepted", audit.optJSONObject("sixSlots")?.optInt("accepted", 0) ?: 0)
             .put("providerNetworkUsed", false))
         status.text = "로컬 재결합 완료 · 후보 ${audit.optInt("candidateCount", 0)} · 지원 6장 ${audit.optJSONObject("sixSlots")?.optInt("resolvable", 0) ?: 0}/6 · 사이트 재수집 없음"
+        refreshHubDashboardFromStore("local-rebind-complete")
     }
 
     private fun rebuildCanonicalHubFromLatestSessionIfReady(trigger: String) {
@@ -8185,10 +8350,14 @@ class MainActivity : Activity() {
         super.onResume()
         handler.removeCallbacks(sessionKeepAlive)
         handler.postDelayed(sessionKeepAlive, 45_000L)
+        handler.removeCallbacks(hubDashboardTicker)
+        handler.postDelayed({ refreshHubDashboardFromStore("activity-resume") }, 250L)
+        handler.postDelayed(hubDashboardTicker, 2_500L)
     }
 
     override fun onPause() {
         persistProcessResumeJournal("onPause", synchronous = true)
+        handler.removeCallbacks(hubDashboardTicker)
         handler.removeCallbacks(sessionKeepAlive)
         if (unifiedRunning || batchRunning || startupLoginPreflightActive || jinhakTransitionAuthGateActive) {
             handler.postDelayed(sessionKeepAlive, 5_000L)
