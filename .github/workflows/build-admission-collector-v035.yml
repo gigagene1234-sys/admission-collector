@@ -1,14 +1,7 @@
 name: Build Admission Collector v0.3.5
 
+# Superseded: retained for explicitly requested historical investigations only.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/build-admission-collector-v035.yml"
-      - "scripts/apply_v035.py"
-      - "MainActivity.kt"
-      - "app/**"
   workflow_dispatch:
 
 permissions:
