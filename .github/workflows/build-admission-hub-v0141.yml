@@ -1,0 +1,110 @@
+name: Build Admission Hub v0.14.1 Real Excel Adiga Score
+
+on:
+  push:
+    branches: [codex/v0141-real-xls-adiga-score]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0141
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.14.1-Real-XLS-Adiga-Score.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify cumulative source and v0.14.1 safety contracts
+        run: python3 .github/scripts/verify_v0141.py
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Test all application and regression contracts
+        run: gradle --no-daemon :app:testDebugUnitTest
+      - name: Compile signed product
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Verify APK package version label and stable signer
+        run: bash .github/scripts/verify_apk_v0141.sh
+      - name: Clean rebuild and retest exact committed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git reset --hard "$GITHUB_SHA"
+          python3 .github/scripts/verify_v0141.py
+          gradle --no-daemon clean :app:testDebugUnitTest :app:assembleDebug
+          bash .github/scripts/verify_apk_v0141.sh
+          git diff --exit-code
+      - name: Package APK and verification report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/$APK_NAME"
+          (cd dist && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          python3 - <<'PY'
+          import glob,json,os,xml.etree.ElementTree as E
+          suites=[E.parse(f).getroot() for f in glob.glob('app/build/test-results/testDebugUnitTest/TEST-*.xml')]
+          counts={k:sum(int(s.get(k,'0')) for s in suites) for k in ['tests','failures','errors','skipped']}
+          assert counts['tests']>=78 and counts['failures']==counts['errors']==counts['skipped']==0,counts
+          report={
+            'productCommit':os.environ['GITHUB_SHA'],
+            'versionName':'0.14.1','versionCode':114100,'tests':counts,
+            'signerSha256':'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995',
+            'exactCommittedSourceRebuild':True,
+            'excelFormats':['xls-ole2-biff8','xlsx-ooxml'],
+            'formulaPolicy':'saved-cached-value-only-never-evaluate',
+            'blankGradePolicy':'preserve-null',
+            'adigaCurrentBindingPolicy':'direct-same-row-or-explicit-same-table-kept-separate-from-component-verification',
+            'adigaHistoricalOutcomePolicy':'full-local-rescan-plus-header-verified-direct-binding-only',
+            'automaticUniversityScoreScopes':['2027-woosong-교과면접','2027-woosong-교과중심','2027-hanbat-교과일반','2027-hanbat-지역인재교과'],
+            'knutHolisticTwo':'not-quantitatively-invented',
+            'slotsMutatedByScoreMaterializer':False,
+            'deviceAcceptance':'pending-real-galaxy-xls-open-and-save'
+          }
+          open('dist/verification-v0.14.1.json','w').write(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+          print(json.dumps(report,ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.14.1-real-xls-adiga-score
+          path: |
+            dist/*
+            app/build/test-results/testDebugUnitTest/*.xml
+      - name: Publish verified v0.14.1 release
+        if: contains(github.event.head_commit.message, '[release-v0141]')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create v0.14.1 "dist/$APK_NAME" "dist/$APK_NAME.sha256" dist/verification-v0.14.1.json \
+            --target "$GITHUB_SHA" --title "Admission Hub v0.14.1 — Real XLS + Adiga Result/Score Fix" \
+            --notes-file docs/releases/v0.14.1.md
