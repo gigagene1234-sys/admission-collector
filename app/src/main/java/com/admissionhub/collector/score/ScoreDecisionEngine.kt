@@ -8,11 +8,12 @@ import kotlin.math.abs
  * Evidence-safe comparison engine.
  *
  * It never manufactures a university conversion formula, an official cut, or an admission
- * probability. A relation is emitted only when identity binding, formula verification,
- * score scale, comparison direction and one official reference are all explicit.
+ * probability. A relation is emitted only when formula/scoring scope, score scale, comparison
+ * direction and one official reference are explicit. Direct same-row application binding remains
+ * a separate fact from a verified university-wide scoring scope.
  */
 object ScoreDecisionEngine {
-    const val SCHEMA_VERSION = 1
+    const val SCHEMA_VERSION = 2
 
     fun evaluate(
         canonicalQuality: String,
@@ -20,12 +21,17 @@ object ScoreDecisionEngine {
         officialOutcomes: JSONArray,
         prediction: JSONObject?
     ): JSONObject {
+        val conversionDetail = conversion?.optJSONObject("detail") ?: JSONObject()
+        val directIdentityBinding = conversion?.optBoolean("identityBindingVerified", false) == true
+        val scoringScopeBinding = conversionDetail.optBoolean("scoringScopeBindingVerified", false)
         val base = JSONObject()
             .put("schemaVersion", SCHEMA_VERSION)
             .put("canonicalQuality", canonicalQuality)
             .put("predictionAvailable", prediction != null)
             .put("predictionStructured", prediction?.optBoolean("structured", false) == true)
             .put("predictionObservedAt", prediction?.optString("observedAt").orEmpty())
+            .put("directApplicationBindingVerified", directIdentityBinding)
+            .put("scoringScopeBindingVerified", scoringScopeBinding)
             .put("probabilityInferred", false)
             .put("unsupportedThresholdsUsed", false)
 
@@ -43,8 +49,8 @@ object ScoreDecisionEngine {
         if (direction !in setOf("higher-is-better", "lower-is-better")) {
             return hold(base, "UNKNOWN_COMPARISON_DIRECTION", "판정 보류 · 점수 방향성 미확인")
         }
-        if (canonicalQuality != "accepted" && !conversion.optBoolean("identityBindingVerified", false)) {
-            return hold(base, "UNVERIFIED_APPLICATION_BINDING", "판정 보류 · 공식 전형 연결 확인 필요")
+        if (canonicalQuality != "accepted" && !directIdentityBinding && !scoringScopeBinding) {
+            return hold(base, "UNVERIFIED_SCORING_SCOPE", "판정 보류 · 이 모집단위에 적용할 공식 환산 범위 확인 필요")
         }
 
         val comparable = mutableListOf<JSONObject>()
@@ -62,7 +68,7 @@ object ScoreDecisionEngine {
             comparable += outcome
         }
         if (comparable.isEmpty()) {
-            return hold(base, "NO_COMPARABLE_OFFICIAL_OUTCOME", "판정 보류 · 같은 척도의 검증된 공식 입결 없음")
+            return hold(base, "NO_COMPARABLE_OFFICIAL_OUTCOME", "판정 보류 · 같은 척도로 직접 비교할 수 있는 검증된 공식 입결 없음")
         }
         val primary = comparable.filter { it.optBoolean("primaryReference", false) }
         val reference = when {
@@ -72,7 +78,7 @@ object ScoreDecisionEngine {
             else -> return hold(base, "AMBIGUOUS_OFFICIAL_REFERENCE", "판정 보류 · 비교할 공식 입결 지표 선택 필요")
         }
 
-        val own = conversion.optDouble("scoreValue")
+        val own = ownFinite
         val ref = reference.optDouble("metricValue")
         val advantage = if (direction == "higher-is-better") own - ref else ref - own
         val relation = when {
