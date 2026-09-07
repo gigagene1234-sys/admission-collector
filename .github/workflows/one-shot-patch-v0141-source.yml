@@ -1,0 +1,57 @@
+name: One-shot patch v0.14.1 source metadata
+
+on:
+  push:
+    branches: [codex/v0141-real-xls-adiga-score]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0141-one-shot-source-patch
+  cancel-in-progress: false
+
+jobs:
+  patch-if-needed:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+      - name: Patch exact committed source strings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          main = Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt')
+          s = main.read_text()
+          old = s
+          s = s.replace('private const val VERSION = "0.14.0"', 'private const val VERSION = "0.14.1"')
+          s = s.replace('private const val BUILD_CODE = 114000', 'private const val BUILD_CODE = 114100')
+          if s != old:
+              main.write_text(s)
+
+          ui = Path('app/src/main/java/com/admissionhub/collector/score/ScoreReviewUi.kt')
+          s = ui.read_text()
+          old = s
+          s = s.replace('과목별 성적을 직접 입력하거나 XLSX·CSV·TSV·성적 JSON을 가져오세요.', '과목별 성적을 직접 입력하거나 XLS·XLSX·CSV·TSV·성적 JSON을 가져오세요.')
+          s = s.replace('XLSX 파일 가져오기 · 시트/열 미리보기', 'XLS / XLSX 파일 가져오기 · 시트/열 미리보기')
+          if s != old:
+              ui.write_text(s)
+          PY
+      - name: Commit one-shot patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo 'No patch needed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/score/ScoreReviewUi.kt
+          git commit -m 'chore: align v0.14.1 runtime metadata and Excel wording'
+          git push origin HEAD:codex/v0141-real-xls-adiga-score
