@@ -204,7 +204,7 @@ class JinhakMissionTargetLedger {
 
     fun hasMission(identityKey: String?): Boolean = identityKey != null && targets.values.any { it.identityKey == identityKey }
 
-    fun hasActionablePending(): Boolean = targets.values.any { it.state == State.PENDING }
+    fun hasActionablePending(): Boolean = targets.values.any { it.state == State.PENDING || it.state == State.CLICKED || it.state == State.DEFERRED }
 
     fun outstandingCount(): Int = targets.values.count {
         it.state == State.PENDING || it.state == State.CLICKED || it.state == State.DEFERRED
@@ -213,10 +213,11 @@ class JinhakMissionTargetLedger {
     fun pendingCount(): Int = targets.values.count { it.state == State.PENDING }
 
     fun originForNextPending(preferredIdentityKey: String? = null): String? {
+        fun actionable(target: Target): Boolean = target.state == State.PENDING || target.state == State.CLICKED || target.state == State.DEFERRED
         val preferred = preferredIdentityKey?.let { key ->
-            sortedTargets().firstOrNull { it.identityKey == key && it.state == State.PENDING }
+            sortedTargets().firstOrNull { it.identityKey == key && actionable(it) }
         }
-        return preferred?.originRoute ?: sortedTargets().firstOrNull { it.state == State.PENDING }?.originRoute
+        return preferred?.originRoute ?: sortedTargets().firstOrNull(::actionable)?.originRoute
     }
 
     /** Mark already-covered lanes as skipped before choosing another saved-card target. */
@@ -239,7 +240,7 @@ class JinhakMissionTargetLedger {
     ): Target? {
         if (originRoute.isBlank()) return null
         reconcileCoveredLanes(preferredIdentityKey, coveredLanes)
-        val sameOrigin = sortedTargets().filter { it.originRoute == originRoute && it.state == State.PENDING }
+        val sameOrigin = sortedTargets().filter { it.originRoute == originRoute && (it.state == State.PENDING || it.state == State.CLICKED || it.state == State.DEFERRED) }
         val preferred = if (preferredIdentityKey != null) {
             sameOrigin.firstOrNull { it.identityKey == preferredIdentityKey && it.lane !in coveredLanes }
         } else null

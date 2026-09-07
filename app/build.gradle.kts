@@ -14,8 +14,8 @@ android {
         applicationId = "com.admissionhub.collector"
         minSdk = 26
         targetSdk = 35
-        versionCode = 110010
-        versionName = "0.10.1"
+        versionCode = 110020
+        versionName = "0.10.2"
     }
 
     compileOptions {
@@ -47,4 +47,8 @@ android {
             signingConfigs.findByName("admissionStable")?.let { signingConfig = it }
         }
     }
+}
+
+dependencies {
+    testImplementation("junit:junit:4.13.2")
 }
