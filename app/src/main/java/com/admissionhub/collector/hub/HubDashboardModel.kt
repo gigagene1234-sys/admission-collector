@@ -2,6 +2,7 @@ package com.admissionhub.collector.hub
 
 import org.json.JSONArray
 import org.json.JSONObject
+import com.admissionhub.collector.score.ApplicationReviewEngine
 
 /** Read-only presentation model over persisted canonical, sync, and score-decision evidence. */
 object HubDashboardModel {
@@ -49,6 +50,7 @@ object HubDashboardModel {
         return JSONObject()
             .put("schemaVersion", SCHEMA_VERSION)
             .put("cards", cards)
+            .put("applicationPortfolio", ApplicationReviewEngine.portfolio(cards))
             .put("sync", sync)
             .put("studentScoreProfile", scoreDecisionSummary.optJSONObject("studentProfile") ?: JSONObject().put("status", "NOT_IMPORTED"))
             .put("summary", JSONObject()
@@ -108,6 +110,8 @@ object HubDashboardModel {
             .put("coverageCount", coverage.optInt("coveredCount", 0)).put("coverageComplete", coverage.optBoolean("complete", false))
             .put("missingLanes", coverage.optJSONArray("missing") ?: JSONArray())
             .put("updatedAt", candidate.optString("updatedAt"))
+            .put("academicYear", candidate.optInt("academicYear"))
+            .put("applicationReview", score?.optJSONObject("applicationReview") ?: JSONObject().put("code", "HOLD").put("label", "자료 보완 후 판단"))
             .put("officialStructuralCurrent", binding.optInt("officialStructuralCurrent", 0))
             .put("officialRowBoundCurrent", binding.optInt("officialRowBoundCurrent", 0))
             .put("officialTableSegmentCurrent", binding.optInt("officialTableSegmentCurrent", 0))

@@ -8,6 +8,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ScoreDecisionEngineTest {
+    @Test fun invalidNumericScoreCannotBecomeEqualReference() {
+        val own=verifiedConversion(930.0,"points-1000","higher-is-better").put("scoreValue","NaN")
+        assertTrue(ScoreDecisionEngine.evaluate("accepted",own,JSONArray().put(verifiedOutcome(930.0,"points-1000",true)),null).getBoolean("hold"))
+    }
+    @Test fun invalidNumericReferenceIsNotComparable() {
+        val outcome=verifiedOutcome(930.0,"points-1000",true).put("metricValue","NaN")
+        assertTrue(ScoreDecisionEngine.evaluate("accepted",verifiedConversion(930.0,"points-1000","higher-is-better"),JSONArray().put(outcome),null).getBoolean("hold"))
+    }
     @Test
     fun refusesToInventConversion() {
         val result = ScoreDecisionEngine.evaluate("accepted", null, JSONArray(), null)

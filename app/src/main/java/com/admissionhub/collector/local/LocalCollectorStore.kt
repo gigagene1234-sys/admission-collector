@@ -13,6 +13,11 @@ import com.admissionhub.collector.canonical.CanonicalSixApplicationGraph
 import com.admissionhub.collector.canonical.AdigaOfficialAdmissionEvidence
 import com.admissionhub.collector.sync.LocalRebindPolicy
 import com.admissionhub.collector.score.ScoreDecisionEngine
+import com.admissionhub.collector.score.StudentScoreImport
+import com.admissionhub.collector.score.ApplicationReviewEngine
+import com.admissionhub.collector.score.SameCardPrediction
+import com.admissionhub.collector.score.ReviewExportContract
+import com.admissionhub.collector.hub.HubDashboardModel
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
@@ -29,9 +34,11 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "admission_collector_local_v1.db",
     null,
-    9
+    10
 ) {
     private fun ensureFoundationSchema(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS application_review_inputs(application_identity_key TEXT PRIMARY KEY, input_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS application_review_history(review_id TEXT PRIMARY KEY, application_identity_key TEXT NOT NULL, input_json TEXT NOT NULL, saved_at TEXT NOT NULL)")
         // Content-aware captures: same route can expose different data at another time/context.
         runCatching { db.execSQL("ALTER TABLE unified_analysis_captures ADD COLUMN content_fingerprint TEXT") }
         runCatching { db.execSQL("ALTER TABLE unified_analysis_captures ADD COLUMN context_fingerprint TEXT") }
@@ -482,6 +489,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         if (oldVersion < 9) {
             ensureFoundationSchema(db)
         }
+        if (oldVersion < 10) ensureFoundationSchema(db)
     }
 
     fun beginOrResumeUnifiedSession(collectorVersion: String): String {
@@ -869,7 +877,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                     .put("pageAnalyses", analyses)))
     }
 
-    fun writeUnifiedExport(sessionId: String, writer: Writer) {
+    fun writeUnifiedExport(sessionId: String, writer: Writer, exporterVersion: String = "0.13.0", exporterBuildCode: Int = 113000) {
         val status = unifiedStatus(sessionId)
         val adigaRun = status.optJSONObject("adiga")?.optString("runId")?.takeIf { it.isNotBlank() && it != "null" }
         val jinhakRun = status.optJSONObject("jinhak")?.optString("runId")?.takeIf { it.isNotBlank() && it != "null" }
@@ -1054,6 +1062,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         writeErrors(jinhakRun)
         writer.write("},\"syncDiagnostics\":")
         writeSyncDiagnostics()
+        val score = scoreDecisionSummary(sessionId)
+        val hub = HubDashboardModel.build(canonicalHubSummary(sessionId), status, JSONObject(), score)
+        ReviewExportContract.append(writer, exporterVersion, exporterBuildCode, status.optString("collectorVersion"), Instant.now().toString(), currentStudentScoreProfile(), score, hub)
         writer.write("}")
         writer.flush()
     }
@@ -1574,6 +1585,57 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("sessionSecretStored", false)
     }
 
+    fun currentStudentScoreProfile(): JSONObject = readableDatabase.rawQuery(
+        "SELECT source_json FROM score_student_profiles ORDER BY updated_at DESC LIMIT 1", emptyArray()
+    ).use { c -> if (c.moveToFirst()) runCatching { JSONObject(c.getString(0)) }.getOrDefault(JSONObject()) else JSONObject().put("status", "NOT_IMPORTED") }
+
+    fun saveStudentScoreImport(profile: JSONObject) {
+        require(profile.optString("fingerprint").isNotBlank())
+        upsertStudentScoreProfile(profile.getString("fingerprint"), profile.getInt("academicYear"), "user-transcript-import", profile, "USER_CONFIRMED_INPUT")
+    }
+
+    fun loadApplicationReviewInput(identity: String): JSONObject = readableDatabase.rawQuery(
+        "SELECT input_json FROM application_review_inputs WHERE application_identity_key=?", arrayOf(identity)
+    ).use { c -> if (c.moveToFirst()) JSONObject(c.getString(0)) else JSONObject() }
+
+    fun saveApplicationReviewInput(sessionId: String, identity: String, input: JSONObject) {
+        val slots = loadHubApplicationSlots()
+        require((0 until slots.length()).any { slots.optJSONObject(it)?.optString("applicationIdentityKey") == identity }) { "현재 선택한 6장에만 근거를 등록할 수 있습니다." }
+        val candidates = loadCanonicalApplicationCandidates(sessionId)
+        val candidate = (0 until candidates.length()).mapNotNull { candidates.optJSONObject(it) }.firstOrNull { it.optString("applicationIdentityKey") == identity }
+            ?: error("지원안 연결을 먼저 복구하세요.")
+        val clean = ApplicationReviewEngine.sanitize(input).put("applicationIdentityKey", identity).put("academicYear", candidate.getInt("academicYear"))
+        // A changed transcript invalidates old comparisons until the user explicitly rechecks the source.
+        if (clean.optBoolean("sourceReviewConfirmed")) clean.put("profileFingerprint", currentStudentScoreProfile().optString("fingerprint"))
+        val now = Instant.now().toString(); clean.put("reviewedAt", now)
+        val db = writableDatabase; db.beginTransaction()
+        try {
+            val cv = ContentValues().apply { put("application_identity_key", identity); put("input_json", clean.toString()); put("updated_at", now) }
+            db.insertWithOnConflict("application_review_inputs", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+            val history = ContentValues().apply { put("review_id", UUID.randomUUID().toString()); put("application_identity_key", identity); put("input_json", clean.toString()); put("saved_at", now) }
+            db.insertOrThrow("application_review_history", null, history)
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    fun materializeSelectedPredictions(sessionId: String) {
+        val run = unifiedProviderRunId(sessionId, "jinhak") ?: return
+        val candidates = loadCanonicalApplicationCandidates(sessionId)
+        val slots = loadHubApplicationSlots()
+        val selected = (0 until slots.length()).mapNotNull { slots.optJSONObject(it)?.optString("applicationIdentityKey") }.toSet()
+        for (i in 0 until candidates.length()) {
+            val c = candidates.getJSONObject(i); val identity = c.optString("applicationIdentityKey")
+            if (identity !in selected) continue
+            readableDatabase.rawQuery("SELECT json FROM records WHERE run_id=? AND application_identity_key=? ORDER BY updated_at", arrayOf(run, identity)).use { rows ->
+                while (rows.moveToNext()) {
+                    val record = runCatching { JSONObject(rows.getString(0)) }.getOrNull() ?: continue
+                    val metrics = SameCardPrediction.extract(c, record) ?: continue
+                    storePredictionSnapshot(identity, metrics.getString("observedAt"), "jinhak", true, metrics, "같은 지원 카드에서 확인한 진학사 수치")
+                }
+            }
+        }
+    }
+
     fun upsertStudentScoreProfile(
         profileId: String,
         academicYear: Int,
@@ -1686,6 +1748,11 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
 
     fun scoreDecisionSummary(sessionId: String): JSONObject {
         val db = readableDatabase
+        val fullProfile = currentStudentScoreProfile()
+        val candidates = loadCanonicalApplicationCandidates(sessionId)
+        val candidateById = (0 until candidates.length()).map { candidates.getJSONObject(it) }.associateBy { it.optString("applicationIdentityKey") }
+        val slots = loadHubApplicationSlots()
+        val selected = (0 until slots.length()).mapNotNull { slots.optJSONObject(it)?.optString("applicationIdentityKey") }.toSet()
         val byIdentity = JSONObject()
         var verifiedConversions = 0
         var officialOutcomeAvailable = 0
@@ -1714,6 +1781,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         ).use { apps ->
             while (apps.moveToNext()) {
                 val identity = apps.getString(0)
+                if (identity !in selected) continue
                 val canonicalQuality = apps.getString(1)
                 val academicYear = apps.getInt(2)
                 val conversion = db.rawQuery(
@@ -1757,7 +1825,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                             .put("observedAt", c.getString(11)))
                     }
                 }
-                if (outcomes.length() > 0) officialOutcomeAvailable += 1
+                if ((0 until outcomes.length()).any { outcomes.getJSONObject(it).optBoolean("verified") }) officialOutcomeAvailable += 1
 
                 var prediction: JSONObject? = db.rawQuery(
                     "SELECT observed_at,provider,structured,metrics_json,source_label FROM score_prediction_snapshots WHERE application_identity_key=? ORDER BY observed_at DESC LIMIT 1",
@@ -1823,6 +1891,12 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                     .put("officialOutcomeLabel", outcomeLabel)
                     .put("predictionLabel", predictionLabel)
                     .put("decisionLabel", decisionLabel)
+                val review = ApplicationReviewEngine.evaluate(candidateById[identity] ?: JSONObject(), loadApplicationReviewInput(identity), fullProfile, prediction, Instant.now())
+                row.put("applicationReview", review).put("predictionLabel", SameCardPrediction.label(prediction))
+                val reviewInput = review.getJSONObject("input")
+                if (reviewInput.has("ownScore") && !reviewInput.isNull("ownScore")) row.put("conversionLabel", "대학 환산 입력: ${reviewInput.optDouble("ownScore")} · ${if (review.optBoolean("comparisonReady")) "사용자 근거 확인" else "확인 필요"}")
+                if (reviewInput.has("referenceScore") && !reviewInput.isNull("referenceScore")) row.put("officialOutcomeLabel", "입결 입력: ${reviewInput.optInt("outcomeYear")} ${reviewInput.optString("metricName")} ${reviewInput.optDouble("referenceScore")}")
+                row.put("decisionLabel", "원서 검토: ${review.optString("label")}")
                 byIdentity.put(identity, row)
 
                 val cv = ContentValues().apply {
@@ -1838,7 +1912,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         }
         return JSONObject()
             .put("schemaVersion", 1)
-            .put("studentProfile", studentProfile)
+            .put("studentProfile", if (fullProfile.optString("status") == "IMPORTED") fullProfile else studentProfile)
             .put("byIdentity", byIdentity)
             .put("summary", JSONObject()
                 .put("verifiedConversions", verifiedConversions)

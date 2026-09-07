@@ -36,7 +36,7 @@ object ScoreDecisionEngine {
             return hold(base, "MISSING_CONVERSION_SCORE", "판정 보류 · 대학 환산점수 없음")
         }
         val scale = conversion.optString("scoreScale").trim()
-        if (scale.isBlank()) {
+        if (scale.isBlank() || scale == "null") {
             return hold(base, "MISSING_SCORE_SCALE", "판정 보류 · 점수 척도 미확인")
         }
         val direction = conversion.optString("comparisonDirection").trim()
@@ -48,11 +48,14 @@ object ScoreDecisionEngine {
         }
 
         val comparable = mutableListOf<JSONObject>()
+        val ownFinite = conversion.optNullableDouble("scoreValue")
+            ?: return hold(base, "INVALID_CONVERSION_SCORE", "판정 보류 · 환산점수가 유효한 숫자가 아님")
         val conversionMax = conversion.optNullableDouble("maxScore")
         for (i in 0 until officialOutcomes.length()) {
             val outcome = officialOutcomes.optJSONObject(i) ?: continue
             if (!outcome.optBoolean("verified", false)) continue
             if (!outcome.has("metricValue") || outcome.isNull("metricValue")) continue
+            if (outcome.optNullableDouble("metricValue") == null) continue
             if (outcome.optString("scoreScale").trim() != scale) continue
             val outcomeMax = outcome.optNullableDouble("maxScore")
             if (conversionMax != null && outcomeMax != null && abs(conversionMax - outcomeMax) > 1e-9) continue

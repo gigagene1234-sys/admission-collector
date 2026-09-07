@@ -34,6 +34,7 @@ import com.admissionhub.collector.capture.SnapshotScript
 import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.hub.HubDashboardModel
+import com.admissionhub.collector.score.ScoreReviewUi
 import com.admissionhub.collector.hub.HubFirstLayoutPolicy
 import com.admissionhub.collector.observation.ObservationEvidence
 import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
@@ -84,6 +85,7 @@ class MainActivity : Activity() {
     private lateinit var localStore: LocalCollectorStore
     private lateinit var sessionVault: SecureSessionVault
     private lateinit var credentialVault: CredentialVault
+    private lateinit var scoreReviewUi: ScoreReviewUi
     private lateinit var slowLaneHost: FrameLayout
     private lateinit var slowLanePool: JinhakSlowLanePool
     private val jinhakMissionCells = JinhakMissionCellSupervisor()
@@ -489,8 +491,9 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.12.0"
-        private const val BUILD_CODE = 112000
+        private const val IMPORT_SCORE_REQUEST = 13130
+        private const val VERSION = "0.13.0"
+        private const val BUILD_CODE = 113000
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -503,6 +506,13 @@ class MainActivity : Activity() {
         jinhakMissionTargetLedger.setMutationListener { payload -> persistJinhakMissionMutation(payload) }
         sessionVault = SecureSessionVault(this)
         credentialVault = CredentialVault(this)
+        scoreReviewUi = ScoreReviewUi(this, localStore, { canonicalHubSessionId() }, { refreshHubDashboardFromStore("score-review") }, {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("text/csv", "text/tab-separated-values", "text/plain", "application/json"))
+            }, IMPORT_SCORE_REQUEST)
+        })
         buildUi()
         slowLanePool = JinhakSlowLanePool(this, slowLaneHost, object : JinhakSlowLanePool.Listener {
             override fun onSlowLaneCompleted(task: JinhakSlowLanePool.Task, snapshot: JSONObject, stats: JinhakSlowLanePool.ResultStats) {
@@ -596,7 +606,7 @@ class MainActivity : Activity() {
             setPadding(8, 8, 8, 8)
         }
         val sessionButton = Button(this).apply {
-            text = "계정 자동로그인 설정"
+            text = "계정 로그인 화면 열기"
             setOnClickListener { showCredentialDialog(provider, continueAfterSave = false) }
         }
         val liveWebButton = Button(this).apply {
@@ -675,7 +685,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         unifiedButton = Button(this).apply {
-            text = "자동 로그인 + 통합 수집"
+            text = "통합 동기화 시작"
             setOnClickListener {
                 when {
                     startupLoginPreflightActive -> cancelStartupLoginPreflight("user-cancel")
@@ -769,7 +779,7 @@ class MainActivity : Activity() {
                         setOnClickListener { showHubDashboardCard(index + 1) }
                     }
                     hubDashboardCards.add(card)
-                    row.addView(card, LinearLayout.LayoutParams(0, dashboardCardHeight, 1f).apply {
+                    row.addView(card, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                         setMargins(dp(5), dp(5), dp(5), dp(5))
                     })
                     cardIndex += 1
@@ -865,8 +875,13 @@ class MainActivity : Activity() {
         root.addView(primaryActions)
         root.addView(hubDashboardGrid, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(hubDecisionSummary, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(Button(this@MainActivity).apply { text = "내 성적 입력 / 가져오기"; setOnClickListener { scoreReviewUi.showProfile() } }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(Button(this@MainActivity).apply { text = "6장 원서 적정성 검토"; setOnClickListener { scoreReviewUi.showPortfolio() } }, LinearLayout.LayoutParams(0, -2, 1f))
+        })
         root.addView(hubAdvancedPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        setContentView(root)
+        setContentView(ScrollView(this).apply { isFillViewport = true; addView(root) })
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -897,6 +912,7 @@ class MainActivity : Activity() {
         val canonical = runCatching { localStore.canonicalHubSummary(canonicalSession) }.getOrDefault(JSONObject())
         val syncSession = if (unifiedRunning && !unifiedSessionId.isNullOrBlank()) unifiedSessionId else canonicalSession
         val sync = runCatching { localStore.unifiedStatus(syncSession ?: canonicalSession) }.getOrDefault(JSONObject())
+        if (trigger != "ticker") runCatching { localStore.materializeSelectedPredictions(canonicalSession) }
         val scoreDecision = runCatching { localStore.scoreDecisionSummary(canonicalSession) }.getOrDefault(JSONObject())
         val model = HubDashboardModel.build(canonical, sync, runtimeHubDashboardState(), scoreDecision)
         hubDashboardLastModel = model
@@ -926,7 +942,10 @@ class MainActivity : Activity() {
         if (::hubDecisionSummary.isInitialized) {
             val profile = model.optJSONObject("studentScoreProfile") ?: JSONObject()
             val profileText = if (profile.optString("status") == "IMPORTED") "성적 프로필 등록" else "성적 프로필 미등록"
-            hubDecisionSummary.text = "$profileText · 검증 환산 ${summary.optInt("verifiedConversions", 0)}/6 · 공식 입결 ${summary.optInt("officialOutcomeAvailable", 0)}/6 · 비교 가능 ${summary.optInt("comparableDecisions", 0)}/6 · 판정보류 ${summary.optInt("decisionHolds", 0)} · 진학사 예측자료 ${summary.optInt("predictionCollected", 0)}/6"
+            val portfolio = model.optJSONObject("applicationPortfolio")?.optJSONObject("counts") ?: JSONObject()
+            val own = if (profile.has("ownWeightedGrade") && !profile.isNull("ownWeightedGrade")) " · 입력 내신 %.3f".format(java.util.Locale.US, profile.optDouble("ownWeightedGrade")) else ""
+            hubDecisionSummary.text = "$profileText ${profile.optInt("rowCount", 0)}과목$own\n공식 검증 환산 ${summary.optInt("verifiedConversions", 0)}/6 · 공식 입결 ${summary.optInt("officialOutcomeAvailable", 0)}/6 · 진학사 수치 ${summary.optInt("structuredPredictions", 0)}/6\n원서 검토 가능 ${portfolio.optInt("REVIEWABLE")} · 성적 위험 ${portfolio.optInt("SCORE_RISK")} · 조건 재검토 ${portfolio.optInt("CONDITIONS_RECHECK")} · 자료 보완 ${portfolio.optInt("HOLD")}"
+
         }
         if (::sessionState.isInitialized) {
             sessionState.text = "통합 상태: ${sync.optString("stateLabel", "대기")} · ${sync.optString("progressText", "진행 수치 대기")}$ageText"
@@ -1010,6 +1029,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("지원 $slot 상세")
             .setMessage(message)
+            .setNeutralButton("원서 적정성·근거") { _, _ -> scoreReviewUi.showCard(card.optString("applicationIdentityKey")) }
             .setPositiveButton("확인", null)
             .show()
     }
@@ -1788,7 +1808,7 @@ class MainActivity : Activity() {
 
     private fun openProvider(which: ProviderId) {
         if (startupLoginPreflightActive) {
-            Toast.makeText(this, "자동 로그인 준비 중에는 사이트 전환을 로그인 오케스트레이터가 관리합니다.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "로그인 상태 확인 중에는 사이트 전환을 로그인 오케스트레이터가 관리합니다.", Toast.LENGTH_SHORT).show()
             return
         }
         if (unifiedRunning) {
@@ -1829,7 +1849,7 @@ class MainActivity : Activity() {
             scheduleLoginSurfaceDetection(provider, "session-refresh")
             sessionState.text = if (needsLogin) "○ 로그인 필요 감지 · 로그인 화면 대기" else "△ 로그인 상태 재확인 중 · 현재 화면 유지"
             status.text = if (needsLogin) {
-                "로그인이 필요한 상태가 감지되었습니다. 현재 화면을 유지하며 로그인 폼이 렌더링되면 저장 계정으로 자동 로그인합니다."
+                "로그인이 필요한 상태가 감지되었습니다. 현재 화면을 유지하며 로그인 폼이 나타나면 직접 로그인하세요."
             } else {
                 "로그인 상태가 확정되지 않았습니다. 화면 이동 없이 현재 페이지에서 다시 확인합니다."
             }
@@ -1918,7 +1938,7 @@ class MainActivity : Activity() {
                 }
                 sessionState.text = when {
                     authenticated -> "● 로그인 유지됨 · 보안 세션 lease 갱신"
-                    loginSurface -> "○ 로그인 화면 감지 · 자동 로그인 준비"
+                    loginSurface -> "○ 로그인 화면 감지 · 로그인 상태 확인"
                     needsLogin -> "○ 로그인 필요 상태 감지"
                     else -> "△ 로그인 상태 미확정 · 현재 화면 유지"
                 }
@@ -2623,61 +2643,12 @@ class MainActivity : Activity() {
     }
 
     private fun showCredentialDialog(which: ProviderId, continueAfterSave: Boolean) {
-        val existing = runCatching { credentialVault.load(which.wireName) }.getOrNull()
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            val p = (18 * resources.displayMetrics.density).toInt()
-            setPadding(p, p / 2, p, 0)
-        }
-        val username = EditText(this).apply {
-            hint = "${which.displayName} 아이디"
-            inputType = InputType.TYPE_CLASS_TEXT
-            setText(existing?.username.orEmpty())
-            setSelection(text.length)
-        }
-        val password = EditText(this).apply {
-            hint = if (existing != null) "비밀번호 변경 시에만 다시 입력" else "비밀번호"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        layout.addView(username)
-        layout.addView(password)
-
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("${which.displayName} 자동로그인")
-            .setMessage("이 기기 안에 Android Keystore로 암호화 저장합니다. 계정정보는 수집 JSON·로그·Cloud·웹 대시보드로 전송하지 않습니다.")
-            .setView(layout)
-            .setNeutralButton("저장정보 삭제") { _, _ ->
-                credentialVault.clear(which.wireName)
-                sessionState.text = "○ ${which.displayName} 자동로그인 정보 삭제됨"
-            }
-            .setNegativeButton("취소", null)
-            .setPositiveButton("저장") { _, _ ->
-                val u = username.text.toString().trim()
-                val p = password.text.toString().ifBlank { existing?.password.orEmpty() }
-                if (u.isBlank() || p.isBlank()) {
-                    Toast.makeText(this, "아이디와 비밀번호를 모두 입력해야 합니다.", Toast.LENGTH_LONG).show()
-                    return@setPositiveButton
-                }
-                runCatching { credentialVault.save(which.wireName, u, p) }
-                    .onSuccess {
-                        sessionState.text = "● ${which.displayName} 자동로그인 정보 저장됨"
-                        recordRuntimeEvent("credential-vault-updated", JSONObject()
-                            .put("provider", which.wireName)
-                            .put("credentialStored", true)
-                            .put("credentialExported", false))
-                        if (continueAfterSave) {
-                            credentialAutoLoginInFlight = false
-                            credentialAutoLoginLastAttemptAtMs = 0L
-                            credentialLoginSurfaceAttempts = 0
-                            // Do not force a login URL. If the site has already rendered a login
-                            // surface, the passive detector will fill and submit it immediately.
-                            scheduleLoginSurfaceDetection(which, "credential-saved")
-                        }
-                    }
-                    .onFailure { Toast.makeText(this, "암호화 저장 실패: ${it.javaClass.simpleName}", Toast.LENGTH_LONG).show() }
-            }
-            .create()
-        dialog.show()
+        // User-session collection keeps native WebView sessions; the app never stores or submits credentials.
+        hubAdvancedPanel.visibility = View.VISIBLE
+        hubAdvancedToggle.text = "고급 도구 닫기"
+        sessionState.text = "○ ${which.displayName} 사용자 로그인 필요"
+        status.text = "현재 공식 사이트 화면에서 직접 로그인하세요. 완료하면 인증 확인 후 수집을 이어갑니다."
+        if (!continueAfterSave) webView.loadUrl(providerLoginUrl(which))
     }
 
     private fun probeLoginSurface(which: ProviderId, callback: (JSONObject) -> Unit) {
@@ -2748,7 +2719,7 @@ class MainActivity : Activity() {
                         pauseBatchForRenderedLoginSurface(which, reason)
                     }
                     sessionState.text = "○ ${which.displayName} 로그인 화면 감지"
-                    status.text = "${which.displayName} 로그인 폼을 실제 DOM에서 감지했습니다. 저장된 계정이 있으면 현재 화면에서 자동 로그인합니다."
+                    status.text = "${which.displayName} 로그인 폼을 실제 DOM에서 감지했습니다. 현재 공식 사이트 화면에서 직접 로그인하세요."
                     if (credentialVault.has(which.wireName)) {
                         attemptSavedCredentialLogin(which, reason)
                     } else if (startupCredentialPromptedProvider != which) {
@@ -2761,145 +2732,9 @@ class MainActivity : Activity() {
     }
 
     private fun attemptSavedCredentialLogin(which: ProviderId, reason: String) {
-        if (provider != which) return
-        val now = System.currentTimeMillis()
-        if (credentialAutoLoginInFlight && now - credentialAutoLoginLastAttemptAtMs < 6_000L) {
-            credentialAutoLoginSuppressedInFlight += 1
-            return
-        }
-        if (now - credentialAutoLoginLastAttemptAtMs < 900L) {
-            credentialAutoLoginSuppressedThrottle += 1
-            return
-        }
-        val credentials = runCatching { credentialVault.load(which.wireName) }.getOrNull()
-        if (credentials == null) {
-            credentialAutoLoginSuppressedNoCredential += 1
-            return
-        }
-
-        probeLoginSurface(which) { probe ->
-            if (!probe.optBoolean("detected", false)) {
-                credentialAutoLoginSuppressedProbeLost += 1
-                return@probeLoginSurface
-            }
-            val surfaceKey = which.wireName + "|" + runtimeSafePath(webView.url)
-            if (surfaceKey != credentialLoginSurfaceKey) {
-                credentialLoginSurfaceKey = surfaceKey
-                credentialLoginSurfaceAttempts = 0
-            }
-            if (probe.optBoolean("credentialError", false) && credentialLoginSurfaceAttempts > 0) {
-                if (credentialAutoLoginLastResult != "credential-error") credentialAutoLoginFailures += 1
-                credentialAutoLoginLastResult = "credential-error"
-                credentialAutoLoginLastProvider = which.wireName
-                credentialAutoLoginLastAtMs = System.currentTimeMillis()
-                credentialAwaitingLoginExitProvider = null
-                sessionState.text = "△ ${which.displayName} 저장 계정 로그인 오류 감지"
-                status.text = "저장된 계정으로 로그인한 뒤 오류 문구가 감지되어 반복 제출을 중지했습니다. 계정 설정을 확인해주세요."
-                return@probeLoginSurface
-            }
-            if (credentialLoginSurfaceAttempts >= 2) {
-                credentialAutoLoginSuppressedRetryLimit += 1
-                sessionState.text = "△ ${which.displayName} 자동 로그인 재시도 한도 도달"
-                return@probeLoginSurface
-            }
-
-            credentialAutoLoginInFlight = true
-            credentialAutoLoginLastAttemptAtMs = System.currentTimeMillis()
-            credentialAutoLoginAttempts += 1
-            credentialLoginSurfaceAttempts += 1
-            credentialAwaitingLoginExitProvider = which
-            val userJs = JSONObject.quote(credentials.username)
-            val passJs = JSONObject.quote(credentials.password)
-            val script = """
-                (function(){
-                  try {
-                    function visible(el){ if(!el) return false; var s=getComputedStyle(el); if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false; var r=el.getBoundingClientRect(); return r.width>0&&r.height>0; }
-                    function setValue(el,value){
-                      var proto=Object.getPrototypeOf(el), d=null;
-                      while(proto&&!d){d=Object.getOwnPropertyDescriptor(proto,'value');proto=Object.getPrototypeOf(proto);}
-                      if(d&&d.set) d.set.call(el,value); else el.value=value;
-                      el.focus();
-                      ['input','change','keyup','blur'].forEach(function(t){el.dispatchEvent(new Event(t,{bubbles:true}));});
-                    }
-                    function roots(doc){var out=[doc];try{var all=doc.querySelectorAll('*');for(var i=0;i<all.length;i++)if(all[i].shadowRoot)out.push(all[i].shadowRoot);}catch(e){}return out;}
-                    var docs=[document]; try{var fs=document.querySelectorAll('iframe,frame');for(var f=0;f<fs.length;f++)try{if(fs[f].contentDocument)docs.push(fs[f].contentDocument);}catch(e){}}catch(e){}
-                    var selected=null;
-                    for(var d=0;d<docs.length&&!selected;d++){
-                      var rs=roots(docs[d]);
-                      for(var r=0;r<rs.length&&!selected;r++){
-                        var root=rs[r], passes=[];try{passes=Array.from(root.querySelectorAll('input[type=password]')).filter(visible);}catch(e){}
-                        for(var p=0;p<passes.length&&!selected;p++){
-                          var pass=passes[p], form=pass.form||pass.closest('form'), base=form||root, users=[];
-                          try{users=Array.from(base.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);}catch(e){}
-                          if(!users.length)try{users=Array.from(root.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);}catch(e){}
-                          function score(el){var meta=((el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')+' '+(el.autocomplete||'')).toLowerCase(),n=0;if(/아이디|user|login|member|email|account/.test(meta))n+=50;if(/\bid\b/.test(meta))n+=25;if((el.autocomplete||'').toLowerCase()==='username')n+=80;if(/search|검색/.test(meta))n-=120;if(form&&el.form===form)n+=100;return n;}
-                          users.sort(function(a,b){return score(b)-score(a);}); var user=users[0]||null; if(!user)continue;
-                          var controls=[];try{controls=Array.from((form||root).querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')).filter(visible);}catch(e){}
-                          if(!controls.length)try{controls=Array.from(root.querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')).filter(visible);}catch(e){}
-                          function label(el){return ((el.innerText||el.value||el.textContent||el.getAttribute('aria-label')||'')+'').replace(/\s+/g,' ').trim();}
-                          var submit=controls.find(function(el){return /^(로그인|로그인하기|log\s*in|sign\s*in)$/i.test(label(el));})||null;
-                          selected={user:user,pass:pass,form:form,submit:submit};
-                        }
-                      }
-                    }
-                    if(!selected) return 'fields-not-found';
-                    setValue(selected.user,$userJs); setValue(selected.pass,$passJs);
-                    // Jinhak's current login is UI-driven; prefer the rendered login control
-                    // before native form submission so framework click handlers execute.
-                    if(selected.submit){ selected.submit.focus(); selected.submit.click(); return 'submitted-click'; }
-                    if(selected.form&&typeof selected.form.requestSubmit==='function'){ selected.form.requestSubmit(); return 'submitted-form'; }
-                    try{selected.pass.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));selected.pass.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));return 'submitted-enter';}catch(e){}
-                    return 'submit-not-found';
-                  } catch(e) { return 'error'; }
-                })();
-            """.trimIndent()
-            webView.evaluateJavascript(script) { encoded ->
-                credentialAutoLoginInFlight = false
-                val result = decodeJsString(encoded).take(80)
-                credentialAutoLoginLastResult = result
-                credentialAutoLoginLastProvider = which.wireName
-                credentialAutoLoginLastAtMs = System.currentTimeMillis()
-                if (result.startsWith("submitted")) {
-                    credentialAutoLoginSubmissions += 1
-                } else {
-                    credentialAutoLoginFailures += 1
-                }
-                recordRuntimeEvent("credential-auto-login-attempt", JSONObject()
-                    .put("provider", which.wireName)
-                    .put("reason", reason.take(40))
-                    .put("result", result)
-                    .put("loginSurfaceDetected", true)
-                    .put("attemptOnSurface", credentialLoginSurfaceAttempts)
-                    .put("credentialStored", true)
-                    .put("credentialExported", false))
-                sessionState.text = if (result.startsWith("submitted")) "● ${which.displayName} 자동 로그인 제출됨" else "△ ${which.displayName} 자동 로그인: $result"
-                if (!result.startsWith("submitted")) credentialAwaitingLoginExitProvider = null
-                handler.postDelayed({
-                    checkSessionState { needsLogin, authenticated ->
-                        if (jinhakRealAuthProbeActive && which == ProviderId.JINHAK) {
-                            credentialLoginSurfaceAttempts = if (authenticated) 0 else credentialLoginSurfaceAttempts
-                            scheduleJinhakRealAuthProbePoll(jinhakRealAuthProbeGeneration, 250L)
-                            return@checkSessionState
-                        }
-                        if (authenticated) {
-                            credentialLoginSurfaceAttempts = 0
-                            val url = webView.url.orEmpty()
-                            if (url.isNotBlank()) runCatching { sessionVault.captureAuthenticated(which.wireName, url, VERSION) }
-                            if (batchRunning && batchPausedForLogin) resumeAfterLogin()
-                            if (startupLoginPreflightActive && provider == which) {
-                                val generation = startupLoginPollGeneration
-                                onStartupProviderAuthenticated(which, generation)
-                            }
-                        } else if (needsLogin) {
-                            scheduleLoginSurfaceDetection(which, "post-submit")
-                            if (which == ProviderId.JINHAK) scheduleJinhakLoginRecovery("post-submit-needs-login")
-                        } else if (which == ProviderId.JINHAK) {
-                            scheduleJinhakLoginRecovery("post-submit-provider-verification")
-                        }
-                    }
-                }, 1_100L)
-            }
-        }
+        // Compatibility entry point for old recovery callers: manual login only.
+        credentialAutoLoginSuppressedNoCredential += 1
+        showCredentialDialog(which, continueAfterSave = true)
     }
 
     private fun isFreshJinhakRealAuthProbe(): Boolean {
@@ -3181,7 +3016,7 @@ class MainActivity : Activity() {
     private fun startAutomaticLoginAndCollectionSequence(trigger: String) {
         if (startupLoginPreflightActive) return
         if (unifiedRunning || batchRunning) {
-            Toast.makeText(this, "진행 중인 수집이 있어 자동 로그인 준비를 시작할 수 없습니다.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "진행 중인 수집이 있어 로그인 상태 확인를 시작할 수 없습니다.", Toast.LENGTH_LONG).show()
             return
         }
         startupLoginPreflightActive = true
@@ -3248,12 +3083,12 @@ class MainActivity : Activity() {
                 .put("bypassPrevented", true)
                 .put("credentialStoredLocally", credentialVault.has(ProviderId.ADIGA.wireName) || credentialVault.has(ProviderId.JINHAK.wireName))
                 .put("credentialExported", false)
-                .put("sessionSecretStoredLocally", true)
+                .put("sessionSecretStoredLocally", false)
                 .put("sessionSecretExported", false))
         }
 
         startupLoginPollGeneration += 1
-        unifiedButton.text = "자동 로그인 취소"
+        unifiedButton.text = "로그인 확인 취소"
         recordRuntimeEvent("startup-login-sequence-start", JSONObject()
             .put("trigger", startupLoginTrigger)
             .put("credentialStorage", false)
@@ -3268,8 +3103,8 @@ class MainActivity : Activity() {
         startupLoginStage = "cancelled"
         startupLoginOpenAttempted = false
         startupLoginPollGeneration += 1
-        unifiedButton.text = "자동 로그인 + 통합 수집"
-        status.text = "자동 로그인 준비가 취소되었습니다. 다시 시작하면 어디가→진학사 로그인 확인 후 수집합니다."
+        unifiedButton.text = "통합 동기화 시작"
+        status.text = "로그인 상태 확인가 취소되었습니다. 다시 시작하면 어디가→진학사 로그인 확인 후 수집합니다."
         recordRuntimeEvent("startup-login-sequence-cancel", JSONObject().put("reason", reason.take(80)))
     }
 
@@ -3345,11 +3180,11 @@ class MainActivity : Activity() {
                     startupAuthIndeterminatePolls = 0
                     sessionState.text = "○ ${expectedProvider.displayName} 로그인 화면 감지"
                     if (credentialVault.has(expectedProvider.wireName)) {
-                        status.text = "${expectedProvider.displayName} 로그인 화면이 실제로 감지되어 저장 계정으로 자동 로그인합니다."
+                        status.text = "${expectedProvider.displayName} 로그인 화면이 감지되었습니다. 직접 로그인하세요."
                         attemptSavedCredentialLogin(expectedProvider, "startup-login-surface")
                     } else if (startupCredentialPromptedProvider != expectedProvider) {
                         startupCredentialPromptedProvider = expectedProvider
-                        status.text = "${expectedProvider.displayName} 로그인 화면이 감지되었습니다. 자동로그인 정보를 한 번 저장해주세요."
+                        status.text = "${expectedProvider.displayName} 로그인 화면이 감지되었습니다. 공식 사이트 화면에서 직접 로그인하세요."
                         showCredentialDialog(expectedProvider, continueAfterSave = true)
                     }
                     scheduleStartupLoginPoll(expectedProvider, generation)
@@ -3388,7 +3223,7 @@ class MainActivity : Activity() {
                         } else if (startupCredentialPromptedProvider != expectedProvider) {
                             startupCredentialPromptedProvider = expectedProvider
                             loginRouteFallbackCredentialPrompts += 1
-                            status.text = "로그인이 필요합니다. 이 기기에만 암호화 저장할 자동로그인 정보를 입력해주세요."
+                            status.text = "로그인이 필요합니다. 공식 사이트 화면에서 직접 로그인하세요."
                             showCredentialDialog(expectedProvider, continueAfterSave = true)
                         }
                         scheduleStartupLoginPoll(expectedProvider, generation)
@@ -3454,7 +3289,7 @@ class MainActivity : Activity() {
                     }
                 }
                 sessionState.text = if (needsLogin) "○ 로그인 필요 신호 감지 · 로그인 폼 렌더링 대기" else "△ 로그인 상태 확인 중 · 현재 화면 유지"
-                status.text = "${expectedProvider.displayName} 현재 화면을 유지합니다. 실제 로그인 폼이 감지될 때만 자동 로그인을 실행합니다."
+                status.text = "${expectedProvider.displayName} 현재 화면을 유지합니다. 로그인이 필요한 경우 직접 로그인하도록 안내합니다."
                 scheduleStartupLoginPoll(expectedProvider, generation)
             }
         }
@@ -3487,7 +3322,7 @@ class MainActivity : Activity() {
         if (currentUrl.isNotBlank()) runCatching { sessionVault.captureAuthenticated(expectedProvider.wireName, currentUrl, VERSION) }
         recordRuntimeEvent("startup-login-provider-authenticated", JSONObject()
             .put("provider", expectedProvider.wireName)
-            .put("credentialStoredLocally", credentialVault.has(expectedProvider.wireName)).put("credentialExported", false).put("sessionSecretStoredLocally", true).put("sessionSecretExported", false))
+            .put("credentialStoredLocally", credentialVault.has(expectedProvider.wireName)).put("credentialExported", false).put("sessionSecretStoredLocally", false).put("sessionSecretExported", false))
         if (expectedProvider == ProviderId.ADIGA) {
             sessionState.text = "● 어디가 로그인 확인 완료"
             status.text = "자동 준비 1/3 완료 · 진학사 로그인 확인으로 이동합니다."
@@ -3507,7 +3342,7 @@ class MainActivity : Activity() {
                 .put("trigger", startupLoginTrigger)
                 .put("bothProvidersAuthenticated", startupLoginAdigaAuthenticated && startupLoginJinhakAuthenticated)
                 .put("jinhakAuthenticatedForBatch", jinhakAuthVerifiedForBatch)
-                .put("credentialStoredLocally", credentialVault.has(expectedProvider.wireName)).put("credentialExported", false).put("sessionSecretStoredLocally", true).put("sessionSecretExported", false))
+                .put("credentialStoredLocally", credentialVault.has(expectedProvider.wireName)).put("credentialExported", false).put("sessionSecretStoredLocally", false).put("sessionSecretExported", false))
             handler.postDelayed({
                 if (!unifiedRunning && !batchRunning && startupLoginPreflightVerified) {
                     startUnifiedCollectionAuthenticated()
@@ -3560,7 +3395,7 @@ class MainActivity : Activity() {
                     .put("loginUiOpenCount", startupLoginUiOpenCount)
                     .put("verifiedAtMs", startupLoginVerifiedAtMs)
                     .put("passwordStored", false)
-                    .put("sessionSecretStoredLocally", startupLoginAdigaRestoredLease || startupLoginJinhakRestoredLease)
+                    .put("sessionSecretStoredLocally", false)
                     .put("sessionSecretExported", false)
                     .put("adigaCredentialStored", credentialVault.has(ProviderId.ADIGA.wireName))
                     .put("jinhakCredentialStored", credentialVault.has(ProviderId.JINHAK.wireName))
@@ -4210,7 +4045,7 @@ class MainActivity : Activity() {
             ++jinhakAbsoluteTargetGeneration
 
             if (sessionId == null) {
-                unifiedButton.text = "자동 로그인 + 통합 수집"
+                unifiedButton.text = "통합 동기화 시작"
                 status.text = "종료할 통합 수집 세션이 없습니다."
                 return
             }
@@ -4261,7 +4096,7 @@ class MainActivity : Activity() {
                 .put("fullExport", "Use JSON 저장; records are streamed from SQLite to the destination file.")
                 .toString(2)
             showPreview(lastJson)
-            unifiedButton.text = "자동 로그인 + 통합 수집"
+            unifiedButton.text = "통합 동기화 시작"
             pendingUnifiedExportSessionId = sessionId
             cloudOffload.sendDiagnostic(
                 "unified", VERSION,
@@ -5609,7 +5444,7 @@ class MainActivity : Activity() {
         batchCloudFinalCheckInProgress = false
         disarmBatchNavigationWatchdog()
         hideBatchCover()
-        sessionState.text = "○ ${which.displayName} 로그인 화면 감지 · 자동 로그인 중"
+        sessionState.text = "○ ${which.displayName} 로그인 화면 감지 · 사용자 로그인 필요"
         status.text = "현재 수집 대상을 보존한 채 로그인 처리를 기다립니다. 로그인 성공 후 같은 대상을 다시 엽니다."
         recordRuntimeEvent(
             "rendered-login-surface-batch-pause",
@@ -5665,7 +5500,7 @@ class MainActivity : Activity() {
                     .put("proactiveLoginNavigation", false))
                 sessionState.text = "○ ${expectedProvider.displayName} 로그인 경로 감지 · 수집 대상 보존"
                 if (credentialVault.has(expectedProvider.wireName)) {
-                    status.text = "현재 수집 대상을 보존했습니다. 로그인 화면이 늦게 렌더링되어도 계속 감지해 자동로그인 후 동일 target을 재개합니다."
+                    status.text = "현재 수집 대상을 보존했습니다. 로그인 화면이 늦게 렌더링되어도 계속 감지하며 직접 로그인하면 같은 수집 대상을 재개합니다."
                     if (expectedProvider == ProviderId.JINHAK) scheduleJinhakLoginRecovery("batch-login-route-fallback")
                     else scheduleLoginSurfaceDetection(expectedProvider, "batch-login-route-fallback")
                 } else if (startupCredentialPromptedProvider != expectedProvider) {
@@ -8411,6 +8246,20 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == IMPORT_SCORE_REQUEST && resultCode == RESULT_OK) {
+            val uri = data?.data ?: return
+            Thread {
+                val result = runCatching {
+                    contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { reader ->
+                        val text = StringBuilder(); val buffer = CharArray(8192)
+                        while (true) { val n = reader.read(buffer); if (n < 0) break; text.append(buffer, 0, n); require(text.length <= 1_000_000) { "성적 파일은 1MB 이하여야 합니다." } }
+                        text.toString()
+                    } ?: error("파일을 열 수 없습니다.")
+                }
+                runOnUiThread { result.onSuccess { scoreReviewUi.showProfile(it) }.onFailure { Toast.makeText(this, it.message ?: "UTF-8 성적 파일을 확인하세요.", Toast.LENGTH_LONG).show() } }
+            }.start()
+            return
+        }
         if (requestCode == SAVE_JSON_REQUEST && resultCode == RESULT_OK) {
             val uri: Uri = data?.data ?: return
             val streamSession = pendingUnifiedExportSessionId
@@ -8419,7 +8268,7 @@ class MainActivity : Activity() {
             Thread {
                 val result = runCatching {
                     contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { writer ->
-                        if (streamSession != null) localStore.writeUnifiedExport(streamSession, writer)
+                        if (streamSession != null) localStore.writeUnifiedExport(streamSession, writer, VERSION, BUILD_CODE)
                         else writer.write(lastJson)
                     } ?: error("output-stream-unavailable")
                 }
