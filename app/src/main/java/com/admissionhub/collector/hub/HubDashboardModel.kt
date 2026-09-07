@@ -3,10 +3,11 @@ package com.admissionhub.collector.hub
 import org.json.JSONArray
 import org.json.JSONObject
 import com.admissionhub.collector.score.ApplicationReviewEngine
+import java.math.BigDecimal
 
 /** Read-only presentation model over persisted canonical, sync, and score-decision evidence. */
 object HubDashboardModel {
-    const val SCHEMA_VERSION = 3
+    const val SCHEMA_VERSION = 4
     const val SLOT_COUNT = 6
 
     fun build(
@@ -98,6 +99,7 @@ object HubDashboardModel {
         val campus = candidate.nullableString("campus")
         val capacity = if (candidate.has("capacity") && !candidate.isNull("capacity")) candidate.optInt("capacity", -1).takeIf { it >= 0 } else null
         val quality = candidate.optString("qualityState", candidate.optString("adigaBindingQuality", "unknown"))
+        val displayScore = enrichScoreForDisplay(score)
         return JSONObject()
             .put("slot", slot).put("occupied", true).put("resolvable", true)
             .put("applicationIdentityKey", candidate.optString("applicationIdentityKey"))
@@ -113,17 +115,68 @@ object HubDashboardModel {
             .put("missingLanes", coverage.optJSONArray("missing") ?: JSONArray())
             .put("updatedAt", candidate.optString("updatedAt"))
             .put("academicYear", candidate.optInt("academicYear"))
-            .put("applicationReview", score?.optJSONObject("applicationReview") ?: JSONObject().put("code", "HOLD").put("label", "자료 보완 후 판단"))
+            .put("applicationReview", displayScore.optJSONObject("applicationReview") ?: JSONObject().put("code", "HOLD").put("label", "자료 보완 후 판단"))
             .put("officialStructuralCurrent", binding.optInt("officialStructuralCurrent", 0))
             .put("officialRowBoundCurrent", binding.optInt("officialRowBoundCurrent", 0))
             .put("officialTableSegmentCurrent", binding.optInt("officialTableSegmentCurrent", 0))
             .put("adigaMatchCount", candidate.optInt("adigaMatchCount", 0))
-            .put("scoreDecision", score ?: JSONObject()
-                .put("conversionLabel", "대학 환산: 미확인")
-                .put("officialOutcomeLabel", "공식 입결: 미확인")
-                .put("predictionLabel", "진학사 예측: 미확인")
-                .put("decisionLabel", "종합: 판정 보류"))
+            .put("scoreDecision", displayScore)
     }
+
+    private fun enrichScoreForDisplay(source: JSONObject?): JSONObject {
+        if (source == null) return JSONObject()
+            .put("conversionLabel", "대학 환산: 학생부 Excel 가져오기 필요")
+            .put("officialOutcomeLabel", "공식 입결: 아직 원서별 값으로 재결합되지 않음")
+            .put("predictionLabel", "진학사 예측: 미확인")
+            .put("decisionLabel", "종합: 판정 보류")
+        val out = JSONObject(source.toString())
+        val conversion = out.optJSONObject("conversion")
+        if (conversion != null && !conversion.optBoolean("verified", false)) {
+            val reason = conversion.optJSONObject("detail")?.optString("reason").orEmpty()
+            out.put("conversionLabel", when (conversion.optString("status")) {
+                "holistic-not-quantitative" -> "대학 환산: 정량 산출 대상 아님 · 학생부종합Ⅱ 서류 정성평가"
+                "student-profile-not-imported" -> "대학 환산: 학생부 Excel 가져오기 필요"
+                "transcript-not-confirmed-complete" -> "대학 환산: 학생부 전체 과목 확인 필요"
+                "unsupported-official-formula" -> "대학 환산: 자동 산출 미지원 · 공식 산식 범위 확인 필요"
+                "official-components-not-verified" -> "대학 환산: 지원년도 전형·모집단위 공식 식별 보강 필요"
+                else -> if (reason.isNotBlank()) "대학 환산: 보류 · ${reason.take(120)}" else out.optString("conversionLabel", "대학 환산: 미확인")
+            })
+        }
+
+        val outcomes = out.optJSONArray("officialOutcomes") ?: JSONArray()
+        val verified = (0 until outcomes.length()).mapNotNull { outcomes.optJSONObject(it) }.filter { it.optBoolean("verified", false) && it.has("metricValue") && !it.isNull("metricValue") }
+        if (verified.isNotEmpty()) {
+            val latestYear = verified.maxOf { it.optInt("academicYear", 0) }
+            val sameYear = verified.filter { it.optInt("academicYear", 0) == latestYear }
+            val parts = sameYear.sortedBy { metricOrder(it.optString("metricName")) }.take(4).map { outcomeDisplay(it) }
+            out.put("officialOutcomeLabel", "공식 입결: $latestYear · ${parts.joinToString(" · ")}")
+        }
+        return out
+    }
+
+    private fun metricOrder(name: String): Int = when {
+        "50%" in name && "환산" in name -> 1
+        "70%" in name && "환산" in name -> 2
+        "50%" in name && "등급" in name -> 3
+        "70%" in name && "등급" in name -> 4
+        else -> 9
+    }
+
+    private fun outcomeDisplay(outcome: JSONObject): String {
+        val name = outcome.optString("metricName")
+        val prefix = when {
+            "50%" in name && "환산" in name -> "50% 환산"
+            "70%" in name && "환산" in name -> "70% 환산"
+            "50%" in name && "등급" in name -> "50% 등급"
+            "70%" in name && "등급" in name -> "70% 등급"
+            else -> name.take(28)
+        }
+        val value = compactNumber(outcome.optDouble("metricValue"))
+        val max = if (outcome.has("maxScore") && !outcome.isNull("maxScore")) "/${compactNumber(outcome.optDouble("maxScore"))}" else ""
+        return "$prefix $value$max"
+    }
+
+    private fun compactNumber(value: Double): String = if (!value.isFinite()) "?" else BigDecimal.valueOf(value).stripTrailingZeros().toPlainString()
 
     private fun buildSync(syncStatus: JSONObject, runtime: JSONObject): JSONObject {
         val persistedStatus = syncStatus.optString("status", "unknown")
