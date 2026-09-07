@@ -1,4 +1,5 @@
 name: Build Admission Hub v0.10.4 Local Rebind Continuity Retry
+# final retry after adding the JVM org.json runtime used by Mission Cell Supervisor tests
 
 on:
   push:
@@ -41,6 +42,7 @@ jobs:
           adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
           cell=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionCellSupervisor.kt').read_text()
           lease_test=Path('app/src/test/java/com/admissionhub/collector/jinhak/JinhakMissionCellSupervisorLeaseTest.kt').read_text()
+          gradle=Path('app/build.gradle.kts').read_text()
           checks={
             'version': 'private const val VERSION = "0.10.4"' in main and 'private const val BUILD_CODE = 110040' in main,
             'no-launch-full-crawl': 'private const val AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = false' in main,
@@ -48,6 +50,7 @@ jobs:
             'cross-session-canonical-source': 'latestReusableCanonicalSessionId' in store and 'crossSessionContinuity' in store,
             'hard-cell-lease': 'armJinhakHardCellLeaseWatchdog' in main and 'JINHAK_HARD_CELL_LEASE_POLL_MS' in main,
             'valid-lease-test-threshold': 'staleOwnershipMs = 1_000L' in lease_test and 'staleOwnershipMs = 100L' not in lease_test,
+            'jvm-json-test-runtime': 'org.json:json:20240303' in gradle,
             'late-callback-generation': 'LATE_CALLBACK_IGNORED' in cell,
             'batch-crawl-disabled': 'override val supportsBatchCrawl = false' in adapter,
             'user-session-mission': 'override val supportsUserSessionMissionTraversal = true' in adapter,
