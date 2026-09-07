@@ -1,0 +1,179 @@
+name: Build Admission Hub v0.10.3 Official Table Binding
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-admission-hub-v0103.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.10.3-Official-Table-Binding.apk
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v0.10.3 bounded official binding patch
+        run: python3 .github/scripts/patch_v0103.py
+
+      - name: Verify cumulative architecture and binding invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          main=Path('app/src/main/java/com/admissionhub/collector/MainActivity.kt').read_text()
+          store=Path('app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt').read_text()
+          evid=Path('app/src/main/java/com/admissionhub/collector/canonical/AdigaOfficialAdmissionEvidence.kt').read_text()
+          policy=Path('app/src/main/java/com/admissionhub/collector/canonical/AdigaOfficialTableBindingPolicy.kt').read_text()
+          test=Path('app/src/test/java/com/admissionhub/collector/canonical/AdigaOfficialTableBindingPolicyTest.kt').read_text()
+          adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
+          mission=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakApplicationMission.kt').read_text()
+          auth=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakAuthDomainPolicy.kt').read_text()
+          cell=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionCellSupervisor.kt').read_text()
+          checks={
+            'version': 'private const val VERSION = "0.10.3"' in main and 'private const val BUILD_CODE = 110030' in main,
+            'official-structural-policy': 'findExplicitSegmentBindings' in policy and 'isExplicitScopeDeclaration' in policy,
+            'same-table-only': 'same-official-table-explicit-scope-segment' in evid and 'sameOfficialTableSegment' in evid,
+            'scope-boundary-test': 'nextScopeHeaderStopsInheritance' in test,
+            'no-university-wide-propagation-test': 'universityWideAdmissionMentionDoesNotPropagate' in test,
+            'roman-variant-test': 'combinedJonghapOneAndTwoIsNotExactForTwo' in test,
+            'binding-json-v2': 'official-structural-v2' in store and 'sameRowOrExplicitTableScopeRequiredForOfficialAccepted' in store,
+            'do-not-infer': 'doNotInferMissingBindings' in store,
+            'selected-six-ui': '공식결합 $selectedAccepted/6' in main,
+            'batch-crawl-disabled': 'override val supportsBatchCrawl = false' in adapter,
+            'user-session-mission': 'override val supportsUserSessionMissionTraversal = true' in adapter,
+            'same-card': 'same-card-action-not-found' in main,
+            'auth-domain-preserved': 'freshCoreFastTargetQuarantines' in main and 'TARGET_QUARANTINE' in auth,
+            'mission-cell-preserved': 'LATE_CALLBACK_IGNORED' in cell,
+            'no-invented-rail-dept': '철도차량시스템공학과' not in mission,
+          }
+          failed=[k for k,v in checks.items() if not v]
+          if failed: raise SystemExit('v0.10.3 invariant failure: '+', '.join(failed))
+          # Acceptance must not be granted from generic university-current evidence alone.
+          quality_block=store.split('val bindingQuality = when {',1)[1].split('}',1)[0]
+          if 'currentUniversityEvidence > 0 -> "accepted"' in quality_block:
+              raise SystemExit('unsafe university-wide accepted binding detected')
+          print('v0.10.3 cumulative + official binding invariants passed')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Run official binding Mission Lab unit tests
+        run: gradle --no-daemon :app:testDebugUnitTest --tests 'com.admissionhub.collector.canonical.AdigaOfficialTableBindingPolicyTest'
+
+      - name: Compile patched source
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify patched APK metadata and signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/badging.txt
+          grep -Fq "versionCode='110030'" /tmp/badging.txt
+          grep -Fq "versionName='0.10.3'" /tmp/badging.txt
+          grep -Fq "application-label:'Admission Hub v0.10.3 Official Table Binding'" /tmp/badging.txt
+          grep -qi 'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995' /tmp/apksigner.txt
+
+      - name: Commit v0.10.3 product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/local/LocalCollectorStore.kt \
+            app/src/main/java/com/admissionhub/collector/canonical/AdigaOfficialAdmissionEvidence.kt \
+            app/src/main/java/com/admissionhub/collector/canonical/AdigaOfficialTableBindingPolicy.kt \
+            app/src/test/java/com/admissionhub/collector/canonical/AdigaOfficialTableBindingPolicyTest.kt \
+            app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml
+          git commit -m "Implement v0.10.3 Official Table Binding and Canonical Acceptance"
+          git push origin HEAD:main
+          PRODUCT_SHA=$(git rev-parse HEAD)
+          echo "PRODUCT_SHA=$PRODUCT_SHA" >> "$GITHUB_ENV"
+          echo "Product commit: $PRODUCT_SHA"
+
+      - name: Rebuild and retest exact committed product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git reset --hard "$PRODUCT_SHA"
+          rm -rf app/build
+          gradle --no-daemon :app:testDebugUnitTest --tests 'com.admissionhub.collector.canonical.AdigaOfficialTableBindingPolicyTest'
+          gradle --no-daemon :app:assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee /tmp/final-apksigner.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/final-badging.txt
+          grep -Fq "versionCode='110030'" /tmp/final-badging.txt
+          grep -Fq "versionName='0.10.3'" /tmp/final-badging.txt
+          grep -Fq "application-label:'Admission Hub v0.10.3 Official Table Binding'" /tmp/final-badging.txt
+          grep -qi 'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995' /tmp/final-apksigner.txt
+
+      - name: Package final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/$APK_NAME"
+          sha256sum "dist/$APK_NAME" | tee "dist/$APK_NAME.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.10.3-official-table-binding
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish v0.10.3 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release delete v0.10.3 --yes --cleanup-tag >/dev/null 2>&1 || true
+          git tag -f v0.10.3 "$PRODUCT_SHA"
+          git push origin -f v0.10.3
+          gh release create v0.10.3 \
+            "dist/$APK_NAME" "dist/$APK_NAME.sha256" \
+            --target "$PRODUCT_SHA" \
+            --title "Admission Hub v0.10.3 — Official Table Binding + Canonical Acceptance" \
+            --notes "Expands the conservative Adiga canonical acceptance gate from same-row-only to same-row OR an explicit admission-scope segment within the SAME official table. Scope inheritance starts only at explicit labels such as 모집단위/해당전형/전형명 and stops at the next explicit scope row; generic university-wide mentions never propagate to a department. Historical segment evidence remains non-accepting. Adds semantic admission matching with Roman I/II separation, official structural evidence diagnostics, selected-six accepted-count UI, and Mission Lab tests. Preserves v0.10.2 auth-domain separation, mission ownership repair, selected-six recovery, same-card rules, privacy boundaries, and prediction-vs-historical separation. Product commit: $PRODUCT_SHA"
