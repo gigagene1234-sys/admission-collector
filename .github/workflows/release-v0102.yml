@@ -1,0 +1,46 @@
+name: Release v0.10.2 Verified APK
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/release-v0102.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PRODUCT_SHA: 5f94bbb6aaf9cecf79157cb16ebc19aace0c206a
+      BUILD_RUN_ID: 34069714314
+      APK_NAME: Admission-Hub-v0.10.2-Auth-Ownership-Repair.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download verified signed APK artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "$BUILD_RUN_ID" -n admission-collector-main-debug -D dist
+          test -f dist/app-debug.apk
+          mv dist/app-debug.apk "dist/$APK_NAME"
+          printf '%s  %s\n' 'c2693ba803ec5f6305ce4a1fdd8b5625cb8b720956f9c2d9aadaf9e91eb1789a' "$APK_NAME" > "dist/$APK_NAME.sha256"
+          echo 'c2693ba803ec5f6305ce4a1fdd8b5625cb8b720956f9c2d9aadaf9e91eb1789a  dist/'"$APK_NAME" | sha256sum -c -
+      - name: Publish release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release delete v0.10.2 --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create v0.10.2 \
+            "dist/$APK_NAME" "dist/$APK_NAME.sha256" \
+            --target "$PRODUCT_SHA" \
+            --title "Admission Hub v0.10.2 — Auth Domain Separation + Mission Ownership Repair" \
+            --notes "Fixes the v0.10.1 late-login failure mode by separating provider-global authentication from target-specific login redirects. A repeated redirect for the same target after a fresh protected-core proof is quarantined immediately instead of starting another global re-auth cycle. Preserves active mission ownership across report/generic actions, replays CLICKED/DEFERRED orphan mission targets before generic exploration, and blocks generic navigation while persistent mission work remains. When six Hub slots are fixed, app launch now prefers selected-six recovery rather than silently starting a full 27-target recrawl; Hub slot edits/publish are fenced during collection. Adds sanitized auto-login suppression diagnostics and Mission Lab unit tests. Credentials and session secrets remain device-local and are not exported. Product commit: $PRODUCT_SHA. Signed APK verification build: GitHub Actions run $BUILD_RUN_ID."
