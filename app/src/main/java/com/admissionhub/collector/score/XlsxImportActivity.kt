@@ -23,12 +23,13 @@ import com.admissionhub.collector.local.LocalCollectorStore
 import java.io.ByteArrayOutputStream
 import java.util.Locale
 
-/** Native review-first XLSX import. The workbook never leaves the device. */
+/** Native review-first Excel transcript import. The workbook never leaves the device. */
 class XlsxImportActivity : Activity() {
     private lateinit var store: LocalCollectorStore
     private lateinit var root: LinearLayout
     private var workbook: XlsxStudentScoreImport.Workbook? = null
     private var fileName: String = "학생부.xlsx"
+    private var sourceFormat: String = "XLSX"
     private var selectedSheet = 0
     private var headerRow = 1
     private val mappingSpinners = linkedMapOf<XlsxStudentScoreImport.Field, Spinner>()
@@ -46,32 +47,43 @@ class XlsxImportActivity : Activity() {
 
     private fun renderEmpty() {
         root.removeAllViews()
-        text("학생부 XLSX 가져오기", 20f)
-        text("파일은 이 기기에서만 읽습니다. 수식은 실행하지 않고 XLSX에 저장된 캐시값만 읽으며, 빈 석차등급은 0으로 바꾸지 않습니다.")
-        button("XLSX 파일 선택") { openPicker() }
+        text("학생부 Excel 가져오기", 20f)
+        text("실제 .xls(Excel 97~2003)와 .xlsx를 모두 읽습니다. 파일은 기기에서만 처리하며, 수식은 실행하지 않고 저장된 캐시값만 읽습니다. 빈 석차등급은 0으로 바꾸지 않습니다.")
+        button("XLS / XLSX 파일 선택") { openPicker() }
     }
 
     private fun openPicker() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            type = "application/*"
             putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
+                "application/vnd.ms-excel",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 "application/octet-stream"
             ))
-        }, PICK_XLSX)
+        }, PICK_EXCEL)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != PICK_XLSX || resultCode != RESULT_OK) return
+        if (requestCode != PICK_EXCEL || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
-        fileName = displayName(uri) ?: "학생부.xlsx"
-        root.removeAllViews(); text("XLSX 분석 중…", 18f); text(fileName)
+        fileName = displayName(uri) ?: "학생부 Excel"
+        root.removeAllViews(); text("Excel 분석 중…", 18f); text(fileName)
         Thread {
             val result = runCatching {
                 val bytes = readLimited(uri)
-                XlsxStudentScoreImport.parse(bytes)
+                when {
+                    LegacyXlsStudentScoreImport.looksLikeXls(bytes) -> {
+                        sourceFormat = "XLS"
+                        LegacyXlsStudentScoreImport.parse(bytes)
+                    }
+                    bytes.size >= 4 && bytes[0] == 'P'.code.toByte() && bytes[1] == 'K'.code.toByte() -> {
+                        sourceFormat = "XLSX"
+                        XlsxStudentScoreImport.parse(bytes)
+                    }
+                    else -> error("선택한 파일은 지원되는 .xls 또는 .xlsx 형식이 아닙니다. 파일 이름이 아니라 실제 Excel 형식을 확인했습니다.")
+                }
             }
             runOnUiThread {
                 result.onSuccess {
@@ -79,7 +91,7 @@ class XlsxImportActivity : Activity() {
                     selectedSheet = 0
                     headerRow = XlsxStudentScoreImport.suggestHeaderRow(it.sheets[0])
                     renderWorkbook()
-                }.onFailure { showError(it.message ?: "XLSX 파일을 읽지 못했습니다.", true) }
+                }.onFailure { showError(it.message ?: "Excel 파일을 읽지 못했습니다.", true) }
             }
         }.start()
     }
@@ -88,12 +100,12 @@ class XlsxImportActivity : Activity() {
         val wb = workbook ?: return renderEmpty()
         val sheet = wb.sheets[selectedSheet.coerceIn(wb.sheets.indices)]
         root.removeAllViews(); mappingSpinners.clear()
-        text("학생부 XLSX 가져오기", 20f)
-        text("$fileName · 시트 ${wb.sheets.size}개 · 워크북 수식 셀 ${wb.formulaCellCount}개")
-        if (wb.formulaCellCount > 0) text("수식은 계산하지 않습니다. 저장된 캐시값만 미리보기와 가져오기에 사용되며 저장 전에 사용된 수식 셀 수를 다시 표시합니다.")
+        text("학생부 Excel 가져오기", 20f)
+        text("$fileName · $sourceFormat · 시트 ${wb.sheets.size}개 · 워크북 수식 셀 ${wb.formulaCellCount}개")
+        if (wb.formulaCellCount > 0) text("수식은 계산하지 않습니다. 파일에 저장된 캐시값만 미리보기와 가져오기에 사용하며 저장 전에 사용된 수식 셀 수를 다시 표시합니다.")
 
         text("1. 시트 선택", 16f)
-        val sheetSpinner = Spinner(this).apply {
+        Spinner(this).apply {
             adapter = ArrayAdapter(this@XlsxImportActivity, android.R.layout.simple_spinner_dropdown_item, wb.sheets.mapIndexed { i, s -> "${i + 1}. ${s.name}" })
             setSelection(selectedSheet)
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -130,7 +142,7 @@ class XlsxImportActivity : Activity() {
             root.addView(this)
         }
 
-        text("3. XLSX 열 연결", 16f)
+        text("3. Excel 열 연결", 16f)
         text("자동 연결 결과를 확인하고 잘못 연결된 열은 직접 바꾸세요. 학년·학기·과목은 필수입니다.")
         val suggested = XlsxStudentScoreImport.suggestMapping(sheet, headerRow)
         val maxColumn = sheet.maxColumn()
@@ -151,7 +163,7 @@ class XlsxImportActivity : Activity() {
 
         text("4. 원본 미리보기", 16f)
         text(rawPreview(sheet, headerRow), 12f)
-        if (sheet.merges.isNotEmpty()) text("병합 셀 ${sheet.merges.size}개 감지 · 학년/학기는 XLSX에 실제 병합된 범위에서만 상단 값을 이어받습니다.")
+        if (sheet.merges.isNotEmpty()) text("병합 셀 ${sheet.merges.size}개 감지 · 학년/학기는 파일에 실제 병합된 범위에서만 상단 값을 이어받습니다.")
 
         val defaultYear = intent.getStringExtra(EXTRA_SESSION_ID)?.let { id ->
             store.loadCanonicalApplicationCandidates(id).optJSONObject(0)?.optInt("academicYear")
@@ -168,7 +180,7 @@ class XlsxImportActivity : Activity() {
             root.addView(this)
         }
         button("가져올 성적 검토") { reviewBeforeSave(wb, sheet) }
-        button("다른 XLSX 선택") { openPicker() }
+        button("다른 Excel 파일 선택") { openPicker() }
     }
 
     private fun reviewBeforeSave(wb: XlsxStudentScoreImport.Workbook, sheet: XlsxStudentScoreImport.Sheet) {
@@ -181,26 +193,31 @@ class XlsxImportActivity : Activity() {
             XlsxStudentScoreImport.buildProfile(
                 wb, selectedSheet, headerRow, mapping, year,
                 completeCheck?.isChecked == true, fileName
-            )
+            ).put("sourceType", sourceFormat)
         }.getOrElse { return showError(it.message ?: "열 연결을 확인하세요.") }
         val average = if (profile.isNull("ownWeightedGrade")) "산출 보류" else String.format(Locale.US, "%.4f", profile.optDouble("ownWeightedGrade"))
         val message = buildString {
+            append("형식: ").append(sourceFormat).append('\n')
             append("시트: ").append(profile.optString("xlsxSheetName")).append('\n')
             append("과목: ").append(profile.optInt("rowCount")).append("개 · 등급 없음 ").append(profile.optInt("ungradedRows")).append("개\n")
             append("입력 과목 가중평균: ").append(average).append("\n")
             append("가져오기에 사용된 수식 캐시 셀: ").append(profile.optInt("xlsxFormulaCachedCellsUsed")).append("개\n")
             append("병합된 학년/학기에서 이어받은 값: ").append(profile.optInt("xlsxMergedStructuralFills")).append("개\n\n")
-            append("수식은 실행하지 않았고 빈 등급은 빈칸으로 보존했습니다. 대학별 공식 환산값은 이 평균과 별도로 검증해야 합니다.")
+            append("수식은 실행하지 않았고 빈 등급은 빈칸으로 보존했습니다. 저장 뒤 수집된 어디가 공식 산식·입결을 다시 연결해 대학별 환산 가능 여부를 재계산합니다.")
         }
-        AlertDialog.Builder(this).setTitle("XLSX 저장 전 확인").setMessage(message)
+        AlertDialog.Builder(this).setTitle("Excel 저장 전 확인").setMessage(message)
             .setNegativeButton("열 연결 다시 보기", null)
             .setPositiveButton("이 성적 저장") { _, _ ->
-                runCatching { store.saveStudentScoreImport(profile) }
-                    .onSuccess {
-                        Toast.makeText(this, "XLSX 성적 프로필 저장 완료", Toast.LENGTH_SHORT).show()
-                        setResult(RESULT_OK); finish()
+                runCatching {
+                    store.saveStudentScoreImport(profile)
+                    intent.getStringExtra(EXTRA_SESSION_ID)?.takeIf { it.isNotBlank() }?.let { sessionId ->
+                        store.rebuildCanonicalApplicationGraph(sessionId)
+                        AdigaAutoScoreMaterializer.materializeSelected(store, sessionId, profile)
                     }
-                    .onFailure { showError(it.message ?: "성적 저장에 실패했습니다.") }
+                }.onSuccess {
+                    Toast.makeText(this, "Excel 성적 저장 · 공식 산식/입결 재계산 완료", Toast.LENGTH_SHORT).show()
+                    setResult(RESULT_OK); finish()
+                }.onFailure { showError(it.message ?: "성적 저장에 실패했습니다.") }
             }.show()
     }
 
@@ -227,7 +244,7 @@ class XlsxImportActivity : Activity() {
             while (true) {
                 val n = input.read(buffer); if (n < 0) break
                 total += n
-                require(total <= XlsxStudentScoreImport.MAX_FILE_BYTES) { "XLSX 파일은 20MB 이하만 가져올 수 있습니다." }
+                require(total <= XlsxStudentScoreImport.MAX_FILE_BYTES) { "Excel 파일은 20MB 이하만 가져올 수 있습니다." }
                 out.write(buffer, 0, n)
             }
             return out.toByteArray()
@@ -247,7 +264,7 @@ class XlsxImportActivity : Activity() {
     }
     private fun button(label: String, action: () -> Unit) = Button(this).apply { text = label; setOnClickListener { action() }; root.addView(this) }
     private fun showError(message: String, offerFile: Boolean = false) {
-        AlertDialog.Builder(this).setTitle("XLSX 확인").setMessage(message)
+        AlertDialog.Builder(this).setTitle("Excel 확인").setMessage(message)
             .setNegativeButton("닫기", null)
             .apply { if (offerFile) setPositiveButton("다른 파일 선택") { _, _ -> openPicker() } }
             .show()
@@ -261,6 +278,6 @@ class XlsxImportActivity : Activity() {
 
     companion object {
         const val EXTRA_SESSION_ID = "sessionId"
-        private const val PICK_XLSX = 14140
+        private const val PICK_EXCEL = 14141
     }
 }
