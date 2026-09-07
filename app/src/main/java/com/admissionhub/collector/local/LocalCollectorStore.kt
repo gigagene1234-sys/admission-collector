@@ -11,6 +11,7 @@ import com.admissionhub.collector.canonical.CanonicalEntity
 import com.admissionhub.collector.canonical.ProviderEntityMapping
 import com.admissionhub.collector.canonical.CanonicalSixApplicationGraph
 import com.admissionhub.collector.canonical.AdigaOfficialAdmissionEvidence
+import com.admissionhub.collector.sync.LocalRebindPolicy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
@@ -2097,6 +2098,73 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         return audit
     }
 
+    fun canonicalApplicationCount(sessionId: String?): Int {
+        if (sessionId.isNullOrBlank()) return 0
+        return readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM canonical_applications WHERE session_id=?",
+            arrayOf(sessionId)
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+    }
+
+    fun pinnedHubSlotCount(): Int = readableDatabase.rawQuery(
+        "SELECT COUNT(*) FROM hub_application_slots WHERE user_pinned=1",
+        emptyArray()
+    ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+
+    /**
+     * Returns the newest canonical session that can resolve every currently pinned Hub slot.
+     * This deliberately prefers preserved local evidence over starting a new browser mission.
+     */
+    fun latestReusableCanonicalSessionId(): String? {
+        val pinned = pinnedHubSlotCount()
+        val candidates = mutableListOf<String>()
+        readableDatabase.rawQuery(
+            "SELECT session_id,COUNT(*),MAX(updated_at) FROM canonical_applications GROUP BY session_id HAVING COUNT(*)>=6 ORDER BY MAX(updated_at) DESC",
+            emptyArray()
+        ).use { c -> while (c.moveToNext()) candidates += c.getString(0) }
+        for (sessionId in candidates) {
+            if (pinned <= 0) return sessionId
+            val matched = readableDatabase.rawQuery(
+                "SELECT COUNT(*) FROM canonical_applications WHERE session_id=? AND application_identity_key IN (SELECT application_identity_key FROM hub_application_slots WHERE user_pinned=1)",
+                arrayOf(sessionId)
+            ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+            if (matched == pinned) return sessionId
+        }
+        return null
+    }
+
+    fun localRebindDecision(): JSONObject {
+        val latest = latestUnifiedSession()
+        val reusable = latestReusableCanonicalSessionId()
+        val latestCandidates = canonicalApplicationCount(latest)
+        val reusableCandidates = canonicalApplicationCount(reusable)
+        val latestStatus = if (latest.isNullOrBlank()) "none" else readableDatabase.rawQuery(
+            "SELECT status FROM unified_sessions WHERE session_id=? LIMIT 1",
+            arrayOf(latest)
+        ).use { c -> if (c.moveToFirst()) c.getString(0) else "unknown" }
+        val pinned = pinnedHubSlotCount()
+        val input = LocalRebindPolicy.Input(
+            pinnedSlots = pinned,
+            reusableCandidateCount = reusableCandidates,
+            latestCandidateCount = latestCandidates,
+            latestStatus = latestStatus,
+            latestIsReusableSource = !latest.isNullOrBlank() && latest == reusable
+        )
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("pinnedSlots", pinned)
+            .put("latestSessionId", latest ?: JSONObject.NULL)
+            .put("latestSessionStatus", latestStatus)
+            .put("latestCandidateCount", latestCandidates)
+            .put("reusableSessionId", reusable ?: JSONObject.NULL)
+            .put("reusableCandidateCount", reusableCandidates)
+            .put("preferLocalRebind", LocalRebindPolicy.preferLocalRebind(input))
+            .put("suppressInterruptedBrowserResume", LocalRebindPolicy.suppressInterruptedBrowserResume(input))
+            .put("providerNetworkRequired", false)
+            .put("credentialsRead", false)
+            .put("sessionSecretsRead", false)
+    }
+
     fun canonicalHubSummary(sessionId: String): JSONObject {
         val candidates = loadCanonicalApplicationCandidates(sessionId)
         val slots = loadHubApplicationSlots()
@@ -2112,6 +2180,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("slots", slots)
             .put("qualityAudit", audit)
             .put("selectedRecoveryPlan", selectedSixRecoveryPlan(sessionId))
+            .put("crossSessionContinuity", localRebindDecision())
             .put("slotPolicy", JSONObject()
                 .put("slots", CanonicalSixApplicationGraph.SLOT_COUNT)
                 .put("userControlsAddChangeReplaceOrder", true)

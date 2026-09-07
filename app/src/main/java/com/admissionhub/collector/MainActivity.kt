@@ -390,6 +390,13 @@ class MainActivity : Activity() {
     private var jinhakOrphanOutstandingRecoveries = 0
     private var jinhakActiveOwnerPreservations = 0
     private var hubEditsBlockedDuringCollection = 0
+    private var localRebindSourceSessionId: String? = null
+    private var localRebindRuns = 0
+    private var localRebindResumeSuppressions = 0
+    private var jinhakHardLeaseWatchdogGeneration = 0
+    private var jinhakHardActionLeaseExpirations = 0
+    private var jinhakHardSnapshotLeaseExpirations = 0
+    private var jinhakHardLeaseRecoveryDispatches = 0
     private var jinhakRealAuthProbeActive = false
     private var jinhakRealAuthProbeAutoContinue = false
     private var jinhakRealAuthProbeGeneration = 0
@@ -439,6 +446,7 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_REFERENCE_ROUTE_CAPTURES = 2
         private const val JINHAK_NO_PROGRESS_FENCE_MS = 60_000L
         private const val JINHAK_PROGRESS_FENCE_POLL_MS = 15_000L
+        private const val JINHAK_HARD_CELL_LEASE_POLL_MS = 5_000L
         private const val MAX_JINHAK_MISSION_STALL_RECOVERIES = 2
         private const val MAX_JINHAK_MISSION_ORIGIN_ERROR_STREAK = 5
         private const val MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES = 2
@@ -453,7 +461,7 @@ class MainActivity : Activity() {
         private const val JINHAK_RENDERER_CIRCUIT_COOLDOWN_MS = 30_000L
         private const val MAX_JINHAK_RENDERER_CRASHES_PER_WINDOW = 2
         private const val MAX_JINHAK_RENDERER_CIRCUIT_BREAKS_PER_SESSION = 2
-        private const val AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = true
+        private const val AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = false
         private const val LOGIN_PREFLIGHT_DOM_SETTLE_MS = 300L
         private const val LOGIN_PREFLIGHT_POLL_MS = 1_500L
         private const val JINHAK_LOGIN_RECOVERY_POLL_MS = 1_500L
@@ -464,8 +472,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.10.3"
-        private const val BUILD_CODE = 110030
+        private const val VERSION = "0.10.4"
+        private const val BUILD_CODE = 110040
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -479,7 +487,6 @@ class MainActivity : Activity() {
         sessionVault = SecureSessionVault(this)
         credentialVault = CredentialVault(this)
         buildUi()
-        handler.postDelayed({ rebuildCanonicalHubFromLatestSessionIfReady("app-start") }, 1800L)
         slowLanePool = JinhakSlowLanePool(this, slowLaneHost, object : JinhakSlowLanePool.Listener {
             override fun onSlowLaneCompleted(task: JinhakSlowLanePool.Task, snapshot: JSONObject, stats: JinhakSlowLanePool.ResultStats) {
                 handleJinhakSlowLaneCompleted(task, snapshot, stats)
@@ -496,12 +503,19 @@ class MainActivity : Activity() {
         configureWebView()
         initializeProcessResumeJournal()
         restoreJinhakAuthProofCheckpoint("activity-create")
-        val resumed = resumeInterruptedUnifiedSessionIfNeeded()
+        val localDecision = localStore.localRebindDecision()
+        val suppressInterruptedResume = localDecision.optBoolean("suppressInterruptedBrowserResume", false)
+        if (suppressInterruptedResume) {
+            localRebindResumeSuppressions += 1
+            recordRuntimeEvent("local-rebind-suppressed-interrupted-browser-resume", localDecision)
+        }
+        val resumed = if (suppressInterruptedResume) false else resumeInterruptedUnifiedSessionIfNeeded()
         if (!resumed) {
-            if (AUTO_LOGIN_AND_COLLECT_ON_LAUNCH) {
+            if (AUTO_LOGIN_AND_COLLECT_ON_LAUNCH && !localDecision.optBoolean("preferLocalRebind", false)) {
                 handler.postDelayed({ startLaunchAwareCollection() }, 350L)
             } else {
-                openProvider(ProviderId.JINHAK)
+                handler.postDelayed({ runLocalRebindOnly("app-start") }, 300L)
+                status.text = "기존 로컬 수집 결과를 우선 재결합합니다. 사이트 재수집은 자동 시작하지 않습니다."
             }
         }
         handler.postDelayed({ sendPendingRuntimeEvents() }, 1200L)
@@ -531,7 +545,7 @@ class MainActivity : Activity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "Admission Collector v$VERSION · build $BUILD_CODE · LOCAL-FIRST"
+            text = "Admission Hub v$VERSION · build $BUILD_CODE · LOCAL-FIRST"
             gravity = Gravity.CENTER
             textSize = 13f
             setPadding(8, 6, 8, 6)
@@ -748,9 +762,56 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
+    private fun canonicalHubSessionId(): String? =
+        localRebindSourceSessionId
+            ?: localStore.latestReusableCanonicalSessionId()
+            ?: localStore.latestUnifiedSession()
+
+    private fun runLocalRebindOnly(trigger: String) {
+        if (unifiedRunning || batchRunning || startupLoginPreflightActive) return
+        val decision = localStore.localRebindDecision()
+        val sourceSessionId = decision.optString("reusableSessionId").takeIf { it.isNotBlank() && it != "null" }
+            ?: localStore.latestReusableCanonicalSessionId()
+            ?: localStore.latestUnifiedSession()
+        if (sourceSessionId.isNullOrBlank()) {
+            refreshHubState(null)
+            status.text = "재사용 가능한 로컬 canonical 데이터가 없습니다. 필요할 때 통합 동기화를 시작하세요."
+            return
+        }
+        val persisted = localStore.jinhakMissionCoveragePersistenceSummary(sourceSessionId)
+        if (persisted.optInt("persistedIdentities", 0) <= 0) {
+            refreshHubState(sourceSessionId)
+            status.text = "로컬 세션은 있으나 canonical 재결합에 필요한 mission evidence가 없습니다."
+            return
+        }
+        localRebindSourceSessionId = sourceSessionId
+        // Export/admin actions should refer to the graph being presented, not a newer abandoned browser run.
+        unifiedSessionId = sourceSessionId
+        localRebindRuns += 1
+        val startedAt = System.currentTimeMillis()
+        val summary = runCatching { localStore.rebuildCanonicalApplicationGraph(sourceSessionId) }.getOrElse { error ->
+            recordRuntimeEvent("local-rebind-failed", JSONObject()
+                .put("trigger", trigger.take(80))
+                .put("sourceSessionId", sourceSessionId)
+                .put("exceptionClass", error.javaClass.name.take(120)))
+            localStore.canonicalHubSummary(sourceSessionId)
+        }
+        val audit = summary.optJSONObject("qualityAudit") ?: JSONObject()
+        refreshHubState(sourceSessionId, summary)
+        recordRuntimeEvent("local-rebind-complete", JSONObject()
+            .put("trigger", trigger.take(80))
+            .put("sourceSessionId", sourceSessionId)
+            .put("durationMs", System.currentTimeMillis() - startedAt)
+            .put("candidateCount", audit.optInt("candidateCount", 0))
+            .put("selectedResolvable", audit.optJSONObject("sixSlots")?.optInt("resolvable", 0) ?: 0)
+            .put("accepted", audit.optJSONObject("sixSlots")?.optInt("accepted", 0) ?: 0)
+            .put("providerNetworkUsed", false))
+        status.text = "로컬 재결합 완료 · 후보 ${audit.optInt("candidateCount", 0)} · 지원 6장 ${audit.optJSONObject("sixSlots")?.optInt("resolvable", 0) ?: 0}/6 · 사이트 재수집 없음"
+    }
+
     private fun rebuildCanonicalHubFromLatestSessionIfReady(trigger: String) {
         if (unifiedRunning || batchRunning) return
-        val sessionId = localStore.latestUnifiedSession()
+        val sessionId = canonicalHubSessionId()
         if (sessionId.isNullOrBlank()) {
             refreshHubState(null)
             return
@@ -811,14 +872,14 @@ class MainActivity : Activity() {
     }
 
     private fun selectedSixRecoveryNeeded(): Boolean {
-        val sessionId = localStore.latestUnifiedSession() ?: return false
+        val sessionId = canonicalHubSessionId() ?: return false
         val audit = localStore.canonicalHubSummary(sessionId).optJSONObject("qualityAudit") ?: return false
         val slots = audit.optJSONObject("sixSlots") ?: return false
         return slots.optInt("selected", 0) == 6 && slots.optInt("fullCoreCoverage", 0) < 6
     }
 
     private fun selectedSixAlreadyComplete(): Boolean {
-        val sessionId = localStore.latestUnifiedSession() ?: return false
+        val sessionId = canonicalHubSessionId() ?: return false
         val audit = localStore.canonicalHubSummary(sessionId).optJSONObject("qualityAudit") ?: return false
         val slots = audit.optJSONObject("sixSlots") ?: return false
         return slots.optInt("selected", 0) == 6 && slots.optInt("fullCoreCoverage", 0) == 6
@@ -852,7 +913,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "현재 로그인/수집 작업이 끝난 뒤 보강을 시작해주세요.", Toast.LENGTH_LONG).show()
             return
         }
-        val sessionId = localStore.latestUnifiedSession()
+        val sessionId = canonicalHubSessionId()
         if (sessionId.isNullOrBlank()) {
             Toast.makeText(this, "보강할 통합 수집 세션이 없습니다.", Toast.LENGTH_LONG).show()
             return
@@ -925,7 +986,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "수집 중에는 지원 6장을 변경할 수 없습니다. 현재 작업 종료 후 변경해주세요.", Toast.LENGTH_LONG).show()
             return
         }
-        val sessionId = localStore.latestUnifiedSession()
+        val sessionId = canonicalHubSessionId()
         if (sessionId.isNullOrBlank()) {
             Toast.makeText(this, "먼저 통합 수집을 완료해주세요.", Toast.LENGTH_LONG).show()
             return
@@ -946,7 +1007,7 @@ class MainActivity : Activity() {
             .setTitle("지원 6장 관리 · 수집기가 자동 변경하지 않습니다")
             .setItems(items) { _, which ->
                 if (which in 0..5) showHubCandidatePicker(sessionId, which + 1)
-                else rebuildCanonicalHubFromLatestSessionIfReady("manual-refresh")
+                else runLocalRebindOnly("manual-refresh")
             }
             .setNegativeButton("닫기", null)
             .show()
@@ -3262,6 +3323,12 @@ class MainActivity : Activity() {
                     .put("orphanOutstandingRecoveries", jinhakOrphanOutstandingRecoveries)
                     .put("activeOwnerPreservations", jinhakActiveOwnerPreservations)
                     .put("hubEditsBlockedDuringCollection", hubEditsBlockedDuringCollection)
+                .put("localRebindRuns", localRebindRuns)
+                .put("localRebindResumeSuppressions", localRebindResumeSuppressions)
+                .put("localRebindSourceSessionId", localRebindSourceSessionId ?: JSONObject.NULL)
+                .put("hardActionLeaseExpirations", jinhakHardActionLeaseExpirations)
+                .put("hardSnapshotLeaseExpirations", jinhakHardSnapshotLeaseExpirations)
+                .put("hardLeaseRecoveryDispatches", jinhakHardLeaseRecoveryDispatches)
                     .put("targetAuthRedirectTrackedTargets", jinhakTargetAuthRedirectCounts.size)
                     .put("targetAuthRedirectMaxCycles", jinhakTargetAuthRedirectCounts.values.maxOrNull() ?: 0)
                     .put("targetAuthRedirectThreshold", MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES)
@@ -4324,7 +4391,10 @@ class MainActivity : Activity() {
     }
 
     private fun beginBatchNavigation(runId: String?) {
-        if (provider == ProviderId.JINHAK) armJinhakProgressFence()
+        if (provider == ProviderId.JINHAK) {
+            armJinhakProgressFence()
+            armJinhakHardCellLeaseWatchdog()
+        }
         enqueueProviderSeeds()
         cloudOffload.probeFrontier { available ->
             runOnUiThread {
@@ -4687,6 +4757,46 @@ class MainActivity : Activity() {
         return true
     }
 
+    private fun armJinhakHardCellLeaseWatchdog() {
+        if (provider != ProviderId.JINHAK) return
+        val generation = ++jinhakHardLeaseWatchdogGeneration
+        val poller = object : Runnable {
+            override fun run() {
+                if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK || generation != jinhakHardLeaseWatchdogGeneration) return
+                val expiry = jinhakMissionCells.expireStaleOwnership(System.currentTimeMillis())
+                if (expiry.actionExpired) {
+                    jinhakHardActionLeaseExpirations += 1
+                    jinhakAgentActionInFlight = false
+                }
+                if (expiry.snapshotExpired) {
+                    jinhakHardSnapshotLeaseExpirations += 1
+                    batchCollecting = false
+                }
+                if (expiry.expiredAny) {
+                    jinhakHardLeaseRecoveryDispatches += 1
+                    jinhakAbsoluteTargetKey = ""
+                    ++jinhakAbsoluteTargetGeneration
+                    ++jinhakStallWatchdogGeneration
+                    runCatching { webView.stopLoading() }
+                    recordRuntimeEvent("jinhak-hard-cell-lease-expired", JSONObject()
+                        .put("expiry", expiry.toJson())
+                        .put("missionOutstanding", jinhakMissionTargetLedger.outstandingCount())
+                        .put("activeMissionTarget", jinhakActiveMissionTargetId ?: JSONObject.NULL))
+                    persistLiveJinhakDiagnostics("hard-cell-lease-expired", force = true)
+                    handler.postDelayed({
+                        if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return@postDelayed
+                        val recovered = if (jinhakMissionTargetLedger.outstandingCount() > 0) {
+                            recoverOrStopJinhakMissionStall("hard-cell-lease", countAsNoProgressFence = false)
+                        } else false
+                        if (!recovered && batchRunning && !batchPausedForLogin) loadNextBatchPage()
+                    }, 180L)
+                }
+                handler.postDelayed(this, JINHAK_HARD_CELL_LEASE_POLL_MS)
+            }
+        }
+        handler.postDelayed(poller, JINHAK_HARD_CELL_LEASE_POLL_MS)
+    }
+
     private fun armJinhakProgressFence() {
         if (provider != ProviderId.JINHAK) return
         if (jinhakLastMeaningfulProgressAtMs == 0L) jinhakLastMeaningfulProgressAtMs = System.currentTimeMillis()
@@ -4790,6 +4900,7 @@ class MainActivity : Activity() {
     private fun disarmBatchNavigationWatchdog() {
         batchNavigationWatchdogGeneration += 1
         jinhakStallWatchdogGeneration += 1
+        jinhakHardLeaseWatchdogGeneration += 1
     }
 
     private fun armJinhakStallWatchdog(expectedUrl: String) {

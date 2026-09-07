@@ -14,8 +14,8 @@ android {
         applicationId = "com.admissionhub.collector"
         minSdk = 26
         targetSdk = 35
-        versionCode = 110030
-        versionName = "0.10.3"
+        versionCode = 110040
+        versionName = "0.10.4"
     }
 
     compileOptions {
@@ -51,4 +51,5 @@ android {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
