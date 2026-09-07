@@ -16,4 +16,14 @@ for old, new in repls.items():
         raise SystemExit('expected lease test token missing: ' + old)
     s = s.replace(old, new)
 p.write_text(s)
-print('v0.10.4 lease test threshold hotfix applied')
+
+g = Path('app/build.gradle.kts')
+gs = g.read_text()
+anchor = '    testImplementation("junit:junit:4.13.2")\n'
+json_dep = '    testImplementation("org.json:json:20240303")\n'
+if anchor not in gs:
+    raise SystemExit('JUnit dependency anchor missing')
+if json_dep not in gs:
+    gs = gs.replace(anchor, anchor + json_dep, 1)
+g.write_text(gs)
+print('v0.10.4 lease test threshold + JVM org.json hotfix applied')
