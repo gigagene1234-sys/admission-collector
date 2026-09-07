@@ -23,10 +23,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply v0.10.4 patch with scoped lookup fix
+      - name: Apply v0.10.4 patch with scoped lookup and lease-test fixes
         run: |
           python3 .github/scripts/patch_v0104_hotfix.py
           python3 .github/scripts/patch_v0104.py
+          python3 .github/scripts/patch_v0104_test_hotfix.py
 
       - name: Verify cumulative safety and v0.10.4 architecture invariants
         shell: bash
@@ -39,12 +40,14 @@ jobs:
           policy=Path('app/src/main/java/com/admissionhub/collector/sync/LocalRebindPolicy.kt').read_text()
           adapter=Path('app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt').read_text()
           cell=Path('app/src/main/java/com/admissionhub/collector/jinhak/JinhakMissionCellSupervisor.kt').read_text()
+          lease_test=Path('app/src/test/java/com/admissionhub/collector/jinhak/JinhakMissionCellSupervisorLeaseTest.kt').read_text()
           checks={
             'version': 'private const val VERSION = "0.10.4"' in main and 'private const val BUILD_CODE = 110040' in main,
             'no-launch-full-crawl': 'private const val AUTO_LOGIN_AND_COLLECT_ON_LAUNCH = false' in main,
             'rebind-before-browser-resume': 'suppressInterruptedBrowserResume' in main and 'runLocalRebindOnly("app-start")' in main,
             'cross-session-canonical-source': 'latestReusableCanonicalSessionId' in store and 'crossSessionContinuity' in store,
             'hard-cell-lease': 'armJinhakHardCellLeaseWatchdog' in main and 'JINHAK_HARD_CELL_LEASE_POLL_MS' in main,
+            'valid-lease-test-threshold': 'staleOwnershipMs = 1_000L' in lease_test and 'staleOwnershipMs = 100L' not in lease_test,
             'late-callback-generation': 'LATE_CALLBACK_IGNORED' in cell,
             'batch-crawl-disabled': 'override val supportsBatchCrawl = false' in adapter,
             'user-session-mission': 'override val supportsUserSessionMissionTraversal = true' in adapter,
@@ -120,6 +123,7 @@ jobs:
           git push origin HEAD:main
           PRODUCT_SHA=$(git rev-parse HEAD)
           echo "PRODUCT_SHA=$PRODUCT_SHA" >> "$GITHUB_ENV"
+          echo "Product commit: $PRODUCT_SHA"
 
       - name: Rebuild and retest exact committed product source
         shell: bash
