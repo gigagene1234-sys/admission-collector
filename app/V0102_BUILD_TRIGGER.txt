@@ -1,0 +1,2 @@
+Admission Hub v0.10.2 committed-source verification trigger.
+No runtime behavior is defined in this file.
