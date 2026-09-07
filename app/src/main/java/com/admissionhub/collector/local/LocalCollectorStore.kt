@@ -12,6 +12,7 @@ import com.admissionhub.collector.canonical.ProviderEntityMapping
 import com.admissionhub.collector.canonical.CanonicalSixApplicationGraph
 import com.admissionhub.collector.canonical.AdigaOfficialAdmissionEvidence
 import com.admissionhub.collector.sync.LocalRebindPolicy
+import com.admissionhub.collector.score.ScoreDecisionEngine
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
@@ -28,7 +29,7 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "admission_collector_local_v1.db",
     null,
-    8
+    9
 ) {
     private fun ensureFoundationSchema(db: SQLiteDatabase) {
         // Content-aware captures: same route can expose different data at another time/context.
@@ -205,6 +206,79 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             )
         """.trimIndent())
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_hub_selected_recovery_state ON hub_selected_recovery_scope(session_id,state,updated_at)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS score_student_profiles(
+              profile_id TEXT PRIMARY KEY,
+              academic_year INTEGER NOT NULL,
+              source_type TEXT NOT NULL,
+              source_json TEXT NOT NULL,
+              verification_state TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_score_profile_year ON score_student_profiles(academic_year,updated_at)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS score_conversion_results(
+              application_identity_key TEXT PRIMARY KEY,
+              academic_year INTEGER NOT NULL,
+              score_value REAL,
+              max_score REAL,
+              score_scale TEXT,
+              comparison_direction TEXT,
+              formula_source TEXT,
+              formula_version TEXT,
+              identity_binding_verified INTEGER NOT NULL DEFAULT 0,
+              verified INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL,
+              detail_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """.trimIndent())
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS score_official_outcomes(
+              outcome_id TEXT PRIMARY KEY,
+              application_identity_key TEXT NOT NULL,
+              academic_year INTEGER NOT NULL,
+              metric_name TEXT NOT NULL,
+              metric_value REAL,
+              score_scale TEXT,
+              max_score REAL,
+              source_name TEXT NOT NULL,
+              source_url TEXT,
+              verified INTEGER NOT NULL DEFAULT 0,
+              primary_reference INTEGER NOT NULL DEFAULT 0,
+              detail_json TEXT NOT NULL,
+              observed_at TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_score_outcome_identity ON score_official_outcomes(application_identity_key,academic_year,metric_name)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS score_prediction_snapshots(
+              snapshot_id TEXT PRIMARY KEY,
+              application_identity_key TEXT NOT NULL,
+              observed_at TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              structured INTEGER NOT NULL DEFAULT 0,
+              metrics_json TEXT NOT NULL,
+              source_label TEXT NOT NULL
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_score_prediction_identity ON score_prediction_snapshots(application_identity_key,observed_at)")
+
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS score_decision_assessments(
+              application_identity_key TEXT PRIMARY KEY,
+              decision_code TEXT NOT NULL,
+              decision_label TEXT NOT NULL,
+              confidence TEXT NOT NULL,
+              result_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """.trimIndent())
 
         db.execSQL("""
             CREATE TABLE IF NOT EXISTS jinhak_mission_targets(
@@ -403,6 +477,9 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             ensureFoundationSchema(db)
         }
         if (oldVersion < 8) {
+            ensureFoundationSchema(db)
+        }
+        if (oldVersion < 9) {
             ensureFoundationSchema(db)
         }
     }
@@ -1495,6 +1572,283 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("monotonicConfirmedOnly", true)
             .put("credentialStored", false)
             .put("sessionSecretStored", false)
+    }
+
+    fun upsertStudentScoreProfile(
+        profileId: String,
+        academicYear: Int,
+        sourceType: String,
+        source: JSONObject,
+        verificationState: String
+    ) {
+        if (profileId.isBlank()) return
+        val cv = ContentValues().apply {
+            put("profile_id", profileId.take(160))
+            put("academic_year", academicYear)
+            put("source_type", sourceType.take(80))
+            put("source_json", source.toString())
+            put("verification_state", verificationState.take(80))
+            put("updated_at", Instant.now().toString())
+        }
+        writableDatabase.insertWithOnConflict("score_student_profiles", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun upsertUniversityConversionResult(
+        applicationIdentityKey: String,
+        academicYear: Int,
+        scoreValue: Double?,
+        maxScore: Double?,
+        scoreScale: String?,
+        comparisonDirection: String?,
+        formulaSource: String?,
+        formulaVersion: String?,
+        identityBindingVerified: Boolean,
+        verified: Boolean,
+        status: String,
+        detail: JSONObject = JSONObject()
+    ) {
+        if (applicationIdentityKey.isBlank()) return
+        val cv = ContentValues().apply {
+            put("application_identity_key", applicationIdentityKey)
+            put("academic_year", academicYear)
+            if (scoreValue == null) putNull("score_value") else put("score_value", scoreValue)
+            if (maxScore == null) putNull("max_score") else put("max_score", maxScore)
+            if (scoreScale.isNullOrBlank()) putNull("score_scale") else put("score_scale", scoreScale.take(120))
+            if (comparisonDirection.isNullOrBlank()) putNull("comparison_direction") else put("comparison_direction", comparisonDirection.take(40))
+            if (formulaSource.isNullOrBlank()) putNull("formula_source") else put("formula_source", formulaSource.take(500))
+            if (formulaVersion.isNullOrBlank()) putNull("formula_version") else put("formula_version", formulaVersion.take(120))
+            put("identity_binding_verified", if (identityBindingVerified) 1 else 0)
+            put("verified", if (verified) 1 else 0)
+            put("status", status.take(80))
+            put("detail_json", detail.toString())
+            put("updated_at", Instant.now().toString())
+        }
+        writableDatabase.insertWithOnConflict("score_conversion_results", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun storeOfficialAdmissionOutcome(
+        applicationIdentityKey: String,
+        academicYear: Int,
+        metricName: String,
+        metricValue: Double?,
+        scoreScale: String?,
+        maxScore: Double?,
+        sourceName: String,
+        sourceUrl: String?,
+        verified: Boolean,
+        primaryReference: Boolean,
+        detail: JSONObject = JSONObject()
+    ): String? {
+        if (applicationIdentityKey.isBlank() || metricName.isBlank() || sourceName.isBlank()) return null
+        val observedAt = Instant.now().toString()
+        val outcomeId = RecordUtils.sha256(listOf(applicationIdentityKey, academicYear, metricName, metricValue, scoreScale, sourceName, sourceUrl).joinToString("|"))
+        val cv = ContentValues().apply {
+            put("outcome_id", outcomeId)
+            put("application_identity_key", applicationIdentityKey)
+            put("academic_year", academicYear)
+            put("metric_name", metricName.take(160))
+            if (metricValue == null) putNull("metric_value") else put("metric_value", metricValue)
+            if (scoreScale.isNullOrBlank()) putNull("score_scale") else put("score_scale", scoreScale.take(120))
+            if (maxScore == null) putNull("max_score") else put("max_score", maxScore)
+            put("source_name", sourceName.take(240))
+            if (sourceUrl.isNullOrBlank()) putNull("source_url") else put("source_url", sourceUrl.take(1000))
+            put("verified", if (verified) 1 else 0)
+            put("primary_reference", if (primaryReference) 1 else 0)
+            put("detail_json", detail.toString())
+            put("observed_at", observedAt)
+        }
+        writableDatabase.insertWithOnConflict("score_official_outcomes", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        return outcomeId
+    }
+
+    fun storePredictionSnapshot(
+        applicationIdentityKey: String,
+        observedAt: String,
+        provider: String,
+        structured: Boolean,
+        metrics: JSONObject,
+        sourceLabel: String
+    ): String? {
+        if (applicationIdentityKey.isBlank() || provider.isBlank() || observedAt.isBlank()) return null
+        val snapshotId = RecordUtils.sha256("$applicationIdentityKey|$provider|$observedAt|${RecordUtils.sha256(metrics.toString())}")
+        val cv = ContentValues().apply {
+            put("snapshot_id", snapshotId)
+            put("application_identity_key", applicationIdentityKey)
+            put("observed_at", observedAt)
+            put("provider", provider.take(80))
+            put("structured", if (structured) 1 else 0)
+            put("metrics_json", metrics.toString())
+            put("source_label", sourceLabel.take(240))
+        }
+        writableDatabase.insertWithOnConflict("score_prediction_snapshots", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        return snapshotId
+    }
+
+    fun scoreDecisionSummary(sessionId: String): JSONObject {
+        val db = readableDatabase
+        val byIdentity = JSONObject()
+        var verifiedConversions = 0
+        var officialOutcomeAvailable = 0
+        var comparableDecisions = 0
+        var decisionHolds = 0
+        var predictionCollected = 0
+        var structuredPredictions = 0
+
+        val studentProfile = db.rawQuery(
+            "SELECT profile_id,academic_year,source_type,verification_state,updated_at FROM score_student_profiles ORDER BY updated_at DESC LIMIT 1",
+            emptyArray()
+        ).use { c ->
+            if (!c.moveToFirst()) JSONObject().put("status", "NOT_IMPORTED")
+            else JSONObject()
+                .put("status", "IMPORTED")
+                .put("profileId", c.getString(0))
+                .put("academicYear", c.getInt(1))
+                .put("sourceType", c.getString(2))
+                .put("verificationState", c.getString(3))
+                .put("updatedAt", c.getString(4))
+        }
+
+        db.rawQuery(
+            "SELECT application_identity_key,quality_state,academic_year FROM canonical_applications WHERE session_id=? ORDER BY application_identity_key",
+            arrayOf(sessionId)
+        ).use { apps ->
+            while (apps.moveToNext()) {
+                val identity = apps.getString(0)
+                val canonicalQuality = apps.getString(1)
+                val academicYear = apps.getInt(2)
+                val conversion = db.rawQuery(
+                    "SELECT academic_year,score_value,max_score,score_scale,comparison_direction,formula_source,formula_version,identity_binding_verified,verified,status,detail_json,updated_at FROM score_conversion_results WHERE application_identity_key=? LIMIT 1",
+                    arrayOf(identity)
+                ).use { c ->
+                    if (!c.moveToFirst()) null else JSONObject()
+                        .put("academicYear", c.getInt(0))
+                        .put("scoreValue", if (c.isNull(1)) JSONObject.NULL else c.getDouble(1))
+                        .put("maxScore", if (c.isNull(2)) JSONObject.NULL else c.getDouble(2))
+                        .put("scoreScale", if (c.isNull(3)) JSONObject.NULL else c.getString(3))
+                        .put("comparisonDirection", if (c.isNull(4)) JSONObject.NULL else c.getString(4))
+                        .put("formulaSource", if (c.isNull(5)) JSONObject.NULL else c.getString(5))
+                        .put("formulaVersion", if (c.isNull(6)) JSONObject.NULL else c.getString(6))
+                        .put("identityBindingVerified", c.getInt(7) != 0)
+                        .put("verified", c.getInt(8) != 0)
+                        .put("status", c.getString(9))
+                        .put("detail", runCatching { JSONObject(c.getString(10)) }.getOrDefault(JSONObject()))
+                        .put("updatedAt", c.getString(11))
+                }
+                if (conversion?.optBoolean("verified", false) == true && conversion.optString("status") == "verified") verifiedConversions += 1
+
+                val outcomes = JSONArray()
+                db.rawQuery(
+                    "SELECT outcome_id,academic_year,metric_name,metric_value,score_scale,max_score,source_name,source_url,verified,primary_reference,detail_json,observed_at FROM score_official_outcomes WHERE application_identity_key=? ORDER BY academic_year DESC,observed_at DESC",
+                    arrayOf(identity)
+                ).use { c ->
+                    while (c.moveToNext()) {
+                        outcomes.put(JSONObject()
+                            .put("outcomeId", c.getString(0))
+                            .put("academicYear", c.getInt(1))
+                            .put("metricName", c.getString(2))
+                            .put("metricValue", if (c.isNull(3)) JSONObject.NULL else c.getDouble(3))
+                            .put("scoreScale", if (c.isNull(4)) JSONObject.NULL else c.getString(4))
+                            .put("maxScore", if (c.isNull(5)) JSONObject.NULL else c.getDouble(5))
+                            .put("sourceName", c.getString(6))
+                            .put("sourceUrl", if (c.isNull(7)) JSONObject.NULL else c.getString(7))
+                            .put("verified", c.getInt(8) != 0)
+                            .put("primaryReference", c.getInt(9) != 0)
+                            .put("detail", runCatching { JSONObject(c.getString(10)) }.getOrDefault(JSONObject()))
+                            .put("observedAt", c.getString(11)))
+                    }
+                }
+                if (outcomes.length() > 0) officialOutcomeAvailable += 1
+
+                var prediction: JSONObject? = db.rawQuery(
+                    "SELECT observed_at,provider,structured,metrics_json,source_label FROM score_prediction_snapshots WHERE application_identity_key=? ORDER BY observed_at DESC LIMIT 1",
+                    arrayOf(identity)
+                ).use { c ->
+                    if (!c.moveToFirst()) null else JSONObject()
+                        .put("observedAt", c.getString(0))
+                        .put("provider", c.getString(1))
+                        .put("structured", c.getInt(2) != 0)
+                        .put("metrics", runCatching { JSONObject(c.getString(3)) }.getOrDefault(JSONObject()))
+                        .put("sourceLabel", c.getString(4))
+                }
+                if (prediction == null) {
+                    val collected = db.rawQuery(
+                        "SELECT confirmed_at FROM jinhak_mission_coverage WHERE session_id=? AND identity_key=? AND lane='current-prediction' LIMIT 1",
+                        arrayOf(sessionId, identity)
+                    ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                    if (!collected.isNullOrBlank()) {
+                        prediction = JSONObject()
+                            .put("observedAt", collected)
+                            .put("provider", "jinhak")
+                            .put("structured", false)
+                            .put("sourceLabel", "current-prediction mission coverage")
+                            .put("status", "COLLECTED_UNSTRUCTURED")
+                    }
+                }
+                if (prediction != null) {
+                    predictionCollected += 1
+                    if (prediction.optBoolean("structured", false)) structuredPredictions += 1
+                }
+
+                val evaluation = ScoreDecisionEngine.evaluate(canonicalQuality, conversion, outcomes, prediction)
+                if (evaluation.optBoolean("hold", true)) decisionHolds += 1 else comparableDecisions += 1
+                val reference = evaluation.optJSONObject("referenceOutcome")
+                val conversionLabel = if (conversion?.optBoolean("verified", false) == true && conversion.has("scoreValue") && !conversion.isNull("scoreValue")) {
+                    val value = java.math.BigDecimal.valueOf(conversion.optDouble("scoreValue")).stripTrailingZeros().toPlainString()
+                    val max = if (conversion.has("maxScore") && !conversion.isNull("maxScore")) "/${java.math.BigDecimal.valueOf(conversion.optDouble("maxScore")).stripTrailingZeros().toPlainString()}" else ""
+                    "대학 환산: $value$max · 검증"
+                } else "대학 환산: 미확인"
+                val outcomeLabel = when {
+                    reference != null -> {
+                        val value = java.math.BigDecimal.valueOf(reference.optDouble("metricValue")).stripTrailingZeros().toPlainString()
+                        "공식 입결: ${reference.optInt("academicYear", academicYear)} ${reference.optString("metricName", "참고선")} $value"
+                    }
+                    outcomes.length() > 0 -> "공식 입결: ${outcomes.length()}건 · 비교 기준 미확정"
+                    else -> "공식 입결: 미확인"
+                }
+                val predictionLabel = when {
+                    prediction == null -> "진학사 예측: 미확인"
+                    prediction.optBoolean("structured", false) -> prediction.optString("displayLabel").takeIf { it.isNotBlank() }
+                        ?: "진학사 예측: 구조화 자료 있음"
+                    else -> "진학사 예측: 수집됨 · 값 구조화 대기"
+                }
+                val decisionLabel = "종합: ${evaluation.optString("decisionLabel", "판정 보류")}".replace("종합: 판정 보류 ·", "종합: 판정 보류 ·")
+                val row = JSONObject()
+                    .put("academicYear", academicYear)
+                    .put("canonicalQuality", canonicalQuality)
+                    .put("conversion", conversion ?: JSONObject.NULL)
+                    .put("officialOutcomes", outcomes)
+                    .put("prediction", prediction ?: JSONObject.NULL)
+                    .put("evaluation", evaluation)
+                    .put("conversionLabel", conversionLabel)
+                    .put("officialOutcomeLabel", outcomeLabel)
+                    .put("predictionLabel", predictionLabel)
+                    .put("decisionLabel", decisionLabel)
+                byIdentity.put(identity, row)
+
+                val cv = ContentValues().apply {
+                    put("application_identity_key", identity)
+                    put("decision_code", evaluation.optString("decisionCode", "UNKNOWN"))
+                    put("decision_label", evaluation.optString("decisionLabel", "판정 보류"))
+                    put("confidence", evaluation.optString("confidence", "INSUFFICIENT_EVIDENCE"))
+                    put("result_json", evaluation.toString())
+                    put("updated_at", Instant.now().toString())
+                }
+                writableDatabase.insertWithOnConflict("score_decision_assessments", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+        }
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("studentProfile", studentProfile)
+            .put("byIdentity", byIdentity)
+            .put("summary", JSONObject()
+                .put("verifiedConversions", verifiedConversions)
+                .put("officialOutcomeAvailable", officialOutcomeAvailable)
+                .put("comparableDecisions", comparableDecisions)
+                .put("decisionHolds", decisionHolds)
+                .put("predictionCollected", predictionCollected)
+                .put("structuredPredictions", structuredPredictions)
+                .put("probabilityInferred", false)
+                .put("missingValuesDefaultToZero", false))
     }
 
     fun providerRunIdForUnifiedSession(sessionId: String, provider: String): String? = unifiedProviderRunId(sessionId, provider)

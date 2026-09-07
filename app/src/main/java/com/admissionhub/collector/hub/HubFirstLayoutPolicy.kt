@@ -11,9 +11,9 @@ object HubFirstLayoutPolicy {
         return (6 + columns - 1) / columns
     }
     fun cardHeightDp(widthDp: Int): Int = when (columnsForWidthDp(widthDp)) {
-        3 -> 164
-        2 -> 176
-        else -> 188
+        3 -> 236
+        2 -> 248
+        else -> 264
     }
     const val advancedToolsInitiallyVisible = false
 }

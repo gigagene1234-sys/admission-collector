@@ -74,6 +74,7 @@ class MainActivity : Activity() {
     private lateinit var hubManageButton: Button
     private lateinit var hubRecoveryButton: Button
     private lateinit var hubDashboardStatus: TextView
+    private lateinit var hubDecisionSummary: TextView
     private lateinit var hubDashboardGrid: LinearLayout
     private lateinit var hubAdvancedPanel: LinearLayout
     private lateinit var hubAdvancedToggle: Button
@@ -488,8 +489,8 @@ class MainActivity : Activity() {
         private const val RUNTIME_PREFS = "collector_runtime_v064"
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
-        private const val VERSION = "0.11.1"
-        private const val BUILD_CODE = 111010
+        private const val VERSION = "0.12.0"
+        private const val BUILD_CODE = 112000
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -732,6 +733,13 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(12), dp(16), dp(12))
             setOnClickListener { refreshHubDashboardFromStore("manual-banner-refresh") }
         }
+        hubDecisionSummary = TextView(this).apply {
+            text = "성적·판정 데이터 준비 중…"
+            textSize = 15f
+            setTextColor(android.graphics.Color.rgb(45, 49, 56))
+            setBackgroundColor(android.graphics.Color.rgb(241, 244, 248))
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+        }
         val dashboardWidthDp = resources.configuration.screenWidthDp.takeIf { it > 0 } ?: 720
         val dashboardColumns = HubFirstLayoutPolicy.columnsForWidthDp(dashboardWidthDp)
         val dashboardCardHeight = dp(HubFirstLayoutPolicy.cardHeightDp(dashboardWidthDp))
@@ -856,6 +864,7 @@ class MainActivity : Activity() {
         root.addView(hubDashboardStatus)
         root.addView(primaryActions)
         root.addView(hubDashboardGrid, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        root.addView(hubDecisionSummary, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(hubAdvancedPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         setContentView(root)
     }
@@ -888,7 +897,8 @@ class MainActivity : Activity() {
         val canonical = runCatching { localStore.canonicalHubSummary(canonicalSession) }.getOrDefault(JSONObject())
         val syncSession = if (unifiedRunning && !unifiedSessionId.isNullOrBlank()) unifiedSessionId else canonicalSession
         val sync = runCatching { localStore.unifiedStatus(syncSession ?: canonicalSession) }.getOrDefault(JSONObject())
-        val model = HubDashboardModel.build(canonical, sync, runtimeHubDashboardState())
+        val scoreDecision = runCatching { localStore.scoreDecisionSummary(canonicalSession) }.getOrDefault(JSONObject())
+        val model = HubDashboardModel.build(canonical, sync, runtimeHubDashboardState(), scoreDecision)
         hubDashboardLastModel = model
         renderHubDashboard(model)
         if (trigger != "ticker") {
@@ -913,6 +923,11 @@ class MainActivity : Activity() {
             if (providerOnly > 0) append(" · 공식결합없음 ").append(providerOnly)
         }
         hubDashboardStatus.text = "${sync.optString("stateLabel", "대기")} · ${sync.optString("progressText", "진행 수치 대기")}$ageText\n지원 6장 ${summary.optInt("resolvable", 0)}/6 · 핵심자료 ${summary.optInt("fullCoreCoverage", 0)}/6 · $qualityText"
+        if (::hubDecisionSummary.isInitialized) {
+            val profile = model.optJSONObject("studentScoreProfile") ?: JSONObject()
+            val profileText = if (profile.optString("status") == "IMPORTED") "성적 프로필 등록" else "성적 프로필 미등록"
+            hubDecisionSummary.text = "$profileText · 검증 환산 ${summary.optInt("verifiedConversions", 0)}/6 · 공식 입결 ${summary.optInt("officialOutcomeAvailable", 0)}/6 · 비교 가능 ${summary.optInt("comparableDecisions", 0)}/6 · 판정보류 ${summary.optInt("decisionHolds", 0)} · 진학사 예측자료 ${summary.optInt("predictionCollected", 0)}/6"
+        }
         if (::sessionState.isInitialized) {
             sessionState.text = "통합 상태: ${sync.optString("stateLabel", "대기")} · ${sync.optString("progressText", "진행 수치 대기")}$ageText"
         }
@@ -946,7 +961,12 @@ class MainActivity : Activity() {
                     val capacity = if (card.has("capacity") && !card.isNull("capacity")) "모집 ${card.optInt("capacity")}명" else "모집인원 미확인"
                     val coverage = "Jinhak 핵심 ${card.optInt("coverageCount", 0)}/5"
                     val official = card.optString("qualityLabel", "데이터 품질 확인 필요")
-                    "${index + 1}. $university\n$department\n$subtitle\n\n$capacity\n$coverage\n$official"
+                    val scoreDecision = card.optJSONObject("scoreDecision") ?: JSONObject()
+                    val conversion = scoreDecision.optString("conversionLabel", "대학 환산: 미확인")
+                    val officialOutcome = scoreDecision.optString("officialOutcomeLabel", "공식 입결: 미확인")
+                    val prediction = scoreDecision.optString("predictionLabel", "진학사 예측: 미확인")
+                    val decision = scoreDecision.optString("decisionLabel", "종합: 판정 보류")
+                    "${index + 1}. $university\n$department\n$subtitle\n\n$capacity · $coverage\n$official\n$conversion\n$officialOutcome\n$prediction\n$decision"
                 }
             }
         }
@@ -976,6 +996,14 @@ class MainActivity : Activity() {
             append("Adiga 구조적 현재연도 근거: ").append(card.optInt("officialStructuralCurrent", 0)).append("건\n")
             append("Adiga 같은 행 근거: ").append(card.optInt("officialRowBoundCurrent", 0)).append("건\n")
             append("Adiga 명시적 표 구간 근거: ").append(card.optInt("officialTableSegmentCurrent", 0)).append("건\n")
+            val scoreDecision = card.optJSONObject("scoreDecision") ?: JSONObject()
+            append("\n[성적·판정]\n")
+            append(scoreDecision.optString("conversionLabel", "대학 환산: 미확인")).append('\n')
+            append(scoreDecision.optString("officialOutcomeLabel", "공식 입결: 미확인")).append('\n')
+            append(scoreDecision.optString("predictionLabel", "진학사 예측: 미확인")).append('\n')
+            append(scoreDecision.optString("decisionLabel", "종합: 판정 보류")).append('\n')
+            val evaluation = scoreDecision.optJSONObject("evaluation")
+            if (evaluation != null) append("판정 코드: ").append(evaluation.optString("decisionCode", "UNKNOWN")).append('\n')
             val updated = card.optString("updatedAt")
             if (updated.isNotBlank()) append("마지막 canonical 갱신: ").append(updated)
         }

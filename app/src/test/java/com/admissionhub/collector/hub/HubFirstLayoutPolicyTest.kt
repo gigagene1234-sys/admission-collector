@@ -8,7 +8,7 @@ class HubFirstLayoutPolicyTest {
     @Test fun wideTabletUsesThreeByTwo() {
         assertEquals(3, HubFirstLayoutPolicy.columnsForWidthDp(1200))
         assertEquals(2, HubFirstLayoutPolicy.rowsForSix(1200))
-        assertEquals(164, HubFirstLayoutPolicy.cardHeightDp(1200))
+        assertEquals(236, HubFirstLayoutPolicy.cardHeightDp(1200))
     }
     @Test fun narrowerLayoutsDoNotUseSixWideStrip() {
         assertEquals(2, HubFirstLayoutPolicy.columnsForWidthDp(700))

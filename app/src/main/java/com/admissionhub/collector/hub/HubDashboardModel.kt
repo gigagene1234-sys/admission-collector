@@ -3,22 +3,22 @@ package com.admissionhub.collector.hub
 import org.json.JSONArray
 import org.json.JSONObject
 
-/**
- * Pure presentation model for the six-application Hub dashboard.
- *
- * It never mutates collection data or canonical bindings. The dashboard is a view over
- * persisted canonical evidence and sync state, so process recreation cannot make the UI
- * silently invent progress or provider semantics.
- */
+/** Read-only presentation model over persisted canonical, sync, and score-decision evidence. */
 object HubDashboardModel {
-    const val SCHEMA_VERSION = 1
+    const val SCHEMA_VERSION = 2
     const val SLOT_COUNT = 6
 
-    fun build(canonicalHub: JSONObject, syncStatus: JSONObject, runtime: JSONObject = JSONObject()): JSONObject {
+    fun build(
+        canonicalHub: JSONObject,
+        syncStatus: JSONObject,
+        runtime: JSONObject = JSONObject(),
+        scoreDecisionSummary: JSONObject = JSONObject()
+    ): JSONObject {
         val graph = canonicalHub.optJSONArray("candidateGraph") ?: JSONArray()
         val slots = canonicalHub.optJSONArray("slots") ?: JSONArray()
         val audit = canonicalHub.optJSONObject("qualityAudit") ?: JSONObject()
         val auditSlots = audit.optJSONObject("sixSlots") ?: JSONObject()
+        val scoreByIdentity = scoreDecisionSummary.optJSONObject("byIdentity") ?: JSONObject()
 
         val byIdentity = linkedMapOf<String, JSONObject>()
         for (i in 0 until graph.length()) {
@@ -33,7 +33,8 @@ object HubDashboardModel {
             val occupied = slotRow?.optBoolean("occupied", false) == true
             val identity = slotRow?.optString("applicationIdentityKey").orEmpty()
             val candidate = if (identity.isBlank()) null else byIdentity[identity]
-            cards.put(buildCard(slot, occupied, slotRow, candidate))
+            val score = if (identity.isBlank()) null else scoreByIdentity.optJSONObject(identity)
+            cards.put(buildCard(slot, occupied, slotRow, candidate, score))
         }
 
         val sync = buildSync(syncStatus, runtime)
@@ -43,11 +44,13 @@ object HubDashboardModel {
         val provisional = auditSlots.optInt("provisional", cards.countQuality("provisional"))
         val providerOnly = auditSlots.optInt("providerOnly", cards.countQuality("provider-only"))
         val fullCoverage = auditSlots.optInt("fullCoreCoverage", cards.countFullCoverage())
+        val scoreSummary = scoreDecisionSummary.optJSONObject("summary") ?: JSONObject()
 
         return JSONObject()
             .put("schemaVersion", SCHEMA_VERSION)
             .put("cards", cards)
             .put("sync", sync)
+            .put("studentScoreProfile", scoreDecisionSummary.optJSONObject("studentProfile") ?: JSONObject().put("status", "NOT_IMPORTED"))
             .put("summary", JSONObject()
                 .put("selected", selected)
                 .put("resolvable", resolvable)
@@ -55,34 +58,33 @@ object HubDashboardModel {
                 .put("provisional", provisional)
                 .put("providerOnly", providerOnly)
                 .put("fullCoreCoverage", fullCoverage)
+                .put("verifiedConversions", scoreSummary.optInt("verifiedConversions", 0))
+                .put("officialOutcomeAvailable", scoreSummary.optInt("officialOutcomeAvailable", 0))
+                .put("comparableDecisions", scoreSummary.optInt("comparableDecisions", 0))
+                .put("decisionHolds", scoreSummary.optInt("decisionHolds", cards.countResolvable()))
+                .put("predictionCollected", scoreSummary.optInt("predictionCollected", 0))
+                .put("structuredPredictions", scoreSummary.optInt("structuredPredictions", 0))
                 .put("hubReady", audit.optBoolean("hubReady", false))
                 .put("publishState", audit.optString("publishState", "WAITING_FOR_USER_SELECTION"))
                 .put("candidateCount", audit.optInt("candidateCount", graph.length())))
     }
 
-    private fun buildCard(slot: Int, occupied: Boolean, slotRow: JSONObject?, candidate: JSONObject?): JSONObject {
+    private fun buildCard(slot: Int, occupied: Boolean, slotRow: JSONObject?, candidate: JSONObject?, score: JSONObject?): JSONObject {
         if (!occupied) {
             return JSONObject()
-                .put("slot", slot)
-                .put("occupied", false)
-                .put("resolvable", false)
-                .put("title", "$slot. 비어 있음")
-                .put("qualityState", "empty")
-                .put("qualityLabel", "지원안 미선택")
-                .put("coverageCount", 0)
-                .put("coverageComplete", false)
+                .put("slot", slot).put("occupied", false).put("resolvable", false)
+                .put("title", "$slot. 비어 있음").put("qualityState", "empty")
+                .put("qualityLabel", "지원안 미선택").put("coverageCount", 0)
+                .put("coverageComplete", false).put("scoreDecision", JSONObject().put("decisionLabel", "종합: 판정 보류"))
         }
         if (candidate == null) {
             return JSONObject()
-                .put("slot", slot)
-                .put("occupied", true)
-                .put("resolvable", false)
+                .put("slot", slot).put("occupied", true).put("resolvable", false)
                 .put("applicationIdentityKey", slotRow?.optString("applicationIdentityKey").orEmpty())
                 .put("title", "$slot. ${slotRow?.optString("displayLabel", "연결 확인 필요")}")
-                .put("qualityState", "stale")
-                .put("qualityLabel", "canonical 연결 복구 필요")
-                .put("coverageCount", 0)
-                .put("coverageComplete", false)
+                .put("qualityState", "stale").put("qualityLabel", "canonical 연결 복구 필요")
+                .put("coverageCount", 0).put("coverageComplete", false)
+                .put("scoreDecision", JSONObject().put("decisionLabel", "종합: 판정 보류"))
         }
 
         val coverage = candidate.optJSONObject("coverage") ?: JSONObject()
@@ -94,28 +96,27 @@ object HubDashboardModel {
         val capacity = if (candidate.has("capacity") && !candidate.isNull("capacity")) candidate.optInt("capacity", -1).takeIf { it >= 0 } else null
         val quality = candidate.optString("qualityState", candidate.optString("adigaBindingQuality", "unknown"))
         return JSONObject()
-            .put("slot", slot)
-            .put("occupied", true)
-            .put("resolvable", true)
+            .put("slot", slot).put("occupied", true).put("resolvable", true)
             .put("applicationIdentityKey", candidate.optString("applicationIdentityKey"))
             .put("canonicalApplicationId", candidate.optString("canonicalApplicationId"))
-            .put("university", university ?: JSONObject.NULL)
-            .put("department", department ?: JSONObject.NULL)
-            .put("admission", admission ?: JSONObject.NULL)
-            .put("campus", campus ?: JSONObject.NULL)
+            .put("university", university ?: JSONObject.NULL).put("department", department ?: JSONObject.NULL)
+            .put("admission", admission ?: JSONObject.NULL).put("campus", campus ?: JSONObject.NULL)
             .put("capacity", capacity ?: JSONObject.NULL)
             .put("title", listOfNotNull(university, department).joinToString(" · ").ifBlank { "$slot. 지원안" })
             .put("subtitle", listOfNotNull(admission, campus?.let { "[$it]" }).joinToString(" · "))
-            .put("qualityState", quality)
-            .put("qualityLabel", qualityLabel(quality))
-            .put("coverageCount", coverage.optInt("coveredCount", 0))
-            .put("coverageComplete", coverage.optBoolean("complete", false))
+            .put("qualityState", quality).put("qualityLabel", qualityLabel(quality))
+            .put("coverageCount", coverage.optInt("coveredCount", 0)).put("coverageComplete", coverage.optBoolean("complete", false))
             .put("missingLanes", coverage.optJSONArray("missing") ?: JSONArray())
             .put("updatedAt", candidate.optString("updatedAt"))
             .put("officialStructuralCurrent", binding.optInt("officialStructuralCurrent", 0))
             .put("officialRowBoundCurrent", binding.optInt("officialRowBoundCurrent", 0))
             .put("officialTableSegmentCurrent", binding.optInt("officialTableSegmentCurrent", 0))
             .put("adigaMatchCount", candidate.optInt("adigaMatchCount", 0))
+            .put("scoreDecision", score ?: JSONObject()
+                .put("conversionLabel", "대학 환산: 미확인")
+                .put("officialOutcomeLabel", "공식 입결: 미확인")
+                .put("predictionLabel", "진학사 예측: 미확인")
+                .put("decisionLabel", "종합: 판정 보류"))
     }
 
     private fun buildSync(syncStatus: JSONObject, runtime: JSONObject): JSONObject {
@@ -127,7 +128,6 @@ object HubDashboardModel {
         val loginRequired = runtime.optBoolean("loginRequired", false)
         val loginChecking = runtime.optBoolean("loginChecking", false)
         val recovering = runtime.optBoolean("recovering", false)
-
         val state = when {
             loginRequired -> "USER_LOGIN_REQUIRED"
             loginChecking -> "LOGIN_CHECK"
@@ -145,7 +145,6 @@ object HubDashboardModel {
             }
             else -> "IDLE"
         }
-
         val mission = runtime.optJSONObject("mission")
             ?: syncStatus.optJSONObject("jinhakDiagnosticsSummary")?.optJSONObject("missionTargetLedger")
             ?: JSONObject()
@@ -158,13 +157,10 @@ object HubDashboardModel {
             else -> "진행 수치 대기"
         }
         return JSONObject()
-            .put("state", state)
-            .put("stateLabel", syncStateLabel(state))
+            .put("state", state).put("stateLabel", syncStateLabel(state))
             .put("phase", if (runtimeRunning) runtimePhase else persistedPhase)
-            .put("progressText", progressText)
-            .put("targets", totalTargets)
-            .put("confirmed", confirmed)
-            .put("outstanding", outstanding)
+            .put("progressText", progressText).put("targets", totalTargets)
+            .put("confirmed", confirmed).put("outstanding", outstanding)
             .put("updatedAt", syncStatus.optString("updatedAt"))
             .put("completionReason", syncStatus.optString("completionReason"))
             .put("lastProgressAgeSeconds", runtime.optLong("lastProgressAgeSeconds", -1L))
@@ -195,7 +191,6 @@ object HubDashboardModel {
 
     private fun JSONObject.nullableString(key: String): String? =
         if (!has(key) || isNull(key)) null else optString(key).trim().takeIf { it.isNotBlank() && it != "null" }
-
     private fun JSONArray.countOccupied(): Int = (0 until length()).count { optJSONObject(it)?.optBoolean("occupied", false) == true }
     private fun JSONArray.countResolvable(): Int = (0 until length()).count { optJSONObject(it)?.optBoolean("resolvable", false) == true }
     private fun JSONArray.countFullCoverage(): Int = (0 until length()).count { optJSONObject(it)?.optBoolean("coverageComplete", false) == true }
