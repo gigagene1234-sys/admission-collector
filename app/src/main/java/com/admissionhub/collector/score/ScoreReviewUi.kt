@@ -6,13 +6,13 @@ import android.content.Intent
 import android.net.Uri
 import android.text.InputType
 import android.widget.*
+import com.admissionhub.collector.canonical.AdigaApplicationEvidenceAnalyzer
 import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.hub.HubDashboardModel
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
 import java.time.LocalDateTime
-import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -47,11 +47,15 @@ class ScoreReviewUi(
         }
     }
     private fun error(message: String) { AlertDialog.Builder(activity).setTitle("입력 확인").setMessage(message).setPositiveButton("확인", null).show() }
+
     fun showProfile(importedText: String? = null) {
         val old = store.currentStudentScoreProfile(); val p = panel()
-        text(p, "과목별 성적을 입력하거나 엑셀에서 복사한 표·CSV·JSON 파일을 가져오세요. 등급이 없는 과목은 빈칸으로 보존합니다.")
+        text(p, "과목별 성적을 직접 입력하거나 XLSX·CSV·TSV·성적 JSON을 가져오세요. 등급이 없는 과목은 빈칸으로 보존합니다.")
         val defaultYear = session()?.let { store.loadCanonicalApplicationCandidates(it).optJSONObject(0)?.optInt("academicYear") } ?: 2027
         val year = field(p, "지원 학년도", old.optInt("academicYear", defaultYear).toString(), true)
+        button(p, "XLSX 파일 가져오기 · 시트/열 미리보기") {
+            activity.startActivity(Intent(activity, XlsxImportActivity::class.java).putExtra(XlsxImportActivity.EXTRA_SESSION_ID, session()))
+        }
         button(p, "CSV / TSV / 성적 JSON 파일 가져오기", importFile)
         val rows = old.optJSONArray("subjects") ?: JSONArray()
         val existing = buildString {
@@ -75,12 +79,13 @@ class ScoreReviewUi(
         }
         dialog("내 성적", p)
     }
+
     fun showPortfolio() {
         val id = session() ?: return error("지원안을 먼저 선택하세요.")
         val model = HubDashboardModel.build(store.canonicalHubSummary(id), store.unifiedStatus(id), JSONObject(), store.scoreDecisionSummary(id))
         val p = panel(); val portfolio = model.getJSONObject("applicationPortfolio")
         text(p, "원서 적정성 · 선택 ${portfolio.optInt("selected")}/6", true)
-        text(p, "공식 참고선과의 성적 비교, 지원조건, 일정, 진학사 자료를 함께 검토합니다. 결과는 입력 근거에 따른 점검이며 합격확률이 아닙니다.")
+        text(p, "어디가 공식근거 연결상태, 공식 참고선과의 성적 비교, 지원조건·일정, 진학사 자료를 분리해 함께 검토합니다. 결과는 입력·확인된 근거에 따른 점검이며 합격확률이 아닙니다.")
         val counts = portfolio.getJSONObject("counts")
         text(p, "검토 가능 ${counts.optInt("REVIEWABLE")} · 성적 위험 ${counts.optInt("SCORE_RISK")} · 조건·일정 재검토 ${counts.optInt("CONDITIONS_RECHECK")} · 자료 보완 ${counts.optInt("HOLD")}")
         val warnings = portfolio.getJSONArray("warnings")
@@ -89,18 +94,32 @@ class ScoreReviewUi(
         for (i in 0 until cards.length()) {
             val card = cards.getJSONObject(i); if (!card.optBoolean("occupied")) continue
             text(p, "${card.optInt("slot")}. ${card.optString("title")}\n${card.optString("subtitle")}", true)
+            val official = card.optJSONObject("officialEvidence")
+            if (official != null) text(p, official.optString("label"))
             text(p, card.optJSONObject("applicationReview")?.optString("label", "자료 보완 후 판단") ?: "자료 보완 후 판단")
             button(p, "근거·부족한 항목 보기") { showCard(card.optString("applicationIdentityKey")) }
         }
         dialog("6장 전체 검토", p)
     }
+
     fun showCard(identity: String) {
         val id = session() ?: return error("지원안 연결을 확인하세요.")
         val list = store.loadCanonicalApplicationCandidates(id)
         val candidate = (0 until list.length()).map { list.getJSONObject(it) }.firstOrNull { it.optString("applicationIdentityKey") == identity } ?: return error("지원안 연결을 복구하세요.")
         val score = store.scoreDecisionSummary(id).getJSONObject("byIdentity").optJSONObject(identity) ?: return error("현재 선택한 지원안에만 등록할 수 있습니다.")
         val review = score.getJSONObject("applicationReview"); val p = panel()
+        val official = AdigaApplicationEvidenceAnalyzer.analyze(candidate)
         text(p, candidate.optString("displayLabel"), true); text(p, review.getString("label"), true)
+        text(p, "어디가 공식근거 연결", true)
+        text(p, official.optString("label"))
+        val officialFacts = official.optJSONArray("facts") ?: JSONArray()
+        for (i in 0 until officialFacts.length()) text(p, "• ${officialFacts.getString(i)}")
+        val officialMissing = official.optJSONArray("missing") ?: JSONArray()
+        if (officialMissing.length() > 0) {
+            text(p, "직접 연결에 부족한 근거")
+            for (i in 0 until officialMissing.length()) text(p, "• ${officialMissing.getString(i)}")
+        }
+        text(p, official.optString("nextAction"))
         for ((key, title) in listOf("reasons" to "판단 근거", "risks" to "유의할 항목", "missing" to "더 필요한 자료")) {
             text(p, title, true); val a = review.getJSONArray(key)
             if (a.length() == 0) text(p, "현재 추가 항목 없음")
@@ -115,20 +134,36 @@ class ScoreReviewUi(
         }
         button(p, "성적·공식 입결 근거 등록 / 수정") { editEvidence(candidate, false) }
         button(p, "지원자격·수능최저·서류·일정 확인") { editEvidence(candidate, true) }
-        button(p, "수집된 공식 행 근거 보기") {
-            val body = panel(); val ev = candidate.optJSONObject("adigaBinding")?.optJSONArray("officialAdmissionEvidence") ?: JSONArray()
-            text(body, "대학 단위 자료도 포함됩니다. 모집단위·전형이 확인된 행만 이 지원안의 입결 근거로 사용할 수 있습니다.")
-            for (i in 0 until minOf(ev.length(), 40)) { val r = ev.getJSONObject(i); text(body, "${r.optInt("recordYear")} · ${r.optString("scope")}\n${r.optString("rowEvidence")}\n${r.optString("sourcePage")}") }
-            if (ev.length() == 0) text(body, "연결된 공식 행 근거가 없습니다. 대학 공식 자료에서 해당 전형·모집단위를 확인하세요.")
-            if (ev.length() > 40) text(body, "전체 ${ev.length()}건 중 40건 표시")
-            dialog("공식 자료 확인", body)
-        }
+        button(p, "수집된 어디가 근거를 연결 수준별로 보기") { showOfficialEvidence(official) }
         dialog("원서별 적정성 검토", p)
     }
+
+    private fun showOfficialEvidence(official: JSONObject) {
+        val body = panel()
+        text(body, official.optString("label"), true)
+        text(body, "대학 단위 자료와 원서 직접 연결 자료를 구분합니다. 전형·모집단위가 같은 행 또는 명시적 동일 표 구간에서 확인되지 않으면 이 원서의 공식 입결로 자동 승격하지 않습니다.")
+        fun showArray(title: String, rows: JSONArray) {
+            text(body, title, true)
+            if (rows.length() == 0) text(body, "없음")
+            for (i in 0 until rows.length()) {
+                val r = rows.optJSONObject(i) ?: continue
+                text(body, "${r.optInt("recordYear")} · ${r.optString("scope")} · 모집단위 ${r.optString("departmentMatch")} · 전형 ${r.optString("admissionMatch")}\n${r.optString("rowEvidence")}\n${r.optString("sourcePage")}")
+            }
+        }
+        showArray("지원년도 직접 연결 근거", official.optJSONArray("currentApplicationBoundEvidence") ?: JSONArray())
+        showArray("과거 입결 직접 연결 근거", official.optJSONArray("historicalApplicationBoundEvidence") ?: JSONArray())
+        showArray("지원년도 대학/전형 공통 근거 예시", official.optJSONArray("universityCurrentEvidenceSample") ?: JSONArray())
+        showArray("과거 공식자료 예시", official.optJSONArray("historicalEvidenceSample") ?: JSONArray())
+        text(body, official.optString("nextAction"), true)
+        dialog("어디가 공식자료 연결 진단", body)
+    }
+
     private fun editEvidence(candidate: JSONObject, rules: Boolean) {
         val id = session() ?: return; val identity = candidate.getString("applicationIdentityKey")
         val old = store.loadApplicationReviewInput(identity); val input = JSONObject(old.toString()); val p = panel()
         text(p, "${candidate.optInt("academicYear")} ${candidate.optString("displayLabel")}", true)
+        val official = AdigaApplicationEvidenceAnalyzer.analyze(candidate)
+        text(p, official.optString("label")); text(p, official.optString("nextAction"))
         val edits = linkedMapOf<String, EditText>()
         fun add(key: String, title: String, numeric: Boolean = false, multiline: Boolean = false) {
             val value = if (old.isNull(key)) "" else old.optString(key)
@@ -137,7 +172,7 @@ class ScoreReviewUi(
         var sourceCheck: CheckBox? = null; var rulesCheck: CheckBox? = null
         val spinners = mutableMapOf<String, Spinner>()
         if (!rules) {
-            text(p, "대학 공식 성적산출 결과와 과거 입결의 동일 지표를 입력하세요. 진학사 점수를 공식 환산값으로 옮겨 검증 처리하지 마세요.")
+            text(p, "대학 공식 성적산출 결과와 과거 입결의 동일 지표를 입력하세요. 어디가의 대학 단위 공통자료나 진학사 점수를 공식 환산값으로 자동 승격하지 않습니다.")
             button(p, "대학 공식 자료 열기") {
                 val u = candidate.optString("university")
                 val url = when { u.contains("우송") -> "https://ent.wsu.ac.kr/board/read.jsp?code=einfo0601&id=267261"; u.contains("한밭") -> "https://www.hanbat.ac.kr/admission/"; u.contains("한국교통") -> "https://www.ut.ac.kr/ipsi.do"; u.contains("충남") -> "https://ipsi.cnu.ac.kr/"; else -> "https://www.adiga.kr/" }
