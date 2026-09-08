@@ -16,7 +16,7 @@ import java.nio.charset.StandardCharsets
  * clicks grade selectors, or performs navigation by itself.
  */
 object JinhakHigh3AuthRoute {
-    const val SCHEMA_VERSION = 1
+    const val SCHEMA_VERSION = 2
     private const val MEMBER_LOGIN_ROOT = "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx"
     private const val WWW_HOST = "www.jinhak.com"
     private const val MEMBER_HOST = "member.jinhak.com"
@@ -60,11 +60,17 @@ object JinhakHigh3AuthRoute {
         return (host == WWW_HOST || host == "jinhak.com") && path == "/jh/member/login"
     }
 
+    fun isMemberLoginSurface(url: String): Boolean {
+        if (url.isBlank()) return false
+        val uri = runCatching { URI(url) }.getOrNull() ?: return false
+        return uri.scheme?.lowercase() == "https" &&
+            uri.host?.lowercase() == MEMBER_HOST &&
+            uri.path.orEmpty().lowercase().endsWith("/memberlogin.aspx")
+    }
+
     fun isCanonicalMemberLogin(url: String): Boolean {
         if (url.isBlank() || JinhakGradeRouteFence.isBlockedLowerGrade(url)) return false
-        val uri = runCatching { URI(url) }.getOrNull() ?: return false
-        if (uri.scheme?.lowercase() != "https" || uri.host?.lowercase() != MEMBER_HOST) return false
-        if (!uri.path.orEmpty().lowercase().endsWith("/memberlogin.aspx")) return false
+        if (!isMemberLoginSurface(url)) return false
         val returnTarget = returnUrl(url) ?: return false
         return isAllowedHigh3Target(returnTarget)
     }
@@ -79,11 +85,11 @@ object JinhakHigh3AuthRoute {
             val keyRaw = if (idx >= 0) pair.substring(0, idx) else pair
             val valueRaw = if (idx >= 0) pair.substring(idx + 1) else ""
             val key = decode(keyRaw)
-            if (!key.equals("ReturnURL", ignoreCase = true) && !key.equals("returnUrl", ignoreCase = true)) continue
+            if (!key.equals("ReturnURL", ignoreCase = true)) continue
             var value = decode(valueRaw)
-            repeat(2) {
+            for (i in 0 until 2) {
                 val next = decode(value)
-                if (next == value) return@repeat
+                if (next == value) break
                 value = next
             }
             return value
