@@ -1,0 +1,171 @@
+name: Apply Build Release Admission Hub v0.16.6 High3 Route Isolation
+
+on:
+  push:
+    branches: [codex/v0166-hard-high3-route-isolation]
+    paths:
+      - ".github/workflows/apply-build-release-v0166.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0166-high3-route-isolation
+  cancel-in-progress: true
+
+jobs:
+  patch-build-test-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.16.6-High3-Route-Isolation.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/v0166-hard-high3-route-isolation
+
+      - name: Apply v0.16.6 product patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch_v0166.py
+          python3 .github/scripts/patch_v0166_post.py
+          python3 .github/scripts/verify_v0166.py
+          git diff --check
+
+      - name: Commit exact v0.16.6 product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git diff --cached --exit-code && { echo "v0.16.6 patch produced no source changes"; exit 1; } || true
+          git commit -m "Admission Hub v0.16.6 hard high3 route isolation"
+          PRODUCT_SHA="$(git rev-parse HEAD)"
+          echo "PRODUCT_SHA=$PRODUCT_SHA" >> "$GITHUB_ENV"
+          git push origin HEAD:codex/v0166-hard-high3-route-isolation
+
+      - name: Verify committed source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          git diff --exit-code
+          python3 .github/scripts/verify_v0166.py
+          git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'jinhak-v0166-lower-grade-hard-block' >/dev/null
+          git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'request.isForMainFrame && JinhakGradeRouteFence.isBlockedLowerGrade(target)' >/dev/null
+          git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F '.put("oneShot", true)' >/dev/null
+          ! git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'jinhak-v0912-hidden-auth-transition' >/dev/null
+
+      - name: Verify v0.16.5 baseline exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=1c859ea425e5fd01813d1cb6fed4e6ee5760c8a9
+          git cat-file -e "$BASE^{commit}"
+          git show "$BASE:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'private fun handleJinhakV0912AuthCompatibilityPage' >/dev/null
+          echo "v0.16.5 baseline present"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test all application and regression contracts
+        run: gradle --no-daemon :app:testDebugUnitTest
+
+      - name: Compile signed product
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK package version label and stable signer
+        run: bash .github/scripts/verify_apk_v0166.sh
+
+      - name: Clean rebuild and retest exact committed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          git diff --exit-code
+          git reset --hard "$PRODUCT_SHA"
+          python3 .github/scripts/verify_v0166.py
+          gradle --no-daemon clean :app:testDebugUnitTest :app:assembleDebug
+          bash .github/scripts/verify_apk_v0166.sh
+          git diff --exit-code
+
+      - name: Package APK and verification report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/$APK_NAME"
+          (cd dist && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          python3 - <<'PY'
+          import glob,json,os,xml.etree.ElementTree as E
+          suites=[E.parse(f).getroot() for f in glob.glob('app/build/test-results/testDebugUnitTest/TEST-*.xml')]
+          counts={k:sum(int(s.get(k,'0')) for s in suites) for k in ['tests','failures','errors','skipped']}
+          assert counts['tests']>=104, counts
+          assert counts['failures']==counts['errors']==counts['skipped']==0, counts
+          report={
+            'productCommit':os.environ['PRODUCT_SHA'],
+            'versionName':'0.16.6','versionCode':116600,'tests':counts,
+            'signerSha256':'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995',
+            'exactCommittedSourceRebuild':True,
+            'baseline':'v0.16.5-1c859ea425e5fd01813d1cb6fed4e6ee5760c8a9',
+            'lowerGradeMainFrameNetworkIntercept':True,
+            'lowerGradePopupNetworkIntercept':True,
+            'lowerGradeCompatibilityTransitionRemoved':True,
+            'sharedLoginVisible':True,
+            'lowerGradeOneShotHigh3Recovery':True,
+            'rendererResumeLowerGradeSanitized':True,
+            'unclassifiedHigh3DoesNotStopSolelyOnTaxonomy':True,
+            'credentialsExported':False,
+            'cookiesExported':False,
+            'jinhakPromotedToOfficial':False,
+            'probabilityInferred':False,
+            'deviceAcceptance':'pending-real-galaxy-no-lower-grade-render-protected-core-batch-evidence'
+          }
+          open('dist/verification-v0.16.6.json','w').write(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+          print(json.dumps(report,ensure_ascii=False))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.16.6-high3-route-isolation
+          path: |
+            dist/*
+            app/build/test-results/testDebugUnitTest/*.xml
+
+      - name: Publish verified v0.16.6 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view v0.16.6 >/dev/null 2>&1 && gh release delete v0.16.6 -y --cleanup-tag || true
+          gh release create v0.16.6 "dist/$APK_NAME" "dist/$APK_NAME.sha256" dist/verification-v0.16.6.json \
+            --target "$PRODUCT_SHA" --title "Admission Hub v0.16.6 — High3 Route Isolation" \
+            --notes-file docs/releases/v0.16.6.md
