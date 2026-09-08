@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.16.8 Event-Driven High3 Auth"
+        android:label="Admission Hub v0.16.9 Event-Driven High3 Auth"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
