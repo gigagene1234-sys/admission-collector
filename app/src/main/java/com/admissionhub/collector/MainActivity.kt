@@ -461,6 +461,7 @@ class MainActivity : Activity() {
         private const val JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS = 2_000L
         private const val JINHAK_LOGIN_RECOVERY_TIMEOUT_MS = 60_000L
         private const val MAX_JINHAK_LOGIN_RECOVERY_POLLS = 40
+        private const val MAX_JINHAK_REAUTH_CYCLES = 3
         private const val MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS = 2
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val MAX_JINHAK_GENERIC_ACTIONS = 180
@@ -4001,6 +4002,22 @@ class MainActivity : Activity() {
 
     private fun scheduleJinhakLoginRecovery(reason: String) {
         if (provider != ProviderId.JINHAK) return
+        if (batchRunning && jinhakReauthCycles >= MAX_JINHAK_REAUTH_CYCLES) {
+            jinhakLoginRecoveryFenceTrips += 1
+            batchErrors.put(JSONObject()
+                .put("type", "jinhak-reauth-circuit-open")
+                .put("reason", reason.take(80))
+                .put("reauthCycles", jinhakReauthCycles)
+                .put("maxReauthCycles", MAX_JINHAK_REAUTH_CYCLES)
+                .put("lowerGradeNavigationsBlocked", jinhakLowerGradeNavigationsBlocked))
+            recordRuntimeEvent("jinhak-reauth-circuit-open", JSONObject()
+                .put("reason", reason.take(80))
+                .put("reauthCycles", jinhakReauthCycles)
+                .put("maxReauthCycles", MAX_JINHAK_REAUTH_CYCLES))
+            status.text = "진학사 재인증 반복 상한 도달 · 무한 로그인 재시도를 중단하고 어디가 공식자료를 보존합니다."
+            finishBatch("jinhak-reauth-circuit-open")
+            return
+        }
         val currentUrl = if (::webView.isInitialized) webView.url.orEmpty() else ""
         if (batchRunning && isProviderLoginUrl(ProviderId.JINHAK, currentUrl) && !batchPausedForLogin) {
             jinhakLoginUrlStateCorrections += 1
