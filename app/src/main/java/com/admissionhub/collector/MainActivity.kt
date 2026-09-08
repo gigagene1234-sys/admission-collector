@@ -34,6 +34,7 @@ import com.admissionhub.collector.capture.SnapshotScript
 import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.hub.HubDashboardModel
+import com.admissionhub.collector.hub.AdmissionDashboardActivity
 import com.admissionhub.collector.score.ScoreReviewUi
 import com.admissionhub.collector.score.AdigaAutoScoreMaterializer
 import com.admissionhub.collector.hub.HubFirstLayoutPolicy
@@ -496,8 +497,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.15.1"
-        private const val BUILD_CODE = 115100
+        private const val VERSION = "0.16.0"
+        private const val BUILD_CODE = 116000
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -852,6 +853,11 @@ class MainActivity : Activity() {
         primaryActions.addView(unifiedButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         primaryActions.addView(hubManageButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         primaryActions.addView(hubRecoveryButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val fullDashboardButton = Button(this).apply {
+            text = "전체 대시보드"
+            setOnClickListener { startActivity(Intent(this@MainActivity, AdmissionDashboardActivity::class.java)) }
+        }
+        primaryActions.addView(fullDashboardButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         hubAdvancedToggle = Button(this).apply { text = "고급 도구" }
         primaryActions.addView(hubAdvancedToggle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
@@ -916,7 +922,14 @@ class MainActivity : Activity() {
         val canonical = runCatching { localStore.canonicalHubSummary(canonicalSession) }.getOrDefault(JSONObject())
         val syncSession = if (unifiedRunning && !unifiedSessionId.isNullOrBlank()) unifiedSessionId else canonicalSession
         val sync = runCatching { localStore.unifiedStatus(syncSession ?: canonicalSession) }.getOrDefault(JSONObject())
-        if (trigger != "ticker") runCatching { localStore.materializeSelectedPredictions(canonicalSession) }
+        if (trigger != "ticker") {
+            // Official Adiga evidence must materialize independently from Jinhak login state.
+            // The latest session can have thousands of official records while Jinhak is still on login.
+            localStore.latestUnifiedSession()?.takeIf { it.isNotBlank() }?.let { latest ->
+                runCatching { AdigaAutoScoreMaterializer.materializeSelected(localStore, latest) }
+            }
+            runCatching { localStore.materializeSelectedPredictions(canonicalSession) }
+        }
         val scoreDecision = runCatching { localStore.scoreDecisionSummary(canonicalSession) }.getOrDefault(JSONObject())
         val model = HubDashboardModel.build(canonical, sync, runtimeHubDashboardState(), scoreDecision)
         hubDashboardLastModel = model
@@ -4002,7 +4015,7 @@ class MainActivity : Activity() {
 
     private fun scheduleJinhakLoginRecovery(reason: String) {
         if (provider != ProviderId.JINHAK) return
-        if (batchRunning && jinhakReauthCycles >= MAX_JINHAK_REAUTH_CYCLES) {
+        if ((batchRunning || unifiedRunning || jinhakTransitionAuthGateActive || startupLoginPreflightActive) && jinhakReauthCycles >= MAX_JINHAK_REAUTH_CYCLES) {
             jinhakLoginRecoveryFenceTrips += 1
             batchErrors.put(JSONObject()
                 .put("type", "jinhak-reauth-circuit-open")

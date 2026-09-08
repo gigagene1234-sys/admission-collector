@@ -125,7 +125,11 @@ class UnifiedExcelScoreActivity : Activity() {
                     { it.optInt("rowCount", 0) },
                     { it.optInt("gradedRows", 0) },
                     { if (it.optString("recognitionMode") == "wide-semester-columns") 1 else 0 }
-                ))!!
+                ))!!.also { chosen ->
+                    val completeness = StudentScoreDocumentCompleteness.assess(chosen)
+                    chosen.put("documentCompleteness", completeness)
+                        .put("documentCompletenessVerified", completeness.optBoolean("verified", false))
+                }
             }
             runOnUiThread {
                 result.onSuccess { profile -> parsedProfile = profile; renderEditable(profile) }
@@ -198,7 +202,9 @@ class UnifiedExcelScoreActivity : Activity() {
         yearEdit = labeledEdit("지원 학년도", defaultYear.toString(), true)
         completeCheck = CheckBox(this).apply {
             text = "이 파일이 판단에 사용할 학생부 과목·학기를 빠짐없이 포함합니다."
-            isChecked = false
+            isChecked = profile.optBoolean("documentCompletenessVerified", false)
+            isEnabled = !isChecked
+            text = if (isChecked) "학교 Excel 구조에서 1-1~3-1 전체 학기 범위가 확인되었습니다." else "이 파일이 판단에 사용할 학생부 과목·학기를 빠짐없이 포함합니다."
             root.addView(this)
         }
 
@@ -284,6 +290,8 @@ class UnifiedExcelScoreActivity : Activity() {
         }.getOrElse { return showError(it.message ?: "입력값을 확인하세요.") }
         val source = parsedProfile ?: JSONObject()
         profile.put("sourceType", sourceFormat)
+            .put("documentCompleteness", source.optJSONObject("documentCompleteness") ?: JSONObject())
+            .put("documentCompletenessVerified", source.optBoolean("documentCompletenessVerified", false))
             .put("excelFileName", fileName.take(240))
             .put("excelSheetName", source.optString("xlsxSheetName"))
             .put("automaticRecognition", true)
