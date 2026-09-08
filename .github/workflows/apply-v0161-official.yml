@@ -1,0 +1,36 @@
+name: Apply Admission Hub v0.16.1 Official Fallback
+
+on:
+  push:
+    branches: [codex/v0160-dashboard-official-login]
+    paths:
+      - ".github/scripts/patch_v0161_official.py"
+      - ".github/workflows/apply-v0161-official.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0161-official-apply
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/v0160-dashboard-official-login
+          fetch-depth: 0
+      - run: python3 .github/scripts/patch_v0161_official.py
+      - name: Commit product patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app
+          git commit -m "feat: integrate verified official published outcome fallback"
+          git push origin HEAD:codex/v0160-dashboard-official-login
