@@ -13,7 +13,7 @@ import java.nio.charset.StandardCharsets
  * authentication surface; lower-grade context inside that surface is fenced separately in the DOM.
  */
 object JinhakGradeRouteFence {
-    const val SCHEMA_VERSION = 2
+    const val SCHEMA_VERSION = 3
 
     private val lowerGradeRouteMarkers = listOf(
         "/jh/high1/",
@@ -34,17 +34,22 @@ object JinhakGradeRouteFence {
         if (containsLowerGradeRoute(path)) return true
 
         // A shared login URL is allowed only when it does not carry an explicit lower-grade
-        // destination in query/fragment/redirect parameters. Decode once so encoded return URLs
-        // such as %2Fjh%2Fhigh2%2F... are caught before WebView navigation begins.
-        val context = buildString {
+        // destination in query/fragment/redirect parameters. Decode repeatedly so nested redirect
+        // parameters such as %252Fjh%252Fhigh2%252F... cannot bypass the route fence.
+        var context = buildString {
             append(uri?.rawQuery.orEmpty())
             append('#')
             append(uri?.rawFragment.orEmpty())
+        }.lowercase()
+        repeat(3) {
+            if (containsLowerGradeRoute(context)) return true
+            val decoded = runCatching {
+                URLDecoder.decode(context, StandardCharsets.UTF_8.name())
+            }.getOrDefault(context).lowercase()
+            if (decoded == context) return false
+            context = decoded
         }
-        val decodedContext = runCatching {
-            URLDecoder.decode(context, StandardCharsets.UTF_8.name())
-        }.getOrDefault(context).lowercase()
-        return containsLowerGradeRoute(decodedContext)
+        return containsLowerGradeRoute(context)
     }
 
     fun isHigh3(url: String): Boolean {
