@@ -1,4 +1,5 @@
 name: Apply Build Release Admission Hub v0.16.6 High3 Route Isolation
+# verifier retry: nested-encoding production comment is valid
 
 on:
   push:
