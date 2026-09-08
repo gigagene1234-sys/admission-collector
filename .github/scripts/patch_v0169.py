@@ -16,12 +16,19 @@ replacements = {
     ],
 }
 
+changed = False
 for path, pairs in replacements.items():
     text = path.read_text()
     for old, new in pairs:
-        if text.count(old) != 1:
-            raise SystemExit(f"expected exactly one occurrence in {path}: {old}")
-        text = text.replace(old, new)
+        old_count = text.count(old)
+        new_count = text.count(new)
+        if old_count == 1 and new_count == 0:
+            text = text.replace(old, new)
+            changed = True
+        elif old_count == 0 and new_count == 1:
+            pass
+        else:
+            raise SystemExit(f"unexpected version token state in {path}: old={old_count}, new={new_count}")
     path.write_text(text)
 
-print("v0.16.9 version patch applied; product logic unchanged")
+print("v0.16.9 version patch ready; changed=" + str(changed).lower() + "; product logic unchanged")
