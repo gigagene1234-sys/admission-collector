@@ -35,7 +35,12 @@ object OfficialUniversityScoreCalculator {
 
         if (profile.optString("status") != "IMPORTED") return hold(base, "student-profile-not-imported", "학생부 과목 성적이 아직 가져와지지 않았습니다.")
         if (profile.optInt("academicYear", year) != year) return hold(base, "student-profile-year-mismatch", "학생부 프로필의 지원 학년도가 원서와 다릅니다.")
-        val transcriptComplete = profile.optBoolean("completeTranscriptConfirmedByUser", false) || profile.optBoolean("documentCompletenessVerified", false)
+        val structuralCompleteness = StudentScoreDocumentCompleteness.assess(profile)
+        val transcriptComplete = profile.optBoolean("completeTranscriptConfirmedByUser", false) ||
+            profile.optBoolean("documentCompletenessVerified", false) ||
+            structuralCompleteness.optBoolean("verified", false)
+        base.put("documentCompleteness", structuralCompleteness)
+            .put("documentCompletenessVerifiedAtCalculation", structuralCompleteness.optBoolean("verified", false))
         if (!transcriptComplete) return hold(base, "transcript-not-confirmed-complete", "가져온 과목·학기가 판단에 필요한 학생부 전체를 포함하는지 확인이 필요합니다.")
         if (!official.optBoolean("currentComponentsVerified", false)) return hold(base, "official-components-not-verified", "지원년도 공식 전형과 모집단위를 각각 확인한 뒤 환산합니다.")
         val courses = parseCourses(profile)

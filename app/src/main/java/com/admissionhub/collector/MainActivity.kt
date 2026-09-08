@@ -313,6 +313,9 @@ class MainActivity : Activity() {
     private var jinhakLoginRecoveryEpisodeStartedAtMs = 0L
     private var jinhakLoginRecoveryEpisodePolls = 0
     private var jinhakLoginRecoveryFenceTrips = 0
+    private var jinhakDomProductFenceInstalls = 0
+    private var jinhakDomProductFenceCorrections = 0
+    private var jinhakDomLowerGradeBlocks = 0
     private var jinhakPostMissionClosureFences = 0
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
@@ -497,8 +500,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.16.0"
-        private const val BUILD_CODE = 116000
+        private const val VERSION = "0.16.1"
+        private const val BUILD_CODE = 116100
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -1449,8 +1452,10 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
-                // v0.9.5: never navigate to login proactively. Probe the rendered DOM after
-                // every navigation and auto-login only when an actual login surface is visible.
+                if (provider == ProviderId.JINHAK) installJinhakHigh3DomProductFence("page-finished")
+                // Probe only after the high3 DOM product fence is armed. Jinhak's login page can
+                // switch the product context without changing /jh/member/login, so URL-only fencing
+                // is insufficient on real devices.
                 scheduleLoginSurfaceDetection(provider, "page-finished")
                 if (jinhakRealAuthProbeActive && provider == ProviderId.JINHAK) {
                     handleJinhakRealAuthProbePageFinished(url)
@@ -2846,8 +2851,54 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun installJinhakHigh3DomProductFence(reason: String) {
+        if (provider != ProviderId.JINHAK || !::webView.isInitialized) return
+        val js = """
+            (function(){
+              try{
+                function norm(v){return (v||'').toString().toLowerCase().replace(/\\s+/g,'').replace(/[·ㆍ・\\/,._-]/g,'');}
+                function label(el){return ((el&&(el.innerText||el.textContent||el.value||el.getAttribute&&el.getAttribute('aria-label')))||'').toString();}
+                function low(el){var n=norm(label(el));return n==='고12'||n==='고1~2'||n.indexOf('고1고2')>=0||n.indexOf('고12학년')>=0;}
+                function high(el){var n=norm(label(el));return n.indexOf('고3')>=0&&(n.indexOf('n수')>=0||n.indexOf('재수')>=0||n==='고3');}
+                function active(el){if(!el)return false;var a=(el.getAttribute&&el.getAttribute('aria-selected'))||'';var c=(el.className||'').toString().toLowerCase();return a==='true'||/(^|\\s)(active|on|selected|current)(\\s|$)/.test(c);}
+                function all(){return Array.from(document.querySelectorAll('a,button,[role=tab],[role=button],li,span,div')).filter(function(el){var n=norm(label(el));return n.indexOf('고3')>=0||n.indexOf('고1')>=0||n.indexOf('고2')>=0;});}
+                function enforce(source){
+                  var els=all(), h=els.find(high), l=els.find(low), now=Date.now();
+                  var lowActive=!!(l&&active(l)); var highActive=!!(h&&active(h));
+                  if(h&&l&&(lowActive||!highActive)&&(!window.__admissionHigh3LastClick||now-window.__admissionHigh3LastClick>1200)){
+                    window.__admissionHigh3LastClick=now; try{h.click();}catch(e){}
+                    return {corrected:true,source:source,high:label(h).trim(),low:label(l).trim(),lowActive:lowActive,highActive:highActive};
+                  }
+                  return {corrected:false,source:source,high:!!h,low:!!l,lowActive:lowActive,highActive:highActive};
+                }
+                if(!window.__admissionHigh3FenceInstalled){
+                  window.__admissionHigh3FenceInstalled=true;
+                  document.addEventListener('click',function(ev){
+                    try{var t=ev.target&&ev.target.closest?ev.target.closest('a,button,[role=tab],[role=button],li,span,div'):ev.target;if(t&&low(t)){ev.preventDefault();ev.stopPropagation();if(ev.stopImmediatePropagation)ev.stopImmediatePropagation();window.__admissionLowerGradeBlocked=(window.__admissionLowerGradeBlocked||0)+1;setTimeout(function(){enforce('blocked-click');},0);}}catch(e){}
+                  },true);
+                  try{new MutationObserver(function(){enforce('mutation');}).observe(document.documentElement||document,{subtree:true,childList:true,attributes:true,attributeFilter:['class','aria-selected']});}catch(e){}
+                }
+                var out=enforce('install'); out.installed=true; out.blocked=window.__admissionLowerGradeBlocked||0; return JSON.stringify(out);
+              }catch(e){return JSON.stringify({installed:false,error:String(e)});}
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) { raw ->
+            jinhakDomProductFenceInstalls += 1
+            val decoded = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
+            val result = runCatching { JSONObject(decoded) }.getOrDefault(JSONObject())
+            val blocked = result.optInt("blocked", 0)
+            if (blocked > jinhakDomLowerGradeBlocks) jinhakDomLowerGradeBlocks = blocked
+            if (result.optBoolean("corrected", false)) {
+                jinhakDomProductFenceCorrections += 1
+                recordRuntimeEvent("jinhak-high3-dom-product-corrected", JSONObject(result.toString()).put("reason", reason))
+                status.text = "진학사 고1·2 제품 전환을 차단하고 고3·N수 컨텍스트를 복구했습니다."
+            }
+        }
+    }
+
     private fun attemptSavedCredentialLogin(which: ProviderId, reason: String) {
         if (provider != which) return
+        if (which == ProviderId.JINHAK) installJinhakHigh3DomProductFence("credential:$reason")
         val now = System.currentTimeMillis()
         if (credentialAutoLoginInFlight) {
             credentialAutoLoginSuppressedInFlight += 1
@@ -7916,6 +7967,9 @@ class MainActivity : Activity() {
                         .put("jinhakLoginRecoveryPolls", jinhakLoginRecoveryPolls)
                         .put("jinhakLoginRecoveryEpisodePolls", jinhakLoginRecoveryEpisodePolls)
                         .put("jinhakLoginRecoveryFenceTrips", jinhakLoginRecoveryFenceTrips)
+                    .put("jinhakDomProductFenceInstalls", jinhakDomProductFenceInstalls)
+                    .put("jinhakDomProductFenceCorrections", jinhakDomProductFenceCorrections)
+                    .put("jinhakDomLowerGradeBlocks", jinhakDomLowerGradeBlocks)
                         .put("jinhakPostMissionClosureFences", jinhakPostMissionClosureFences)
                         .put("jinhakLoginRecoveryTimeoutMs", JINHAK_LOGIN_RECOVERY_TIMEOUT_MS)
                         .put("jinhakLoginRecoveryMaxPolls", MAX_JINHAK_LOGIN_RECOVERY_POLLS)
