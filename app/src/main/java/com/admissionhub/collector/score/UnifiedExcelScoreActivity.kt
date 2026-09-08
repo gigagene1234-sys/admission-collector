@@ -102,7 +102,23 @@ class UnifiedExcelScoreActivity : Activity() {
                     }
                     else -> throw IllegalArgumentException("실제 .xls 또는 .xlsx 형식이 아닙니다.")
                 }
-                autoRecognize(workbook)
+                val strict = runCatching { autoRecognize(workbook) }.getOrNull()
+                val structural = KoreanTranscriptAutoRecognizer.recognizeBest(
+                    workbook = workbook,
+                    admissionYear = sessionId?.let { id -> store.loadCanonicalApplicationCandidates(id).optJSONObject(0)?.optInt("academicYear") }
+                        ?.takeIf { it in 2000..2100 } ?: 2027,
+                    fileName = fileName,
+                    sourceType = sourceFormat
+                )
+                when {
+                    strict == null && structural == null -> throw IllegalArgumentException(
+                        "Excel 파일은 열렸지만 학년·학기·과목 구조를 안전하게 확정하지 못했습니다."
+                    )
+                    strict == null -> structural!!
+                    structural == null -> strict
+                    structural.optInt("rowCount", 0) > strict.optInt("rowCount", 0) -> structural
+                    else -> strict
+                }
             }
             runOnUiThread {
                 result.onSuccess { profile -> parsedProfile = profile; renderEditable(profile) }
@@ -166,7 +182,9 @@ class UnifiedExcelScoreActivity : Activity() {
         title("학생부 자동 분석 · 입력")
         val subjects = profile.optJSONArray("subjects") ?: JSONArray()
         val average = if (profile.isNull("ownWeightedGrade")) "산출 대기" else String.format(Locale.US, "%.3f", profile.optDouble("ownWeightedGrade"))
+        val recognitionMode = profile.optString("recognitionMode").ifBlank { "strict-column" }
         info("$fileName · $sourceFormat · ${profile.optString("xlsxSheetName")} · ${subjects.length()}과목 인식 · 등급 없음 ${profile.optInt("ungradedRows")}과목 · 현재 가중평균 $average")
+        info("자동 인식 방식: $recognitionMode · 학년/학기는 파일에 명시된 열·병합·구간 표지만 사용하고 추정하지 않습니다.")
         info("아래 인식값 자체가 입력값입니다. 틀린 셀만 바로 수정한 뒤 맨 아래의 ‘저장 + 6장 통합 분석’을 누르세요.")
 
         val defaultYear = profile.optInt("academicYear", 2027)
@@ -282,7 +300,7 @@ class UnifiedExcelScoreActivity : Activity() {
         title("학생부 저장 · 통합 분석 완료")
         val avg = if (profile.isNull("ownWeightedGrade")) "산출 보류" else String.format(Locale.US, "%.3f", profile.optDouble("ownWeightedGrade"))
         info("${profile.optInt("rowCount")}과목 저장 · 등급 없는 과목 ${profile.optInt("ungradedRows")}개 · 입력 과목 가중평균 $avg")
-        if (!completeCheck.isChecked) info("전체 학생부 확인 체크가 꺼져 있어 대학별 자동 환산은 보수적으로 보류될 수 있습니다.")
+        if (!completeCheck.isChecked) info("대학 환산 산식이 상위과목·이수단위를 사용하므로, 파일이 판단에 사용할 학생부 전체인지 사용자가 확인하기 전에는 환산값만 보류합니다. 공식 과거 입결 수집·연결은 이 확인과 무관하게 자동 진행됩니다.")
         if (!sid.isNullOrBlank()) {
             val decision = store.scoreDecisionSummary(sid)
             val summary = decision.optJSONObject("summary") ?: JSONObject()

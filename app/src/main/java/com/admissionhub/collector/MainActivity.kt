@@ -35,6 +35,7 @@ import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.hub.HubDashboardModel
 import com.admissionhub.collector.score.ScoreReviewUi
+import com.admissionhub.collector.score.AdigaAutoScoreMaterializer
 import com.admissionhub.collector.hub.HubFirstLayoutPolicy
 import com.admissionhub.collector.observation.ObservationEvidence
 import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
@@ -492,10 +493,10 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.14.2"
-        private const val BUILD_CODE = 114200
+        private const val VERSION = "0.15.0"
+        private const val BUILD_CODE = 115000
         private const val LOCAL_FIRST_BETA = true
-        private const val ADIGA_RETRY_SUSPENDED = true
+        private const val ADIGA_RETRY_SUSPENDED = false
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -685,7 +686,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         unifiedButton = Button(this).apply {
-            text = "통합 동기화 시작"
+            text = "통합 자동수집 시작"
             setOnClickListener {
                 when {
                     startupLoginPreflightActive -> cancelStartupLoginPreflight("user-cancel")
@@ -932,7 +933,7 @@ class MainActivity : Activity() {
         val age = sync.optLong("lastProgressAgeSeconds", -1L)
         val ageText = if (age >= 0 && age < 86_400) " · 마지막 진행 ${age}초 전" else ""
         val qualityText = buildString {
-            append("공식연결 ").append(summary.optInt("accepted", 0)).append("/6")
+            append("공식 구성요소 ").append(summary.optInt("officialCurrentComponentsVerified", 0)).append("/6 · 동일행 직접결합 ").append(summary.optInt("accepted", 0)).append("/6")
             val provisional = summary.optInt("provisional", 0)
             val providerOnly = summary.optInt("providerOnly", 0)
             if (provisional > 0) append(" · 확인필요 ").append(provisional)
@@ -3261,7 +3262,7 @@ class MainActivity : Activity() {
         startupLoginStage = "cancelled"
         startupLoginOpenAttempted = false
         startupLoginPollGeneration += 1
-        unifiedButton.text = "통합 동기화 시작"
+        unifiedButton.text = "통합 자동수집 시작"
         status.text = "로그인 상태 확인가 취소되었습니다. 다시 시작하면 어디가→진학사 로그인 확인 후 수집합니다."
         recordRuntimeEvent("startup-login-sequence-cancel", JSONObject().put("reason", reason.take(80)))
     }
@@ -3510,14 +3511,10 @@ class MainActivity : Activity() {
     }
 
     private fun startUnifiedCollection() {
-        if (!startupLoginPreflightVerified) {
-            if (isFreshJinhakRealAuthProbe()) {
-                startAutomaticLoginAndCollectionSequence("manual-start-fresh-real-auth")
-            } else {
-                startJinhakRealAuthProbe(autoContinue = true, trigger = "manual-start")
-            }
-            return
-        }
+        // v0.15: Jinhak authentication must never block the public official Adiga crawl.
+        // Both provider leases are restored up front, but each provider verifies its own session
+        // only when that provider actually needs protected content. One user action drives the
+        // full Adiga -> Jinhak pipeline; no provider switch or separate login diagnostic is needed.
         startUnifiedCollectionAuthenticated()
     }
 
@@ -3526,6 +3523,21 @@ class MainActivity : Activity() {
             Toast.makeText(this, "현재 개별 수집을 먼저 종료한 뒤 통합 수집을 시작하세요.", Toast.LENGTH_LONG).show()
             return
         }
+        // Restore both domain leases at the same bootstrap point. WebView CookieManager is
+        // domain-scoped, so restoring Jinhak readiness does not require navigating away from Adiga.
+        // A restored lease is NOT treated as proof of server authentication; the Jinhak transition
+        // gate below still verifies a real protected route and uses saved credentials only if needed.
+        val restoredAdiga = runCatching { sessionVault.restore(ProviderId.ADIGA.wireName) }.getOrNull()
+        val restoredJinhak = runCatching { sessionVault.restore(ProviderId.JINHAK.wireName) }.getOrNull()
+        startupLoginAdigaRestoredLease = restoredAdiga?.restored == true
+        startupLoginJinhakRestoredLease = restoredJinhak?.restored == true
+        startupLoginAdigaAuthenticated = false
+        startupLoginJinhakAuthenticated = false
+        startupLoginPreflightActive = false
+        startupLoginPreflightVerified = false
+        startupLoginStage = "provider-independent-auto"
+        CookieManager.getInstance().flush()
+
         val sessionId = localStore.beginOrResumeUnifiedSession(VERSION)
         unifiedSessionId = sessionId
         unifiedRunning = true
@@ -3537,11 +3549,14 @@ class MainActivity : Activity() {
         unifiedJinhakCapturedPages.clear()
         unifiedAutoCaptureScheduled = false
         unifiedButton.text = "통합 수집 종료"
-        localStore.updateUnifiedSession(sessionId, "adiga", "running", "user-start")
+        localStore.updateUnifiedSession(sessionId, "adiga", "running", "provider-independent-auto-start")
         localStore.recordSyncState(
             sessionId, UnifiedSyncState.PRECHECK.name, null,
             JSONObject()
                 .put("collectorVersion", VERSION)
+                .put("providerIndependentAuto", true)
+                .put("adigaBlockedByJinhakAuth", false)
+                .put("bothProviderLeasesRestoredAtBootstrap", true)
                 .put("loginPreflight", JSONObject()
                     .put("verified", startupLoginAdigaAuthenticated && startupLoginJinhakAuthenticated)
                     .put("collectionBootstrapReady", startupLoginPreflightVerified)
@@ -3604,7 +3619,7 @@ class MainActivity : Activity() {
         sessionState.text = "세션 상태 확인 중"
         batchButton.text = "어디가 통합 수집 준비"
         diagnosticButton.text = "어디가 진단 로그 전송"
-        status.text = "통합 수집 1/2 · 어디가 전국 공식 입시정보 resume/audit 준비 중…"
+        status.text = "통합 자동수집 1/2 · 어디가 공식 기준·과거 입결을 먼저 수집합니다. 진학사 인증은 이 단계를 막지 않고 다음 단계에서 자동 복구합니다."
 
         val seed = ProviderRegistry.adapter(ProviderId.ADIGA).seedUrls().firstOrNull()
         if (seed.isNullOrBlank()) {
@@ -3612,6 +3627,37 @@ class MainActivity : Activity() {
             return
         }
         webView.loadUrl(seed)
+    }
+
+    private fun materializeOfficialScoreAndOutcomeEvidence(sessionId: String, trigger: String): JSONObject {
+        if (sessionId.isBlank()) return JSONObject().put("error", "missing-session")
+        val canonical = runCatching { localStore.rebuildCanonicalApplicationGraph(sessionId) }
+            .getOrElse { localStore.canonicalHubSummary(sessionId) }
+        val result = runCatching {
+            AdigaAutoScoreMaterializer.materializeSelected(localStore, sessionId, localStore.currentStudentScoreProfile())
+        }.getOrElse { error ->
+            JSONObject()
+                .put("schemaVersion", 1)
+                .put("error", "materialization-failed")
+                .put("exceptionClass", error.javaClass.name.take(120))
+                .put("probabilityInferred", false)
+        }
+        localStore.recordSyncState(
+            sessionId,
+            "ADIGA_SCORE_OUTCOME_MATERIALIZATION",
+            ProviderId.ADIGA.wireName,
+            JSONObject()
+                .put("trigger", trigger.take(120))
+                .put("candidateCount", canonical.optJSONArray("candidateGraph")?.length() ?: 0)
+                .put("studentProfileStatus", localStore.currentStudentScoreProfile().optString("status", "NOT_IMPORTED"))
+                .put("materialization", result)
+                .put("historicalOutcomeIndexingRunsWithoutStudentProfile", true)
+                .put("probabilityInferred", false),
+            false,
+            false
+        )
+        refreshHubDashboardFromStore("official-materialization")
+        return result
     }
 
     private fun transitionUnifiedToJinhak(adigaReason: String) {
@@ -3649,7 +3695,7 @@ class MainActivity : Activity() {
         batchButton.text = "진학사 자동 탐색 준비"
         diagnosticButton.text = "진학사 전체 분석 전송"
         unifiedButton.text = "통합 수집 종료"
-        status.text = "통합 수집 2/2 · 진학사 보호 경로 인증을 다시 확인한 뒤 저장대학 미션을 시작합니다."
+        status.text = "통합 자동수집 2/2 · 진학사 보호 경로를 자동 검증하고, 필요할 때만 기기 저장 계정으로 로그인한 뒤 6장 미션을 계속합니다."
         val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull() ?: ProviderId.JINHAK.homeUrl
         currentBatchTarget = canonicalizeBatchUrl(coreProbe)
         persistJinhakAuthDiagnostics("transition-auth-probe-start")
@@ -4203,7 +4249,7 @@ class MainActivity : Activity() {
             ++jinhakAbsoluteTargetGeneration
 
             if (sessionId == null) {
-                unifiedButton.text = "통합 동기화 시작"
+                unifiedButton.text = "통합 자동수집 시작"
                 status.text = "종료할 통합 수집 세션이 없습니다."
                 return
             }
@@ -4215,6 +4261,18 @@ class MainActivity : Activity() {
                 false
             )
             val canonicalSummary = localStore.rebuildCanonicalApplicationGraph(sessionId)
+            val finalOfficialMaterialization = materializeOfficialScoreAndOutcomeEvidence(sessionId, "unified-final-merge")
+            localStore.recordSyncState(
+                sessionId,
+                "FINAL_SCORE_OUTCOME_REINDEX",
+                ProviderId.ADIGA.wireName,
+                JSONObject()
+                    .put("materialization", finalOfficialMaterialization)
+                    .put("scoreDecisionSummary", localStore.scoreDecisionSummary(sessionId).optJSONObject("summary") ?: JSONObject())
+                    .put("probabilityInferred", false),
+                false,
+                false
+            )
             if (selectedSixRecoveryMode || selectedSixRecoverySessionId == sessionId) {
                 localStore.updateSelectedRecoveryFromCoverage(sessionId)
             }
@@ -4254,7 +4312,7 @@ class MainActivity : Activity() {
                 .put("fullExport", "Use JSON 저장; records are streamed from SQLite to the destination file.")
                 .toString(2)
             showPreview(lastJson)
-            unifiedButton.text = "통합 동기화 시작"
+            unifiedButton.text = "통합 자동수집 시작"
             pendingUnifiedExportSessionId = sessionId
             cloudOffload.sendDiagnostic(
                 "unified", VERSION,
@@ -7697,6 +7755,7 @@ class MainActivity : Activity() {
             val sessionId = unifiedSessionId
             if (sessionId != null) {
                 localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.ADIGA.wireName, runId) }
+                materializeOfficialScoreAndOutcomeEvidence(sessionId, "adiga-finish:$effectiveReason")
                 localStore.updateUnifiedSession(sessionId, "jinhak", "running", "adiga:$effectiveReason")
             }
             handler.postDelayed({ transitionUnifiedToJinhak(effectiveReason) }, 350L)

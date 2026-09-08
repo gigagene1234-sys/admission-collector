@@ -7,7 +7,7 @@ import java.math.BigDecimal
 
 /** Read-only presentation model over persisted canonical, sync, and score-decision evidence. */
 object HubDashboardModel {
-    const val SCHEMA_VERSION = 4
+    const val SCHEMA_VERSION = 5
     const val SLOT_COUNT = 6
 
     fun build(
@@ -46,6 +46,9 @@ object HubDashboardModel {
         val provisional = auditSlots.optInt("provisional", cards.countQuality("provisional"))
         val providerOnly = auditSlots.optInt("providerOnly", cards.countQuality("provider-only"))
         val fullCoverage = auditSlots.optInt("fullCoreCoverage", cards.countFullCoverage())
+        val officialCurrentComponentsVerified = (0 until cards.length()).count { index ->
+            cards.optJSONObject(index)?.optJSONObject("officialEvidence")?.optBoolean("currentComponentsVerified", false) == true
+        }
         val scoreSummary = scoreDecisionSummary.optJSONObject("summary") ?: JSONObject()
 
         return JSONObject()
@@ -61,6 +64,8 @@ object HubDashboardModel {
                 .put("provisional", provisional)
                 .put("providerOnly", providerOnly)
                 .put("fullCoreCoverage", fullCoverage)
+                .put("officialCurrentComponentsVerified", officialCurrentComponentsVerified)
+                .put("directOfficialApplicationBindings", accepted)
                 .put("verifiedConversions", scoreSummary.optInt("verifiedConversions", 0))
                 .put("officialOutcomeAvailable", scoreSummary.optInt("officialOutcomeAvailable", 0))
                 .put("comparableDecisions", scoreSummary.optInt("comparableDecisions", 0))
