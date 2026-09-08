@@ -6,10 +6,10 @@ import org.json.JSONObject
 /**
  * Monotonic per-application report coverage ledger.
  *
- * Navigation targets and report coverage are deliberately separate: a report can be reached by
- * an inherited, read-only report-family control without owning a persistent navigation target.
- * Persisting the confirmed lane prevents process death from erasing which report families were
- * already proven for each SAME-APPLICATION identity.
+ * v0.14.2 restores university-result as a required integrated lane. Strategy remains optional
+ * editorial/reference material, but admission-result/university-result data is part of the core
+ * admission dataset and must no longer be dropped simply because the first five report families
+ * were already collected.
  */
 class JinhakMissionCoverageLedger {
     private val lanesByIdentity = linkedMapOf<String, MutableSet<String>>()
@@ -56,7 +56,7 @@ class JinhakMissionCoverageLedger {
         val missingByLane = JSONObject()
         CORE_LANES.forEach { lane -> missingByLane.put(lane, (expected.size - laneCounts.optInt(lane)).coerceAtLeast(0)) }
         return JSONObject()
-            .put("schemaVersion", 1)
+            .put("schemaVersion", 2)
             .put("expectedIdentities", expected.size)
             .put("knownIdentities", lanesByIdentity.size)
             .put("requiredCoreLanes", JSONArray(CORE_LANES))
@@ -65,6 +65,7 @@ class JinhakMissionCoverageLedger {
             .put("incompleteIdentities", (expected.size - complete).coerceAtLeast(0))
             .put("coreComplete", expected.isNotEmpty() && complete == expected.size)
             .put("missingByLane", missingByLane)
+            .put("strategyOptional", true)
             .put("credentialStored", false)
             .put("sessionSecretStored", false)
     }
@@ -75,8 +76,9 @@ class JinhakMissionCoverageLedger {
             "current-prediction",
             "mock-support",
             "actual-admit",
-            "score-analysis"
+            "score-analysis",
+            "university-result"
         )
-        private val ALL_TRACKED_LANES = CORE_LANES + listOf("university-result", "strategy")
+        private val ALL_TRACKED_LANES = CORE_LANES + listOf("strategy")
     }
 }
