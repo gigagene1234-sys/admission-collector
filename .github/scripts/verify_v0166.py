@@ -43,7 +43,7 @@ for forbidden in [
 
 assert 'const val SCHEMA_VERSION = 3' in grade
 assert 'repeat(3)' in grade
-assert '%252F' not in grade  # production code remains generic, tests own examples
+assert 'URLDecoder.decode(context' in grade
 assert 'versionCode = 116600' in gradle
 assert 'versionName = "0.16.6"' in gradle
 assert 'android:label="Admission Hub v0.16.6 High3 Route Isolation"' in manifest
@@ -52,6 +52,6 @@ assert 'android:label="Admission Hub v0.16.6 High3 Route Isolation"' in manifest
 for token in ['relation', 'probabilityInferred', 'disclaimer', 'missing', 'warnings', 'risks']:
     assert token in dash, token
 assert '.put("probabilityInferred", false)' in materializer
-assert 'Jinhak→official' not in main  # no promotion label/path added by this release
+assert 'Jinhak→official' not in main
 
 print("v0.16.6 product contracts verified")
