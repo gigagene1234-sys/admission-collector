@@ -1,0 +1,181 @@
+name: Apply Build Release Admission Hub v0.16.7 Direct High3 Auth
+
+on:
+  push:
+    branches: [codex/v0167-direct-high3-auth-no-ui-mask]
+    paths:
+      - ".github/workflows/apply-build-release-v0167.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0167-direct-high3-auth
+  cancel-in-progress: true
+
+jobs:
+  patch-build-test-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.16.7-Direct-High3-Auth-No-UI-Mask.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/v0167-direct-high3-auth-no-ui-mask
+
+      - name: Apply v0.16.7 product patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch_v0167_driver.py
+          python3 .github/scripts/verify_v0167.py
+          git diff --check
+
+      - name: Commit exact v0.16.7 product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+          if git diff --cached --quiet; then
+            echo "v0.16.7 patch produced no source changes"
+            exit 1
+          fi
+          git commit -m "Admission Hub v0.16.7 direct high3 auth no UI mask"
+          PRODUCT_SHA="$(git rev-parse HEAD)"
+          echo "PRODUCT_SHA=$PRODUCT_SHA" >> "$GITHUB_ENV"
+          git push origin HEAD:codex/v0167-direct-high3-auth-no-ui-mask
+
+      - name: Verify committed source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          git diff --exit-code
+          python3 .github/scripts/verify_v0167.py
+          git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'JinhakHigh3AuthRoute.canonicalLoginUrl(currentBatchTarget)' >/dev/null
+          git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'jinhak-v0167-lower-grade-transport-drop' >/dev/null
+          git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'v0167-submitted-awaiting-server-high3-return' >/dev/null
+          ! git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'installJinhakHigh3DomProductFence' >/dev/null
+          ! git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'pollJinhakLoginRecovery(' >/dev/null
+          ! git show "$PRODUCT_SHA:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'ProviderId.JINHAK -> "https://www.jinhak.com/jh/member/login"' >/dev/null
+
+      - name: Verify v0.16.6 failed-device baseline exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=198f9bd93c113aaf40356af988e507d084c0c857
+          git cat-file -e "$BASE^{commit}"
+          git show "$BASE:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'installJinhakHigh3DomProductFence' >/dev/null
+          git show "$BASE:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'pollJinhakLoginRecovery' >/dev/null
+          echo "v0.16.6 failed-device baseline present"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35 and expose build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test all application and regression contracts
+        run: gradle --no-daemon :app:testDebugUnitTest
+
+      - name: Compile signed product
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK package version label and stable signer
+        run: bash .github/scripts/verify_apk_v0167.sh
+
+      - name: Clean rebuild and retest exact committed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          git diff --exit-code
+          git reset --hard "$PRODUCT_SHA"
+          python3 .github/scripts/verify_v0167.py
+          gradle --no-daemon clean :app:testDebugUnitTest :app:assembleDebug
+          bash .github/scripts/verify_apk_v0167.sh
+          git diff --exit-code
+
+      - name: Package APK and verification report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/$APK_NAME"
+          (cd dist && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          python3 - <<'PY'
+          import glob,json,os,xml.etree.ElementTree as E
+          suites=[E.parse(f).getroot() for f in glob.glob('app/build/test-results/testDebugUnitTest/TEST-*.xml')]
+          counts={k:sum(int(s.get(k,'0')) for s in suites) for k in ['tests','failures','errors','skipped']}
+          assert counts['tests']>=109, counts
+          assert counts['failures']==counts['errors']==counts['skipped']==0, counts
+          report={
+            'productCommit':os.environ['PRODUCT_SHA'],
+            'versionName':'0.16.7','versionCode':116700,'tests':counts,
+            'signerSha256':'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995',
+            'exactCommittedSourceRebuild':True,
+            'failedDeviceBaseline':'v0.16.6-198f9bd93c113aaf40356af988e507d084c0c857',
+            'genericProductLoginUsedAsBootstrap':False,
+            'memberJinhakDirectAuthWithExplicitHigh3Return':True,
+            'lowerGradeTransportDropHasNoVisibilityMutation':True,
+            'lowerGradeDropSchedulesRecoveryNavigation':False,
+            'domLowerGradeUiMaskRemoved':True,
+            'recursiveLoginRecoveryPolling':False,
+            'transitionAuthBoundedWithoutBatch':True,
+            'protectedHigh3OnlyAuthPromotion':True,
+            'credentialsExported':False,
+            'cookiesExported':False,
+            'jinhakPromotedToOfficial':False,
+            'probabilityInferred':False,
+            'deviceAcceptance':'pending-real-galaxy-direct-member-login-protected-core-batch-evidence'
+          }
+          open('dist/verification-v0.16.7.json','w').write(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+          print(json.dumps(report,ensure_ascii=False))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.16.7-direct-high3-auth
+          path: |
+            dist/*
+            app/build/test-results/testDebugUnitTest/*.xml
+
+      - name: Publish verified v0.16.7 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view v0.16.7 >/dev/null 2>&1 && gh release delete v0.16.7 -y --cleanup-tag || true
+          gh release create v0.16.7 "dist/$APK_NAME" "dist/$APK_NAME.sha256" dist/verification-v0.16.7.json \
+            --target "$PRODUCT_SHA" --title "Admission Hub v0.16.7 — Direct High3 Auth / No UI Mask" \
+            --notes-file docs/releases/v0.16.7.md
