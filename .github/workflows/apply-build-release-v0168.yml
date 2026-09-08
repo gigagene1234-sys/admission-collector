@@ -1,0 +1,185 @@
+name: Apply Build Release Admission Hub v0.16.8 Event Driven High3 Auth
+
+on:
+  push:
+    branches:
+      - codex/v0168-event-driven-jinhak-auth
+    paths:
+      - '.github/workflows/apply-build-release-v0168.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-test-release:
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.16.8-Event-Driven-High3-Auth.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/v0168-event-driven-jinhak-auth
+
+      - name: Apply v0.16.8 product patch
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch_v0168.py
+          python3 .github/scripts/verify_v0168.py
+          git diff --check
+
+      - name: Commit exact v0.16.8 product source
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+          if ! git diff --cached --quiet; then
+            git commit -m 'Admission Hub v0.16.8 event-driven Jinhak auth'
+            git push origin HEAD:codex/v0168-event-driven-jinhak-auth
+          fi
+
+      - name: Verify committed source contracts
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_v0168.py
+          git diff --check
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          mkdir -p "$HOME/.android"
+          printf '%s' "$ANDROID_SIGNING_SECRET" | sha256sum | awk '{print $1}' > /tmp/signing-material.sha256
+          SIGN_PASS="$(cat /tmp/signing-material.sha256)"
+          keytool -genkeypair -v \
+            -keystore "$HOME/.android/admission-hub-stable.jks" \
+            -storepass "$SIGN_PASS" \
+            -keypass "$SIGN_PASS" \
+            -alias admissionhub \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname 'CN=Admission Hub, OU=Local First, O=Admission Hub, L=Daejeon, C=KR' >/dev/null 2>&1
+          cat > keystore.properties <<EOF
+          storeFile=$HOME/.android/admission-hub-stable.jks
+          storePassword=$SIGN_PASS
+          keyAlias=admissionhub
+          keyPassword=$SIGN_PASS
+          EOF
+
+      - name: Setup Android
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35 and expose build tools
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' >/dev/null
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test all application and regression contracts
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace testDebugUnitTest
+          python3 - <<'PY'
+          import pathlib, xml.etree.ElementTree as ET
+          files=list(pathlib.Path('app/build/test-results/testDebugUnitTest').glob('TEST-*.xml'))
+          if not files: raise SystemExit('no unit test reports')
+          tests=failures=errors=skipped=0
+          for p in files:
+              r=ET.parse(p).getroot()
+              tests+=int(r.attrib.get('tests',0)); failures+=int(r.attrib.get('failures',0)); errors+=int(r.attrib.get('errors',0)); skipped+=int(r.attrib.get('skipped',0))
+          print({'tests':tests,'failures':failures,'errors':errors,'skipped':skipped})
+          if failures or errors: raise SystemExit('unit tests failed')
+          if tests < 100: raise SystemExit(f'unexpectedly low test count: {tests}')
+          PY
+
+      - name: Compile signed product
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK package and signature
+        run: |
+          set -euo pipefail
+          bash .github/scripts/verify_apk_v0168.sh
+
+      - name: Clean rebuild and retest exact committed source
+        run: |
+          set -euo pipefail
+          git status --short
+          git diff --exit-code
+          git diff --cached --exit-code
+          gradle --no-daemon clean testDebugUnitTest assembleDebug
+          python3 .github/scripts/verify_v0168.py
+          bash .github/scripts/verify_apk_v0168.sh
+
+      - name: Package APK and verification report
+        run: |
+          set -euo pipefail
+          mkdir -p release-v0168
+          cp app/build/outputs/apk/debug/app-debug.apk "release-v0168/$APK_NAME"
+          sha256sum "release-v0168/$APK_NAME" | tee "release-v0168/$APK_NAME.sha256"
+          SIGNER="$(apksigner verify --print-certs app/build/outputs/apk/debug/app-debug.apk | awk -F': ' '/Signer #1 certificate SHA-256 digest:/ {print tolower($2); exit}')"
+          TESTS="$(python3 - <<'PY'
+          import pathlib, xml.etree.ElementTree as ET
+          n=0
+          for p in pathlib.Path('app/build/test-results/testDebugUnitTest').glob('TEST-*.xml'):
+              n += int(ET.parse(p).getroot().attrib.get('tests',0))
+          print(n)
+          PY
+          )"
+          cat > release-v0168/verification-v0.16.8.json <<EOF
+          {
+            "versionName": "0.16.8",
+            "versionCode": 116800,
+            "sourceCommit": "$(git rev-parse HEAD)",
+            "tests": $TESTS,
+            "signerSha256": "$SIGNER",
+            "exactCommittedSourceRebuild": true,
+            "jinhakAuthModel": "event-driven-high3-returnurl",
+            "genericProductLoginBootstrap": false,
+            "domGradeUiMask": false,
+            "recursiveLoginPolling": false,
+            "lowerGradeTransportDrop": true,
+            "lowerGradeDropNavigates": false,
+            "memberLoginPassiveWait": true,
+            "collectorCredentialDialogForJinhak": false,
+            "credentialsExported": false,
+            "cookiesExported": false,
+            "jinhakPromotedToOfficial": false,
+            "probabilityInferred": false,
+            "deviceAcceptance": "pending-real-galaxy-high3-auth-batch-and-evidence"
+          }
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.16.8-event-driven-high3-auth
+          path: release-v0168/*
+
+      - name: Publish verified v0.16.8 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git tag -f v0.16.8 "$(git rev-parse HEAD)"
+          git push -f origin v0.16.8
+          gh release delete v0.16.8 --yes --cleanup-tag 2>/dev/null || true
+          git tag -f v0.16.8 "$(git rev-parse HEAD)"
+          git push -f origin v0.16.8
+          gh release create v0.16.8 release-v0168/* \
+            --title 'Admission Hub v0.16.8 — Event-Driven High3 Auth' \
+            --notes-file docs/releases/v0.16.8.md
