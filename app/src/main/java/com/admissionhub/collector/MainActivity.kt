@@ -53,6 +53,7 @@ import com.admissionhub.collector.jinhak.JinhakMissionCellSupervisor
 import com.admissionhub.collector.jinhak.JinhakAuthDomainPolicy
 import com.admissionhub.collector.jinhak.JinhakGradeRouteFence
 import com.admissionhub.collector.jinhak.JinhakHigh3AuthRoute
+import com.admissionhub.collector.jinhak.JinhakAuthEventState
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -113,7 +114,7 @@ class MainActivity : Activity() {
                     jinhakSessionKeepAliveTicks += 1
                     if (!hasWindowFocus()) jinhakSessionKeepAliveBackgroundTicks += 1
                 }
-                attemptSessionExtension()
+                if (!(provider == ProviderId.JINHAK && jinhakV0167AuthWaitActive)) attemptSessionExtension()
                 if (provider == ProviderId.JINHAK) {
                     val current = webView.url.orEmpty()
                     when {
@@ -358,6 +359,11 @@ class MainActivity : Activity() {
     private var jinhakV0167AuthExitsToHigh3 = 0
     private var jinhakV0167AuthWaitActive = false
     private var jinhakV0167AuthReturnTarget = ""
+    private var jinhakV0168AuthEventsObserved = 0
+    private var jinhakV0168PassiveMemberWaits = 0
+    private var jinhakV0168High3Verifications = 0
+    private var jinhakV0168OtherRouteObservations = 0
+    private var jinhakV0168LegacyNavigationSuppressions = 0
     private var jinhakPostMissionClosureFences = 0
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
@@ -544,8 +550,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.16.7"
-        private const val BUILD_CODE = 116700
+        private const val VERSION = "0.16.8"
+        private const val BUILD_CODE = 116800
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -2829,6 +2835,18 @@ class MainActivity : Activity() {
     }
 
     private fun showCredentialDialog(which: ProviderId, continueAfterSave: Boolean) {
+        if (which == ProviderId.JINHAK) {
+            startupCredentialPromptedProvider = ProviderId.JINHAK
+            jinhakV0168LegacyNavigationSuppressions += 1
+            val current = webView.url.orEmpty()
+            if (JinhakHigh3AuthRoute.isMemberLoginSurface(current)) {
+                markJinhakDirectAuthWait("collector-credential-dialog-suppressed", current)
+            } else {
+                openJinhakDirectHigh3Auth("collector-credential-dialog-suppressed", currentBatchTarget)
+            }
+            status.text = "진학사는 Collector 계정 입력창을 사용하지 않습니다. 사이트 자체 로그인/Samsung Pass/자동완성을 사용하세요."
+            return
+        }
         if (credentialAutoLoginInFlight) return
         val existing = credentialVault.load(which.wireName)
         val container = LinearLayout(this).apply {
@@ -3175,19 +3193,24 @@ class MainActivity : Activity() {
 
     private fun attemptSavedCredentialLoginV0912Baseline(reason: String) {
         if (provider != ProviderId.JINHAK) return
-        val now = System.currentTimeMillis()
-        // Match the proven v0.9.12 passive-login timing instead of the newer product-preflight loop.
-        if (credentialAutoLoginInFlight && now - credentialAutoLoginLastAttemptAtMs < 6_000L) return
-        if (now - credentialAutoLoginLastAttemptAtMs < 900L) return
+        val current = webView.url.orEmpty()
+        if (!JinhakHigh3AuthRoute.isMemberLoginSurface(current)) {
+            if (JinhakHigh3AuthRoute.isGenericProductLogin(current)) {
+                openJinhakDirectHigh3Auth("saved-credential-generic-rewrite:$reason", currentBatchTarget)
+            }
+            return
+        }
         val credential = credentialVault.load(ProviderId.JINHAK.wireName)
         if (credential == null) {
             credentialAutoLoginSuppressedNoCredential += 1
             jinhakV0165ManualLoginWaits += 1
-            sessionState.text = "○ 진학사 고3 전용 회원 로그인 필요"
-            status.text = "Collector에 저장된 로그인 정보가 없습니다. 진학사 로그인 화면 자체에서 기기 자동완성/Samsung Pass 등을 사용해 로그인하세요. 입력값은 Collector 진단/JSON/GitHub로 내보내지 않습니다."
-            persistJinhakAuthDiagnostics("v0165-no-local-credential-manual-login")
+            jinhakV0168PassiveMemberWaits += 1
+            markJinhakDirectAuthWait("no-local-credential:$reason", current)
+            status.text = "진학사 회원 로그인 화면입니다. 기기 자동완성/Samsung Pass로 로그인하세요. Collector는 경로를 재시도하지 않습니다."
             return
         }
+        val now = System.currentTimeMillis()
+        if (credentialAutoLoginInFlight || now - credentialAutoLoginLastAttemptAtMs < 1500L) return
         credentialAutoLoginInFlight = true
         credentialAutoLoginLastAttemptAtMs = now
         credentialAutoLoginAttempts += 1
@@ -3199,33 +3222,16 @@ class MainActivity : Activity() {
             (function(){
               try{
                 function visible(el){if(!el)return false;var s=getComputedStyle(el);if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0')return false;var r=el.getBoundingClientRect();return r.width>0&&r.height>0;}
-                function roots(doc){var out=[doc];try{var all=doc.querySelectorAll('*');for(var i=0;i<all.length;i++)if(all[i].shadowRoot)out.push(all[i].shadowRoot);}catch(e){}return out;}
-                function setValue(el,v){
-                  try{var proto=Object.getPrototypeOf(el);var desc=Object.getOwnPropertyDescriptor(proto,'value')||Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');if(desc&&desc.set)desc.set.call(el,v);else el.value=v;}catch(e){el.value=v;}
-                  try{el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}catch(e){}
-                }
-                var docs=[document];try{var fs=document.querySelectorAll('iframe,frame');for(var f=0;f<fs.length;f++)try{if(fs[f].contentDocument)docs.push(fs[f].contentDocument);}catch(e){}}catch(e){}
-                for(var d=0;d<docs.length;d++){
-                  var rs=roots(docs[d]);
-                  for(var r=0;r<rs.length;r++){
-                    var root=rs[r],passes=[];try{passes=Array.from(root.querySelectorAll('input[type=password]')).filter(visible);}catch(e){}
-                    for(var p=0;p<passes.length;p++){
-                      var pass=passes[p],form=pass.form||pass.closest('form'),base=form||root,candidates=[];
-                      try{candidates=Array.from(base.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);}catch(e){}
-                      if(!candidates.length)continue;
-                      function score(el){var meta=((el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')+' '+(el.autocomplete||'')).toLowerCase();var n=0;if(/아이디|user|login|member|email|account/.test(meta))n+=60;if((el.autocomplete||'').toLowerCase()==='username')n+=100;if(/search|검색/.test(meta))n-=200;if(form&&el.form===form)n+=100;return n;}
-                      candidates.sort(function(a,b){return score(b)-score(a);});
-                      var user=candidates[0];if(!user)continue;
-                      setValue(user,$userJson);setValue(pass,$passJson);
-                      var controls=[];try{controls=Array.from(base.querySelectorAll('button,input[type=submit],input[type=button],[role=button]')).filter(visible);}catch(e){}
-                      function label(el){return ((el.innerText||el.value||el.textContent||el.getAttribute('aria-label')||'')+'').replace(/\s+/g,' ').trim();}
-                      var submit=controls.find(function(el){return /^(로그인|로그인하기|log\s*in|sign\s*in)$/i.test(label(el));})||controls.find(function(el){return (el.type||'').toLowerCase()==='submit';})||null;
-                      if(submit){submit.click();return JSON.stringify({submitted:true,method:'button'});}
-                      if(form){if(form.requestSubmit)form.requestSubmit();else form.submit();return JSON.stringify({submitted:true,method:'form'});}
-                    }
-                  }
-                }
-                return JSON.stringify({submitted:false,reason:'visible-login-fields-missing'});
+                function setValue(el,v){try{var d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');if(d&&d.set)d.set.call(el,v);else el.value=v;}catch(e){el.value=v;}try{el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}catch(e){}}
+                var pass=Array.from(document.querySelectorAll('input[type=password]')).find(visible); if(!pass)return JSON.stringify({submitted:false,reason:'password-missing'});
+                var form=pass.form||pass.closest('form')||document;
+                var users=Array.from(form.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);
+                if(!users.length)return JSON.stringify({submitted:false,reason:'username-missing'});
+                var user=users[0]; setValue(user,$userJson); setValue(pass,$passJson);
+                var submit=Array.from(form.querySelectorAll('button,input[type=submit],[role=button]')).filter(visible).find(function(el){var t=((el.innerText||el.value||el.textContent||'')+'').replace(/\s+/g,' ').trim();return /^(로그인|로그인하기|log\s*in|sign\s*in)$/i.test(t);});
+                if(submit){submit.click();return JSON.stringify({submitted:true,method:'button'});}
+                if(pass.form){if(pass.form.requestSubmit)pass.form.requestSubmit();else pass.form.submit();return JSON.stringify({submitted:true,method:'form'});}
+                return JSON.stringify({submitted:false,reason:'submit-missing'});
               }catch(e){return JSON.stringify({submitted:false,reason:'script-error'});}
             })();
         """.trimIndent()
@@ -3237,18 +3243,16 @@ class MainActivity : Activity() {
                 credentialAutoLoginSubmissions += 1
                 jinhakV0912PassiveLoginSubmissions += 1
                 credentialAwaitingLoginExitProvider = ProviderId.JINHAK
-                credentialAutoLoginLastResult = "v0167-submitted-awaiting-server-high3-return"
-                jinhakV0167AuthWaitActive = true
-                jinhakCoreBootstrapState = "v0167-login-submitted-awaiting-returnurl"
-                jinhakLastAuthEvidence = "login-submit-awaiting-server-returnurl"
-                status.text = "진학사 로그인 제출 완료 · Collector는 이동을 강제하지 않고 서버의 high3 ReturnURL 복귀를 기다립니다."
-                persistJinhakAuthDiagnostics("v0167-credential-submit-awaiting-returnurl")
+                credentialAutoLoginLastResult = "v0168-submitted-${result.optString("method", "unknown")}"
+                jinhakV0168PassiveMemberWaits += 1
+                markJinhakDirectAuthWait("saved-credential-submitted:$reason", webView.url.orEmpty())
+                status.text = "진학사 로그인 제출 완료 · 추가 탐색 없이 서버의 high3 ReturnURL 복귀를 기다립니다."
             } else {
-                credentialAutoLoginLastResult = "v0167-not-submitted-${result.optString("reason", "unknown")}"
-                credentialAutoLoginLastAtMs = System.currentTimeMillis()
-                status.text = "자동 입력이 제출되지 않았습니다. 현재 진학사 회원 로그인 화면에서 직접 로그인하면 됩니다. 반복 이동이나 학년 UI 조작은 수행하지 않습니다."
-                persistJinhakAuthDiagnostics("v0167-credential-not-submitted")
+                credentialAutoLoginFailures += 1
+                credentialAutoLoginLastResult = "v0168-not-submitted-${result.optString("reason", "unknown")}"
+                status.text = "자동입력을 완료하지 못했습니다. 현재 사이트 로그인 화면에서 직접 로그인하세요. Collector는 재탐색하지 않습니다."
             }
+            persistJinhakAuthDiagnostics("credential-auto-login-v0168-event-driven")
         }
     }
 
@@ -3410,138 +3414,70 @@ class MainActivity : Activity() {
 
     private fun startJinhakRealAuthProbe(autoContinue: Boolean, trigger: String) {
         if (jinhakRealAuthProbeActive) return
-        val restoredResumeGate = jinhakRealAuthResumeGatePending && unifiedRunning &&
-            unifiedPhase == "jinhak" && !batchRunning && !startupLoginPreflightActive
-        if ((!restoredResumeGate && unifiedRunning) || batchRunning || startupLoginPreflightActive) {
-            Toast.makeText(this, "진행 중인 수집/로그인 준비가 있어 실제 진학사 로그인 진단을 시작할 수 없습니다.", Toast.LENGTH_LONG).show()
+        if (batchRunning) {
+            Toast.makeText(this, "진행 중인 진학사 수집이 있어 인증 진단을 시작할 수 없습니다.", Toast.LENGTH_LONG).show()
             return
         }
-        val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
-        if (coreProbe.isBlank()) {
-            status.text = "진학사 보호 경로가 정의되지 않아 실제 로그인 진단을 시작할 수 없습니다."
+        val core = JinhakGradeRouteFence.protectedHigh3Core()
+        if (core.isBlank()) {
+            status.text = "진학사 high3 보호경로가 정의되지 않았습니다."
             return
         }
         provider = ProviderId.JINHAK
         jinhakRealAuthProbeActive = true
         jinhakRealAuthProbeAutoContinue = autoContinue
-        val generation = ++jinhakRealAuthProbeGeneration
+        ++jinhakRealAuthProbeGeneration
         jinhakRealAuthProbeStartedAtMs = System.currentTimeMillis()
         jinhakRealAuthProbeStablePasses = 0
         jinhakRealAuthProbeCoreLoads = 1
         jinhakRealAuthProbeLoginRoutes = 0
         jinhakRealAuthProbeUnexpectedRoutes = 0
         jinhakRealAuthProbeCycleDetections = 0
-        jinhakRealAuthProbeResult = "running"
+        jinhakRealAuthProbeResult = "running-event-driven"
         jinhakRealAuthProbeRouteCycleDetected = false
-        jinhakRealAuthProbeLastSafePath = ""
         jinhakRealAuthProbeRouteHistory.clear()
         jinhakRealAuthProbeRouteCounts.clear()
         jinhakRealAuthProbeRouteEvents = JSONArray()
-        jinhakRealAuthProbeBaselineSurfaceDetections = credentialLoginSurfaceDetections
-        jinhakRealAuthProbeBaselineAutoAttempts = credentialAutoLoginAttempts
-        jinhakRealAuthProbeBaselineAutoSubmissions = credentialAutoLoginSubmissions
-        jinhakRealAuthProbeBaselineAutoSuccesses = credentialAutoLoginSuccesses
-        jinhakRealAuthProbeBaselineAutoFailures = credentialAutoLoginFailures
-        startupCredentialPromptedProvider = null
-        credentialLoginSurfaceKey = ""
-        credentialLoginSurfaceAttempts = 0
-        credentialAwaitingLoginExitProvider = null
         jinhakAuthVerifiedForBatch = false
-        jinhakCoreBootstrapState = "real-site-auth-probe"
-        jinhakLastAuthEvidence = "real-site-probe-pending"
-        runCatching { sessionVault.restore(ProviderId.JINHAK.wireName) }
-        CookieManager.getInstance().flush()
-        realJinhakAuthProbeButton.text = "진학사 로그인 진단 중지"
-        unifiedButton.isEnabled = false
-        sessionState.text = "△ 실제 진학사 보호 경로 인증 확인 중"
-        status.text = "실제 www.jinhak.com 수시저장소를 열어 로그인→고3 영역 경로를 진단합니다. 로그인 URL을 강제로 열지 않습니다."
-        recordRuntimeEvent("jinhak-real-auth-probe-start", JSONObject()
-            .put("trigger", trigger.take(60))
-            .put("actualSite", true)
-            .put("coreSafePath", runtimeSafePath(coreProbe))
-            .put("credentialStored", credentialVault.has(ProviderId.JINHAK.wireName))
-            .put("credentialExported", false)
-            .put("sessionSecretExported", false))
-        webView.loadUrl(coreProbe)
-        handler.postDelayed({
-            if (jinhakRealAuthProbeActive && generation == jinhakRealAuthProbeGeneration) {
-                finishJinhakRealAuthProbe("auth-probe-timeout", success = false)
-            }
-        }, JINHAK_REAL_AUTH_PROBE_TIMEOUT_MS)
+        jinhakCoreBootstrapState = "v0168-real-auth-event-probe"
+        jinhakLastAuthEvidence = "real-auth-event-pending"
+        sessionState.text = "△ 진학사 high3 인증 이벤트 확인"
+        status.text = "high3 보호경로를 한 번 확인합니다. 로그인으로 이동하면 서버 ReturnURL 복귀를 수동으로 기다립니다."
+        recordRuntimeEvent("jinhak-v0168-real-auth-start", JSONObject().put("trigger", trigger.take(80)).put("polling", false).put("uiMaskUsed", false))
+        webView.loadUrl(core)
     }
 
-    private fun scheduleJinhakRealAuthProbePoll(generation: Int, delayMs: Long = 1_500L) {
-        handler.postDelayed({
-            if (!jinhakRealAuthProbeActive || generation != jinhakRealAuthProbeGeneration || provider != ProviderId.JINHAK) return@postDelayed
-            handleJinhakRealAuthProbePageFinished(webView.url.orEmpty())
-        }, delayMs)
+    private fun scheduleJinhakRealAuthProbePoll(generation: Int, delayMs: Long = 0L) {
+        if (jinhakRealAuthProbeActive && generation == jinhakRealAuthProbeGeneration) {
+            jinhakV0168LegacyNavigationSuppressions += 1
+            persistJinhakAuthDiagnostics("v0168-real-auth-poll-suppressed")
+        }
     }
 
     private fun handleJinhakRealAuthProbePageFinished(url: String) {
         if (!jinhakRealAuthProbeActive || provider != ProviderId.JINHAK) return
-        val generation = jinhakRealAuthProbeGeneration
-        if (System.currentTimeMillis() - jinhakRealAuthProbeStartedAtMs >= JINHAK_REAL_AUTH_PROBE_TIMEOUT_MS) {
-            finishJinhakRealAuthProbe("auth-probe-timeout", success = false)
-            return
-        }
-        val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
-        val coreCanonical = canonicalizeBatchUrl(coreProbe)
-        val currentCanonical = canonicalizeBatchUrl(url)
-
-        probeLoginSurface(ProviderId.JINHAK) { probe ->
-            if (!jinhakRealAuthProbeActive || generation != jinhakRealAuthProbeGeneration) return@probeLoginSurface
-            val currentUrl = webView.url.orEmpty()
-            val loginRoute = isProviderLoginUrl(ProviderId.JINHAK, currentUrl)
-            if (loginRoute || probe.optBoolean("detected", false)) {
-                jinhakRealAuthProbeStablePasses = 0
-                sessionState.text = "○ 실제 진학사 통합회원 로그인 단계"
-                if (credentialVault.has(ProviderId.JINHAK.wireName)) {
-                    status.text = "실제 진학사 로그인 폼을 기다리며, 렌더링된 경우에만 기기 저장 계정으로 로그인합니다."
-                    if (probe.optBoolean("detected", false)) attemptSavedCredentialLogin(ProviderId.JINHAK, "real-auth-probe")
-                    else scheduleLoginSurfaceDetection(ProviderId.JINHAK, "real-auth-probe-login-route")
-                } else if (startupCredentialPromptedProvider != ProviderId.JINHAK) {
-                    startupCredentialPromptedProvider = ProviderId.JINHAK
-                    status.text = "실제 진학사 로그인이 필요합니다. 이 기기에만 암호화 저장할 계정정보를 한 번 입력해주세요."
-                    showCredentialDialog(ProviderId.JINHAK, continueAfterSave = true)
+        jinhakV0168AuthEventsObserved += 1
+        noteJinhakRealAuthProbeRoute(url, "v0168-page-finished")
+        when (JinhakAuthEventState.action(url)) {
+            JinhakAuthEventState.Action.DROP_REQUEST -> hardBlockJinhakLowerGradeNavigation("real-auth-event", url)
+            JinhakAuthEventState.Action.OPEN_CANONICAL_HIGH3_AUTH_ONCE -> openJinhakDirectHigh3Auth("real-auth-generic-rewrite", currentBatchTarget)
+            JinhakAuthEventState.Action.WAIT_FOR_SERVER_RETURN -> {
+                jinhakV0168PassiveMemberWaits += 1
+                markJinhakDirectAuthWait("real-auth-member-wait", url)
+                status.text = "회원 로그인 완료 후 서버가 high3 ReturnURL로 복귀할 때까지 대기합니다. 인증 polling은 실행하지 않습니다."
+            }
+            JinhakAuthEventState.Action.VERIFY_HIGH3_SESSION -> {
+                jinhakV0168High3Verifications += 1
+                checkSessionState { needsLogin, authenticated ->
+                    if (!jinhakRealAuthProbeActive || provider != ProviderId.JINHAK || webView.url.orEmpty() != url) return@checkSessionState
+                    if (authenticated && !needsLogin) finishJinhakRealAuthProbe("protected-core-stable-v0168", success = true)
+                    else openJinhakDirectHigh3Auth("real-auth-high3-needs-login", url)
                 }
-                scheduleJinhakRealAuthProbePoll(generation)
-                return@probeLoginSurface
             }
-
-            if (currentCanonical.isNotBlank() && currentCanonical == coreCanonical) {
-                checkSessionState { needsLogin, _ ->
-                    if (!jinhakRealAuthProbeActive || generation != jinhakRealAuthProbeGeneration) return@checkSessionState
-                    if (!needsLogin && !isProviderLoginUrl(ProviderId.JINHAK, webView.url.orEmpty())) {
-                        jinhakRealAuthProbeStablePasses += 1
-                        if (jinhakRealAuthProbeStablePasses >= JINHAK_CORE_AUTH_STABLE_PASSES) {
-                            finishJinhakRealAuthProbe("protected-core-stable", success = true)
-                        } else {
-                            sessionState.text = "△ 실제 수시저장소 접근 확인 · 안정성 재검증 중"
-                            scheduleJinhakRealAuthProbePoll(generation, 650L)
-                        }
-                    } else {
-                        jinhakRealAuthProbeStablePasses = 0
-                        scheduleJinhakRealAuthProbePoll(generation)
-                    }
-                }
-                return@probeLoginSurface
-            }
-
-            // Real Jinhak can land on a high3/high12/general page after login. The auth
-            // probe is allowed to return to the protected core only a bounded number of
-            // times; route cycling itself is detected separately by page-started history.
-            jinhakRealAuthProbeStablePasses = 0
-            jinhakRealAuthProbeUnexpectedRoutes += 1
-            if (jinhakRealAuthProbeUnexpectedRoutes >= MAX_JINHAK_REAL_AUTH_UNEXPECTED_ROUTES) {
-                finishJinhakRealAuthProbe("unexpected-auth-route-loop", success = false)
-                return@probeLoginSurface
-            }
-            if (coreProbe.isNotBlank()) {
-                jinhakRealAuthProbeCoreLoads += 1
-                status.text = "진학사 로그인 후 다른 영역으로 이동했습니다. 실제 수시저장소 보호 경로로 제한 복귀해 인증 여부를 확인합니다."
-                handler.postDelayed({
-                    if (jinhakRealAuthProbeActive && generation == jinhakRealAuthProbeGeneration) webView.loadUrl(coreProbe)
-                }, 500L)
+            JinhakAuthEventState.Action.OBSERVE_WITHOUT_NAVIGATION -> {
+                jinhakV0168OtherRouteObservations += 1
+                status.text = "진학사 인증 중간 페이지를 관측했습니다. 강제 이동 없이 다음 사이트 navigation event를 기다립니다."
+                persistJinhakAuthDiagnostics("v0168-real-auth-observe-other")
             }
         }
     }
@@ -3772,7 +3708,12 @@ class MainActivity : Activity() {
             .put("provider", which.wireName)
             .put("restoredLease", lease?.restored == true)
             .put("generation", generation))
-        webView.loadUrl(which.homeUrl)
+        if (which == ProviderId.JINHAK) {
+            val core = JinhakGradeRouteFence.protectedHigh3Core()
+            if (core.isNotBlank()) webView.loadUrl(core) else openJinhakDirectHigh3Auth("startup-no-core", null)
+        } else {
+            webView.loadUrl(which.homeUrl)
+        }
     }
 
     private fun handleStartupLoginPreflightPageFinished(url: String) {
@@ -3787,6 +3728,32 @@ class MainActivity : Activity() {
     }
 
     private fun evaluateStartupLoginState(expectedProvider: ProviderId, generation: Int) {
+        if (expectedProvider != ProviderId.JINHAK) {
+            evaluateStartupLoginStateLegacyAdiga(expectedProvider, generation)
+            return
+        }
+        if (!startupLoginPreflightActive || provider != ProviderId.JINHAK || generation != startupLoginPollGeneration) return
+        val current = webView.url.orEmpty()
+        jinhakV0168AuthEventsObserved += 1
+        when (JinhakAuthEventState.action(current)) {
+            JinhakAuthEventState.Action.DROP_REQUEST -> hardBlockJinhakLowerGradeNavigation("startup-event", current)
+            JinhakAuthEventState.Action.OPEN_CANONICAL_HIGH3_AUTH_ONCE -> openJinhakDirectHigh3Auth("startup-generic-rewrite", currentBatchTarget)
+            JinhakAuthEventState.Action.WAIT_FOR_SERVER_RETURN -> {
+                jinhakV0168PassiveMemberWaits += 1
+                markJinhakDirectAuthWait("startup-member-wait", current)
+            }
+            JinhakAuthEventState.Action.VERIFY_HIGH3_SESSION -> {
+                jinhakV0168High3Verifications += 1
+                verifyRecoveredJinhakHigh3AndResume(current)
+            }
+            JinhakAuthEventState.Action.OBSERVE_WITHOUT_NAVIGATION -> {
+                jinhakV0168OtherRouteObservations += 1
+                persistJinhakAuthDiagnostics("v0168-startup-observe-other")
+            }
+        }
+    }
+
+    private fun evaluateStartupLoginStateLegacyAdiga(expectedProvider: ProviderId, generation: Int) {
         if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return
         checkSessionState { needsLogin, authenticated ->
             if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@checkSessionState
@@ -3916,6 +3883,11 @@ class MainActivity : Activity() {
     }
 
     private fun scheduleStartupLoginPoll(expectedProvider: ProviderId, generation: Int) {
+        if (expectedProvider == ProviderId.JINHAK) {
+            jinhakV0168LegacyNavigationSuppressions += 1
+            persistJinhakAuthDiagnostics("v0168-startup-poll-suppressed")
+            return
+        }
         handler.postDelayed({
             if (!startupLoginPreflightActive || provider != expectedProvider || generation != startupLoginPollGeneration) return@postDelayed
             evaluateStartupLoginState(expectedProvider, generation)
@@ -4009,6 +3981,11 @@ class MainActivity : Activity() {
         jinhakV0167AuthExitsToHigh3 = 0
         jinhakV0167AuthWaitActive = false
         jinhakV0167AuthReturnTarget = ""
+        jinhakV0168AuthEventsObserved = 0
+        jinhakV0168PassiveMemberWaits = 0
+        jinhakV0168High3Verifications = 0
+        jinhakV0168OtherRouteObservations = 0
+        jinhakV0168LegacyNavigationSuppressions = 0
         // Restore both domain leases at the same bootstrap point. WebView CookieManager is
         // domain-scoped, so restoring Jinhak readiness does not require navigating away from Adiga.
         // A restored lease is NOT treated as proof of server authentication; the Jinhak transition
@@ -4544,7 +4521,23 @@ class MainActivity : Activity() {
     private fun handleJinhakTransitionAuthGate(url: String) {
         if (!unifiedRunning || unifiedPhase != "jinhak" || provider != ProviderId.JINHAK || !jinhakTransitionAuthGateActive || batchRunning) return
         runtimeLastSafePath = runtimeSafePath(url)
-        scheduleJinhakLoginRecovery("transition-auth-gate")
+        jinhakV0168AuthEventsObserved += 1
+        when (JinhakAuthEventState.action(url)) {
+            JinhakAuthEventState.Action.DROP_REQUEST -> hardBlockJinhakLowerGradeNavigation("transition-event", url)
+            JinhakAuthEventState.Action.OPEN_CANONICAL_HIGH3_AUTH_ONCE -> openJinhakDirectHigh3Auth("transition-generic-rewrite", currentBatchTarget)
+            JinhakAuthEventState.Action.WAIT_FOR_SERVER_RETURN -> {
+                jinhakV0168PassiveMemberWaits += 1
+                markJinhakDirectAuthWait("transition-member-wait", url)
+            }
+            JinhakAuthEventState.Action.VERIFY_HIGH3_SESSION -> {
+                jinhakV0168High3Verifications += 1
+                verifyRecoveredJinhakHigh3AndResume(url)
+            }
+            JinhakAuthEventState.Action.OBSERVE_WITHOUT_NAVIGATION -> {
+                jinhakV0168OtherRouteObservations += 1
+                persistJinhakAuthDiagnostics("v0168-transition-observe-other")
+            }
+        }
     }
 
     private fun scheduleUnifiedJinhakAutoCapture(url: String) {
@@ -6140,83 +6133,36 @@ class MainActivity : Activity() {
     }
 
     private fun resumeAfterLogin() {
-        if (provider == ProviderId.JINHAK && isProviderLoginUrl(ProviderId.JINHAK, webView.url.orEmpty())) {
-            val expected = webView.url.orEmpty()
+        if (provider != ProviderId.JINHAK) {
             checkSessionState { needsLogin, authenticated ->
-                if (provider != ProviderId.JINHAK || webView.url.orEmpty() != expected) return@checkSessionState
-                if (authenticated && !needsLogin) {
-                    val core = JinhakGradeRouteFence.protectedHigh3Core()
-                    if (core.isNotBlank()) {
-                        jinhakV0165ManualLoginVerifiedHandoffs += 1
-                        webView.visibility = View.INVISIBLE
-                        status.text = "진학사 세션 확인 · 고3·N수 보호경로에서 최종 검증합니다."
-                        webView.loadUrl(core)
-                    }
-                } else {
-                    webView.visibility = View.VISIBLE
-                    sessionState.text = "○ 진학사 사이트 로그인 미완료"
-                    status.text = "아직 진학사 로그인 화면입니다. 사이트의 로그인 절차를 먼저 완료한 뒤 다시 계속을 누르세요."
+                if (authenticated && !needsLogin && batchRunning && batchPausedForLogin) {
+                    batchPausedForLogin = false
+                    loadNextBatchPage()
                 }
-                persistJinhakAuthDiagnostics("v0165-manual-login-resume-check")
             }
             return
         }
-        if (provider == ProviderId.JINHAK && jinhakLowerGradeManualGateActive) {
-            val high3Core = JinhakGradeRouteFence.protectedHigh3Core()
-            if (high3Core.isNotBlank()) {
-                jinhakLowerGradeManualGateActive = false
-                jinhakLowerGradeLoginFenceLatched = false
-                jinhakLowerGradeRecoveryInFlight = false
-                // Allow another bounded pair only after an explicit user retry. This prevents an
-                // unattended infinite loop while still making the existing Continue button useful.
-                jinhakLowerGradeHigh3RecoveryAttempts = 0
-                if (batchRunning) batchPausedForLogin = true
-                webView.visibility = View.INVISIBLE
-                runCatching { webView.stopLoading() }
-                sessionState.text = "○ 진학사 고3·N수 인증 재시도 · 수집 target 보존"
-                status.text = "고1·2 화면은 열지 않고 고3·N수 보호경로에서 인증을 다시 확인합니다."
-                handler.postDelayed({
-                    if (provider == ProviderId.JINHAK) webView.loadUrl(high3Core)
-                }, 250L)
-                return
+        val current = webView.url.orEmpty()
+        jinhakV0168AuthEventsObserved += 1
+        when (JinhakAuthEventState.action(current)) {
+            JinhakAuthEventState.Action.DROP_REQUEST -> hardBlockJinhakLowerGradeNavigation("resume-button", current)
+            JinhakAuthEventState.Action.OPEN_CANONICAL_HIGH3_AUTH_ONCE -> {
+                jinhakV0168LegacyNavigationSuppressions += 1
+                openJinhakDirectHigh3Auth("resume-button-generic-login", currentBatchTarget)
             }
-        }
-        if (provider == ProviderId.JINHAK && batchRunning && batchPausedForLogin && jinhakConsentGatePending) {
-            // User must choose consent/decline and confirm inside the provider UI.  This button
-            // only resumes observation; it never clicks or selects either provider choice.
-            jinhakConsentGatePending = false
-            jinhakConsentResumePending = true
-            batchPausedForLogin = false
-            showBatchCover()
-            sessionState.text = "△ 진학사 동의 선택 확인 중"
-            status.text = "사용자 선택 후 진학사 화면을 다시 확인합니다. 선택값은 Collector가 읽거나 변경하지 않습니다."
-            handler.postDelayed({
-                if (batchRunning && !batchPausedForLogin && provider == ProviderId.JINHAK && !batchCollecting) scheduleBatchSnapshot()
-            }, 650L)
-            return
-        }
-        if (!batchRunning || !batchPausedForLogin) {
-            checkSessionState()
-            return
-        }
-        checkSessionState { needsLogin, authenticated ->
-            if (needsLogin || !authenticated) {
-                Toast.makeText(this, "로그인 상태가 아직 확인되지 않습니다.", Toast.LENGTH_SHORT).show()
-                return@checkSessionState
+            JinhakAuthEventState.Action.WAIT_FOR_SERVER_RETURN -> {
+                jinhakV0168PassiveMemberWaits += 1
+                markJinhakDirectAuthWait("resume-button-member-wait", current)
+                status.text = "회원 로그인 화면에서는 이동을 강제하지 않습니다. 사이트 로그인 완료 후 서버의 high3 ReturnURL 복귀를 기다립니다."
             }
-            batchPausedForLogin = false
-            if (provider == ProviderId.JINHAK) {
-                jinhakAuthVerifiedForBatch = true
-                jinhakCoreBootstrapState = "batch-auth-recovered"
+            JinhakAuthEventState.Action.VERIFY_HIGH3_SESSION -> {
+                jinhakV0168High3Verifications += 1
+                verifyRecoveredJinhakHigh3AndResume(current)
             }
-            showBatchCover()
-            sessionState.text = "● 로그인 복구 / 동일 수집 브라우저"
-            val retry = currentBatchTarget
-            if (!retry.isNullOrBlank() && isProviderUrl(retry)) {
-                status.text = "로그인 복구 완료: 중단 지점 재시도"
-                webView.loadUrl(retry)
-            } else {
-                loadNextBatchPage()
+            JinhakAuthEventState.Action.OBSERVE_WITHOUT_NAVIGATION -> {
+                jinhakV0168OtherRouteObservations += 1
+                status.text = "진학사 페이지를 관측 중입니다. Collector는 인증 경로를 강제로 이동하지 않습니다."
+                persistJinhakAuthDiagnostics("v0168-resume-observe-only")
             }
         }
     }
@@ -8265,6 +8211,14 @@ class MainActivity : Activity() {
                     .put("jinhakV0167AuthExitsToHigh3", jinhakV0167AuthExitsToHigh3)
                     .put("jinhakV0167AuthWaitActive", jinhakV0167AuthWaitActive)
                     .put("jinhakV0167AuthReturnTargetSafePath", runtimeSafePath(jinhakV0167AuthReturnTarget))
+                    .put("jinhakV0168AuthEventsObserved", jinhakV0168AuthEventsObserved)
+                    .put("jinhakV0168PassiveMemberWaits", jinhakV0168PassiveMemberWaits)
+                    .put("jinhakV0168High3Verifications", jinhakV0168High3Verifications)
+                    .put("jinhakV0168OtherRouteObservations", jinhakV0168OtherRouteObservations)
+                    .put("jinhakV0168LegacyNavigationSuppressions", jinhakV0168LegacyNavigationSuppressions)
+                    .put("jinhakV0168EventDrivenAuth", true)
+                    .put("jinhakV0168RecursiveAuthPolling", false)
+                    .put("jinhakV0168DomGradeUiMask", false)
                     .put("jinhakV0167GenericProductLoginBootstrap", false)
                     .put("jinhakV0167DomGradeUiMask", false)
                     .put("jinhakV0167RecursiveLoginPolling", false)
