@@ -6,10 +6,8 @@ import org.json.JSONObject
 /**
  * Monotonic per-application report coverage ledger.
  *
- * Navigation targets and report coverage are deliberately separate: a report can be reached by
- * an inherited, read-only report-family control without owning a persistent navigation target.
- * Persisting the confirmed lane prevents process death from erasing which report families were
- * already proven for each SAME-APPLICATION identity.
+ * v0.14.2 restores university-result as a required integrated lane. Strategy remains tracked
+ * but optional because some application cards do not expose a strategy route.
  */
 class JinhakMissionCoverageLedger {
     private val lanesByIdentity = linkedMapOf<String, MutableSet<String>>()
@@ -56,10 +54,11 @@ class JinhakMissionCoverageLedger {
         val missingByLane = JSONObject()
         CORE_LANES.forEach { lane -> missingByLane.put(lane, (expected.size - laneCounts.optInt(lane)).coerceAtLeast(0)) }
         return JSONObject()
-            .put("schemaVersion", 1)
+            .put("schemaVersion", 2)
             .put("expectedIdentities", expected.size)
             .put("knownIdentities", lanesByIdentity.size)
             .put("requiredCoreLanes", JSONArray(CORE_LANES))
+            .put("optionalExtendedLanes", JSONArray(OPTIONAL_EXTENDED_LANES))
             .put("laneCoverage", laneCounts)
             .put("completeIdentities", complete)
             .put("incompleteIdentities", (expected.size - complete).coerceAtLeast(0))
@@ -75,8 +74,10 @@ class JinhakMissionCoverageLedger {
             "current-prediction",
             "mock-support",
             "actual-admit",
-            "score-analysis"
+            "score-analysis",
+            "university-result"
         )
-        private val ALL_TRACKED_LANES = CORE_LANES + listOf("university-result", "strategy")
+        val OPTIONAL_EXTENDED_LANES = listOf("strategy")
+        private val ALL_TRACKED_LANES = CORE_LANES + OPTIONAL_EXTENDED_LANES
     }
 }
