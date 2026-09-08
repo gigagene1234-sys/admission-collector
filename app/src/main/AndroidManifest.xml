@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.14.1 Excel + Adiga Score"
+        android:label="Admission Hub v0.14.2 One-Step + Auto Login"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
