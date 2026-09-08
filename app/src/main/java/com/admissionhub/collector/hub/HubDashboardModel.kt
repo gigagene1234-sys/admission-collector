@@ -155,6 +155,18 @@ object HubDashboardModel {
             val sameYear = verified.filter { it.optInt("academicYear", 0) == latestYear }
             val parts = sameYear.sortedBy { metricOrder(it.optString("metricName")) }.take(4).map { outcomeDisplay(it) }
             out.put("officialOutcomeLabel", "공식 입결: $latestYear · ${parts.joinToString(" · ")}")
+        } else {
+            val availability = (0 until outcomes.length()).mapNotNull { outcomes.optJSONObject(it) }
+                .firstOrNull { it.optBoolean("verified", false) && it.optJSONObject("detail")?.optString("availabilityStatus").orEmpty().isNotBlank() }
+            if (availability != null) {
+                val year = availability.optInt("academicYear", 0)
+                val detail = availability.optJSONObject("detail") ?: JSONObject()
+                out.put("officialOutcomeLabel", when (detail.optString("availabilityStatus")) {
+                    "officially-suppressed" -> "공식 입결: $year · 대학 공식 비공개 · ${detail.optString("availabilityReason", "공개 제한")}" 
+                    "new-program-no-prior-result" -> "공식 입결: $year · 전년도 수치 없음 · ${detail.optString("availabilityReason", "신설 모집단위")}" 
+                    else -> "공식 입결: $year · ${detail.optString("availabilityReason", "수치 공개 없음")}" 
+                })
+            }
         }
         return out
     }

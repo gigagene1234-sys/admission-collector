@@ -176,6 +176,8 @@ object AdigaAutoScoreMaterializer {
                 .put("historicalOutcomeRows", historical.length()))
         }
 
+        val publishedFallback = OfficialPublishedOutcomeFallback.materializeMissing(store, sessionId, selectedCandidates)
+
         return JSONObject()
             .put("schemaVersion", SCHEMA_VERSION)
             .put("selected", selected.size)
@@ -186,6 +188,7 @@ object AdigaAutoScoreMaterializer {
             .put("conversionsHeld", conversionsHeld)
             .put("directHistoricalRowsFound", directHistoricalRowsFound)
             .put("historicalOutcomesStored", historicalOutcomesStored)
+            .put("officialPublishedFallback", publishedFallback)
             .put("fullAdigaRecordsScanned", fullRescan.optInt("recordsScanned"))
             .put("results", results)
             .put("slotsMutated", false)
