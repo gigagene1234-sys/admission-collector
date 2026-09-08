@@ -326,6 +326,9 @@ class MainActivity : Activity() {
     private var jinhakV0912PassiveLoginSubmissions = 0
     private var jinhakV0912ProtectedCoreHandoffs = 0
     private var jinhakV0912ProtectedCoreVerified = 0
+    private var jinhakV0165ManualLoginWaits = 0
+    private var jinhakV0165ManualLoginVerifiedHandoffs = 0
+    private var jinhakV0165ProbeCompletedFromProtectedCore = 0
     private var jinhakPostMissionClosureFences = 0
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
@@ -512,8 +515,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.16.4"
-        private const val BUILD_CODE = 116400
+        private const val VERSION = "0.16.5"
+        private const val BUILD_CODE = 116500
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -673,7 +676,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         val resume = Button(this).apply {
-            text = "로그인/동의 후 계속"
+            text = "사이트 로그인·동의 완료 후 계속"
             setOnClickListener { resumeAfterLogin() }
         }
         val save = Button(this).apply {
@@ -3006,6 +3009,10 @@ class MainActivity : Activity() {
                 sessionState.text = "● 진학사 고3·N수 보호경로 인증 확인 · 수집 재개"
                 when {
                     batchRunning && batchPausedForLogin -> resumeBatchAfterVerifiedJinhakAuth("v0912-protected-core-verified")
+                    jinhakRealAuthProbeActive -> {
+                        jinhakV0165ProbeCompletedFromProtectedCore += 1
+                        finishJinhakRealAuthProbe("protected-core-verified-v0165", success = true)
+                    }
                     unifiedRunning && unifiedPhase == "jinhak" && jinhakTransitionAuthGateActive && !batchRunning -> {
                         jinhakTransitionAuthGateActive = false
                         unifiedPendingJinhakStart = false
@@ -3089,10 +3096,12 @@ class MainActivity : Activity() {
         val credential = credentialVault.load(ProviderId.JINHAK.wireName)
         if (credential == null) {
             credentialAutoLoginSuppressedNoCredential += 1
-            if (startupCredentialPromptedProvider != ProviderId.JINHAK) {
-                startupCredentialPromptedProvider = ProviderId.JINHAK
-                showCredentialDialog(ProviderId.JINHAK, continueAfterSave = true)
-            }
+            jinhakV0165ManualLoginWaits += 1
+            webView.visibility = View.VISIBLE
+            installJinhakHigh3DomProductFence("v0165-no-local-credential")
+            sessionState.text = "○ 진학사 사이트 로그인 필요"
+            status.text = "Collector에 저장된 로그인 정보가 없습니다. 진학사 로그인 화면 자체에서 기기 자동완성/Samsung Pass 등을 사용해 로그인하세요. 입력값은 Collector 진단/JSON/GitHub로 내보내지 않습니다."
+            persistJinhakAuthDiagnostics("v0165-no-local-credential-manual-login")
             return
         }
         credentialAutoLoginInFlight = true
@@ -3956,6 +3965,9 @@ class MainActivity : Activity() {
         jinhakV0912PassiveLoginSubmissions = 0
         jinhakV0912ProtectedCoreHandoffs = 0
         jinhakV0912ProtectedCoreVerified = 0
+        jinhakV0165ManualLoginWaits = 0
+        jinhakV0165ManualLoginVerifiedHandoffs = 0
+        jinhakV0165ProbeCompletedFromProtectedCore = 0
         // Restore both domain leases at the same bootstrap point. WebView CookieManager is
         // domain-scoped, so restoring Jinhak readiness does not require navigating away from Adiga.
         // A restored lease is NOT treated as proof of server authentication; the Jinhak transition
@@ -4397,6 +4409,19 @@ class MainActivity : Activity() {
 
     private fun scheduleJinhakLoginRecovery(reason: String) {
         if (provider != ProviderId.JINHAK) return
+        val v0165Current = webView.url.orEmpty()
+        val v0165HasLocalCredential = credentialVault.load(ProviderId.JINHAK.wireName) != null
+        if (isProviderLoginUrl(ProviderId.JINHAK, v0165Current) &&
+            !v0165HasLocalCredential &&
+            credentialAwaitingLoginExitProvider != ProviderId.JINHAK) {
+            jinhakV0165ManualLoginWaits += 1
+            webView.visibility = View.VISIBLE
+            installJinhakHigh3DomProductFence("v0165-manual-login-stable-surface")
+            sessionState.text = "○ 진학사 사이트 로그인 필요"
+            status.text = "진학사 로그인 화면을 유지합니다. 기기 자동완성/Samsung Pass 등을 사용해 사이트 로그인을 끝낸 뒤 '사이트 로그인·동의 완료 후 계속'을 누르세요."
+            persistJinhakAuthDiagnostics("v0165-manual-login-wait")
+            return
+        }
         if (jinhakLowerGradeLoginFenceLatched && !jinhakAuthCompatibilityWindowActive()) return
         if ((batchRunning || unifiedRunning || jinhakTransitionAuthGateActive || startupLoginPreflightActive) && jinhakReauthCycles >= MAX_JINHAK_REAUTH_CYCLES) {
             jinhakLoginRecoveryFenceTrips += 1
@@ -6241,6 +6266,27 @@ class MainActivity : Activity() {
     }
 
     private fun resumeAfterLogin() {
+        if (provider == ProviderId.JINHAK && isProviderLoginUrl(ProviderId.JINHAK, webView.url.orEmpty())) {
+            val expected = webView.url.orEmpty()
+            checkSessionState { needsLogin, authenticated ->
+                if (provider != ProviderId.JINHAK || webView.url.orEmpty() != expected) return@checkSessionState
+                if (authenticated && !needsLogin) {
+                    val core = JinhakGradeRouteFence.protectedHigh3Core()
+                    if (core.isNotBlank()) {
+                        jinhakV0165ManualLoginVerifiedHandoffs += 1
+                        webView.visibility = View.INVISIBLE
+                        status.text = "진학사 세션 확인 · 고3·N수 보호경로에서 최종 검증합니다."
+                        webView.loadUrl(core)
+                    }
+                } else {
+                    webView.visibility = View.VISIBLE
+                    sessionState.text = "○ 진학사 사이트 로그인 미완료"
+                    status.text = "아직 진학사 로그인 화면입니다. 사이트의 로그인 절차를 먼저 완료한 뒤 다시 계속을 누르세요."
+                }
+                persistJinhakAuthDiagnostics("v0165-manual-login-resume-check")
+            }
+            return
+        }
         if (provider == ProviderId.JINHAK && jinhakLowerGradeManualGateActive) {
             val high3Core = JinhakGradeRouteFence.protectedHigh3Core()
             if (high3Core.isNotBlank()) {
@@ -8330,6 +8376,9 @@ class MainActivity : Activity() {
                     .put("jinhakV0912PassiveLoginSubmissions", jinhakV0912PassiveLoginSubmissions)
                     .put("jinhakV0912ProtectedCoreHandoffs", jinhakV0912ProtectedCoreHandoffs)
                     .put("jinhakV0912ProtectedCoreVerified", jinhakV0912ProtectedCoreVerified)
+                    .put("jinhakV0165ManualLoginWaits", jinhakV0165ManualLoginWaits)
+                    .put("jinhakV0165ManualLoginVerifiedHandoffs", jinhakV0165ManualLoginVerifiedHandoffs)
+                    .put("jinhakV0165ProbeCompletedFromProtectedCore", jinhakV0165ProbeCompletedFromProtectedCore)
                         .put("jinhakPostMissionClosureFences", jinhakPostMissionClosureFences)
                         .put("jinhakLoginRecoveryTimeoutMs", JINHAK_LOGIN_RECOVERY_TIMEOUT_MS)
                         .put("jinhakLoginRecoveryMaxPolls", MAX_JINHAK_LOGIN_RECOVERY_POLLS)
