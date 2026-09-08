@@ -70,7 +70,15 @@ object KoreanTranscriptAutoRecognizer {
             }
 
             if (looksLikeCourseHeader(nonBlank)) {
-                val mapping = XlsxStudentScoreImport.suggestMapping(sheet, row.index)
+                // Structural marker rows immediately above a course header (for example
+                // "3학년 | 1학기") must not be folded into the header mapping. The generic XLSX
+                // mapper intentionally looks upward for merged headers, which can otherwise steal
+                // the 교과/과목 columns as 학년/학기. Prefer labels physically present on this
+                // header row; fall back to the generic mapper only when that direct mapping cannot
+                // identify a subject column.
+                val directMapping = explicitCourseHeaderMapping(row)
+                val suggested = XlsxStudentScoreImport.suggestMapping(sheet, row.index)
+                val mapping = if ((directMapping[XlsxStudentScoreImport.Field.SUBJECT] ?: -1) >= 0) directMapping else suggested
                 if ((mapping[XlsxStudentScoreImport.Field.SUBJECT] ?: -1) >= 0) {
                     activeMapping = mapping
                     activeHeaderRow = row.index
@@ -166,6 +174,31 @@ object KoreanTranscriptAutoRecognizer {
                 .put("xlsxStructuralFillPolicy", "EXPLICIT_YEAR_SEMESTER_SECTION_OR_MERGE_ONLY"),
             score
         )
+    }
+
+    private fun explicitCourseHeaderMapping(row: XlsxStudentScoreImport.Row): Map<XlsxStudentScoreImport.Field, Int> {
+        val result = XlsxStudentScoreImport.Field.values().associateWith { -1 }.toMutableMap()
+        val used = mutableSetOf<Int>()
+        val aliases = mapOf(
+            XlsxStudentScoreImport.Field.GRADE_YEAR to setOf("학년", "gradeyear", "year"),
+            XlsxStudentScoreImport.Field.SEMESTER to setOf("학기", "semester", "term"),
+            XlsxStudentScoreImport.Field.GROUP to setOf("교과", "교과군", "교과영역", "과목군", "group"),
+            XlsxStudentScoreImport.Field.SUBJECT to setOf("과목", "과목명", "교과목", "교과목명", "subject"),
+            XlsxStudentScoreImport.Field.GRADE to setOf("등급", "석차등급", "내신등급", "grade"),
+            XlsxStudentScoreImport.Field.CREDITS to setOf("학점", "이수단위", "단위수", "이수학점", "credits", "credit"),
+            XlsxStudentScoreImport.Field.ACHIEVEMENT to setOf("성취도", "성취수준", "achievement")
+        )
+        for (field in XlsxStudentScoreImport.Field.values()) {
+            val normalizedAliases = aliases[field].orEmpty().map(::normalize).toSet()
+            val match = row.cells.entries
+                .sortedBy { it.key }
+                .firstOrNull { (column, cell) -> column !in used && normalize(cell.value) in normalizedAliases }
+            if (match != null) {
+                result[field] = match.key
+                used += match.key
+            }
+        }
+        return result
     }
 
     private fun looksLikeCourseHeader(values: List<String>): Boolean {
