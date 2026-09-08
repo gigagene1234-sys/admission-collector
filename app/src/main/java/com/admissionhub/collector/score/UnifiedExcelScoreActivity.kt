@@ -100,7 +100,7 @@ class UnifiedExcelScoreActivity : Activity() {
                         sourceFormat = "XLSX"
                         XlsxStudentScoreImport.parse(bytes)
                     }
-                    else -> error("실제 .xls 또는 .xlsx 형식이 아닙니다.")
+                    else -> throw IllegalArgumentException("실제 .xls 또는 .xlsx 형식이 아닙니다.")
                 }
                 autoRecognize(workbook)
             }
@@ -158,7 +158,7 @@ class UnifiedExcelScoreActivity : Activity() {
             }
         }
         return candidates.maxByOrNull { it.score }?.profile
-            ?: error("학년·학기·과목 열을 자동으로 확정하지 못했습니다. 고급 열 연결을 사용하면 직접 지정할 수 있습니다.")
+            ?: throw IllegalArgumentException("학년·학기·과목 열을 자동으로 확정하지 못했습니다. 고급 열 연결을 사용하면 직접 지정할 수 있습니다.")
     }
 
     private fun renderEditable(profile: JSONObject) {
@@ -207,7 +207,7 @@ class UnifiedExcelScoreActivity : Activity() {
             setText(value)
             this.hint = hint
             textSize = 14f
-            singleLine = true
+            setSingleLine(true)
             if (numeric) inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
             layoutParams = LinearLayout.LayoutParams(0, -2, widthWeight).apply { marginEnd = dp(4) }
         }
@@ -231,14 +231,14 @@ class UnifiedExcelScoreActivity : Activity() {
 
     private fun saveAndAnalyze() {
         val admissionYear = yearEdit.text.toString().trim().toIntOrNull()
-            ?: return error("지원 학년도를 확인하세요.")
+            ?: return showError("지원 학년도를 확인하세요.")
         val rawRows = JSONArray()
         rows.forEachIndexed { i, r ->
             val subject = r.subject.text.toString().trim()
             if (subject.isBlank()) return@forEachIndexed
             val year = r.year.text.toString().trim()
             val semester = r.semester.text.toString().trim()
-            if (year.isBlank() || semester.isBlank()) return error("${i + 1}번째 과목의 학년·학기를 확인하세요.")
+            if (year.isBlank() || semester.isBlank()) return showError("${i + 1}번째 과목의 학년·학기를 확인하세요.")
             rawRows.put(JSONObject()
                 .put("gradeYear", year)
                 .put("semester", semester)
@@ -248,7 +248,7 @@ class UnifiedExcelScoreActivity : Activity() {
                 .put("credits", r.credits.text.toString().trim())
                 .put("achievement", r.achievement.text.toString().trim()))
         }
-        if (rawRows.length() == 0) return error("저장할 과목이 없습니다.")
+        if (rawRows.length() == 0) return showError("저장할 과목이 없습니다.")
 
         val profile = runCatching {
             StudentScoreImport.parse(
@@ -256,7 +256,7 @@ class UnifiedExcelScoreActivity : Activity() {
                 admissionYear,
                 completeCheck.isChecked
             )
-        }.getOrElse { return error(it.message ?: "입력값을 확인하세요.") }
+        }.getOrElse { return showError(it.message ?: "입력값을 확인하세요.") }
         val source = parsedProfile ?: JSONObject()
         profile.put("sourceType", sourceFormat)
             .put("excelFileName", fileName.take(240))
@@ -274,7 +274,7 @@ class UnifiedExcelScoreActivity : Activity() {
             }
         }.onSuccess {
             renderSavedResult(profile, sid)
-        }.onFailure { error(it.message ?: "저장 또는 통합 분석에 실패했습니다.") }
+        }.onFailure { showError(it.message ?: "저장 또는 통합 분석에 실패했습니다.") }
     }
 
     private fun renderSavedResult(profile: JSONObject, sid: String?) {
@@ -318,7 +318,7 @@ class UnifiedExcelScoreActivity : Activity() {
     private fun labeledEdit(label: String, value: String, numeric: Boolean = false): EditText {
         info(label)
         return EditText(this).apply {
-            setText(value); singleLine = true
+            setText(value); setSingleLine(true)
             if (numeric) inputType = InputType.TYPE_CLASS_NUMBER
             root.addView(this)
         }
@@ -327,7 +327,7 @@ class UnifiedExcelScoreActivity : Activity() {
     private fun section(value: String) = TextView(this).apply { text = value; textSize = 18f; setPadding(0, dp(16), 0, dp(6)); root.addView(this) }
     private fun info(value: String) = TextView(this).apply { text = value; textSize = 14f; setTextIsSelectable(true); setPadding(0, dp(4), 0, dp(5)); root.addView(this) }
     private fun button(label: String, action: () -> Unit) = Button(this).apply { text = label; setOnClickListener { action() }; root.addView(this) }
-    private fun error(message: String) = AlertDialog.Builder(this).setTitle("학생부 입력 확인").setMessage(message).setPositiveButton("확인", null).show()
+    private fun showError(message: String) { AlertDialog.Builder(this).setTitle("학생부 입력 확인").setMessage(message).setPositiveButton("확인", null).show() }
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
 
     private fun readLimited(uri: Uri): ByteArray {
