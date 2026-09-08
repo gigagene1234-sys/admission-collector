@@ -1,0 +1,36 @@
+name: Apply Admission Hub v0.16.3 Recovery Guard
+
+on:
+  push:
+    branches: [codex/v0163-jinhak-high3-recover]
+    paths:
+      - ".github/scripts/patch_v0163_recovery_guard.py"
+      - ".github/workflows/apply-v0163-recovery-guard.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0163-recovery-guard
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/v0163-jinhak-high3-recover
+          fetch-depth: 0
+      - run: python3 .github/scripts/patch_v0163_recovery_guard.py
+      - name: Commit product guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          git commit -m "fix: keep Jinhak high3 recovery gate resumable"
+          git push origin HEAD:codex/v0163-jinhak-high3-recover
