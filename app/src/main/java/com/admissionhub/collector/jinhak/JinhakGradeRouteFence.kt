@@ -1,33 +1,72 @@
 package com.admissionhub.collector.jinhak
 
 import java.net.URI
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 
 /**
- * Keeps the admission collector inside the 고3 product during authentication and collection.
+ * Keeps the admission collector inside the 고3·N수 product during authentication and collection.
  *
- * Jinhak may expose high1/high2/high12 navigation on the same host. Those routes must never be
- * followed by the high3 collector because changing product context can invalidate or replace the
- * authenticated high3 session. Login/member routes are deliberately not blocked here.
+ * Jinhak can expose high1/high2/high12 product routes on the same host and can also carry a return
+ * route inside a generic member-login URL. The high3 collector must reject those lower-grade
+ * destinations before navigation. A plain /jh/member/login URL remains legal because it is a shared
+ * authentication surface; lower-grade context inside that surface is fenced separately in the DOM.
  */
 object JinhakGradeRouteFence {
-    const val SCHEMA_VERSION = 1
+    const val SCHEMA_VERSION = 2
+
+    private val lowerGradeRouteMarkers = listOf(
+        "/jh/high1/",
+        "/jh/high2/",
+        "/jh/high12/"
+    )
+
+    private val lowerGradeTerminalMarkers = listOf(
+        "/jh/high1",
+        "/jh/high2",
+        "/jh/high12"
+    )
 
     fun isBlockedLowerGrade(url: String): Boolean {
         if (url.isBlank()) return false
-        val path = runCatching { URI(url).path.orEmpty().lowercase() }.getOrElse { url.lowercase() }
-        return path.contains("/jh/high1/") ||
-            path.endsWith("/jh/high1") ||
-            path.contains("/jh/high2/") ||
-            path.endsWith("/jh/high2") ||
-            path.contains("/jh/high12/") ||
-            path.endsWith("/jh/high12")
+        val uri = runCatching { URI(url) }.getOrNull()
+        val path = uri?.path.orEmpty().lowercase()
+        if (containsLowerGradeRoute(path)) return true
+
+        // A shared login URL is allowed only when it does not carry an explicit lower-grade
+        // destination in query/fragment/redirect parameters. Decode once so encoded return URLs
+        // such as %2Fjh%2Fhigh2%2F... are caught before WebView navigation begins.
+        val context = buildString {
+            append(uri?.rawQuery.orEmpty())
+            append('#')
+            append(uri?.rawFragment.orEmpty())
+        }
+        val decodedContext = runCatching {
+            URLDecoder.decode(context, StandardCharsets.UTF_8.name())
+        }.getOrDefault(context).lowercase()
+        return containsLowerGradeRoute(decodedContext)
     }
 
     fun isHigh3(url: String): Boolean {
         if (url.isBlank()) return false
-        val path = runCatching { URI(url).path.orEmpty().lowercase() }.getOrElse { url.lowercase() }
+        val uri = runCatching { URI(url) }.getOrNull()
+        val path = uri?.path.orEmpty().lowercase()
         return path.contains("/jh/high3/") || path.endsWith("/jh/high3")
     }
 
     fun protectedHigh3Core(): String = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
+
+    private fun containsLowerGradeRoute(value: String): Boolean {
+        if (value.isBlank()) return false
+        val normalized = value.lowercase()
+        return lowerGradeRouteMarkers.any(normalized::contains) ||
+            lowerGradeTerminalMarkers.any { marker ->
+                normalized == marker ||
+                    normalized.endsWith(marker) ||
+                    normalized.contains("$marker?") ||
+                    normalized.contains("$marker#") ||
+                    normalized.contains("$marker&") ||
+                    normalized.contains("$marker=")
+            }
+    }
 }
