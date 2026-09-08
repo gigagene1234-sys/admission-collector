@@ -1,0 +1,42 @@
+name: Apply Admission Hub v0.15.1 Repair
+
+on:
+  push:
+    branches: [codex/v0151-wide-xls-high3-fence]
+    paths:
+      - ".github/scripts/patch_v0151.py"
+      - ".github/workflows/apply-v0151.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0151-apply
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/v0151-wide-xls-high3-fence
+          fetch-depth: 0
+      - name: Apply v0.15.1 runtime patch
+        run: python3 .github/scripts/patch_v0151.py
+      - name: Commit patched product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No product source changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+                  app/src/main/java/com/admissionhub/collector/score/UnifiedExcelScoreActivity.kt \
+                  app/build.gradle.kts app/src/main/AndroidManifest.xml
+          git commit -m "feat: wire v0.15.1 wide XLS and high3 route fence"
+          git push origin HEAD:codex/v0151-wide-xls-high3-fence
