@@ -37,7 +37,7 @@ object AdigaOfficialAdmissionEvidence {
                 currentYear -> "university-current"
                 else -> "historical"
             }
-            out += baseEvidence(recordType, recordYear, record, metrics)
+            val evidence = baseEvidence(recordType, recordYear, record, metrics)
                 .put("rowIndex", ri)
                 .put("scope", scope)
                 .put("departmentMatch", departmentQuality)
@@ -45,6 +45,18 @@ object AdigaOfficialAdmissionEvidence {
                 .put("rowEvidence", cells.filter { it.isNotBlank() }.joinToString(" | ").take(1600))
                 .put("rowCells", JSONArray(cells))
                 .put("bindingMethod", "same-row-or-university-evidence")
+
+            if (recordType == "historical-admission-result-table" &&
+                departmentQuality in setOf("exact", "suffix-equivalent") && admissionQuality == "exact") {
+                AdigaHistoricalOutcomeExtractor.extractSameRow(
+                    rows = rows,
+                    departmentRowIndex = ri,
+                    metrics = metrics,
+                    recordYear = recordYear,
+                    admissionLabel = app.admission.orEmpty()
+                )?.let { evidence.put("historicalOutcome", it) }
+            }
+            out += evidence
         }
 
         val segmentBindings = AdigaOfficialTableBindingPolicy.findExplicitSegmentBindings(
