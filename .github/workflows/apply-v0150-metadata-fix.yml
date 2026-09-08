@@ -1,0 +1,36 @@
+name: Apply v0.15.0 Lease Metadata Fix
+
+on:
+  push:
+    branches: [codex/v0150-dual-provider-score-link]
+    paths:
+      - ".github/workflows/apply-v0150-metadata-fix.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply metadata fix
+        run: python3 .github/scripts/fix_v0150_metadata.py
+      - name: Verify focused diff
+        run: |
+          set -euo pipefail
+          git diff --check
+          test "$(git diff --name-only)" = "app/src/main/java/com/admissionhub/collector/MainActivity.kt"
+      - name: Commit metadata fix
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          git diff --cached --quiet && { echo 'Expected metadata fix produced no changes'; exit 1; }
+          git commit -m "fix: report provider lease restore state precisely"
+          git push origin HEAD:codex/v0150-dual-provider-score-link
