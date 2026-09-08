@@ -1,0 +1,146 @@
+name: Build Admission Hub v0.16.4 v0.9.12 Auth Baseline
+
+on:
+  push:
+    branches: [codex/v0164-v0912-auth-baseline]
+    paths:
+      - "app/**"
+      - ".github/scripts/verify_v0164.py"
+      - ".github/scripts/verify_apk_v0164.sh"
+      - ".github/workflows/build-admission-hub-v0164.yml"
+      - "docs/releases/v0.16.4.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0164
+  cancel-in-progress: true
+
+jobs:
+  build-test-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.16.4-v0.9.12-Auth-Baseline.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify v0.16.4 product contracts
+        run: python3 .github/scripts/verify_v0164.py
+
+      - name: Verify real-device baseline exists in repository history
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=58f1a575d3c98afab2b3f6869702105a0c08e09a
+          git cat-file -e "$BASE^{commit}"
+          git show "$BASE:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'private fun attemptSavedCredentialLogin(which: ProviderId, reason: String)' >/dev/null
+          git show "$BASE:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'webView.loadUrl(which.homeUrl)' >/dev/null
+          git show "$BASE:app/src/main/java/com/admissionhub/collector/MainActivity.kt" | grep -F 'resumeBatchAfterVerifiedJinhakAuth' >/dev/null
+          echo "v0.9.12 real-device auth source baseline is present"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test all application and regression contracts
+        run: gradle --no-daemon :app:testDebugUnitTest
+
+      - name: Compile signed product
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK package version label and stable signer
+        run: bash .github/scripts/verify_apk_v0164.sh
+
+      - name: Clean rebuild and retest exact committed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git reset --hard "$GITHUB_SHA"
+          python3 .github/scripts/verify_v0164.py
+          gradle --no-daemon clean :app:testDebugUnitTest :app:assembleDebug
+          bash .github/scripts/verify_apk_v0164.sh
+          git diff --exit-code
+
+      - name: Package APK and verification report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/$APK_NAME"
+          (cd dist && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          python3 - <<'PY'
+          import glob,json,os,xml.etree.ElementTree as E
+          suites=[E.parse(f).getroot() for f in glob.glob('app/build/test-results/testDebugUnitTest/TEST-*.xml')]
+          counts={k:sum(int(s.get(k,'0')) for s in suites) for k in ['tests','failures','errors','skipped']}
+          assert counts['tests']>=99, counts
+          assert counts['failures']==counts['errors']==counts['skipped']==0, counts
+          report={
+            'productCommit':os.environ['GITHUB_SHA'],
+            'versionName':'0.16.4','versionCode':116400,'tests':counts,
+            'signerSha256':'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995',
+            'exactCommittedSourceRebuild':True,
+            'realDeviceComparisonBaseline':'v0.9.12-58f1a575d3c98afab2b3f6869702105a0c08e09a',
+            'baselineEvidence':'v0.9.12 real device successfulSnapshots 65/66, Jinhak records 145, identities 30, mission targets 30',
+            'passiveLoginSemanticsRestored':True,
+            'authProductTabJavascriptClickRemovedFromCompatibilityPath':True,
+            'lowerGradeAuthTransitionsHiddenNotBlocked':True,
+            'protectedHigh3CoreRequiredForAuthPromotion':True,
+            'postAuthLowerGradeCollectionFencePreserved':True,
+            'preservedBatchTargetResumedAfterProtectedCoreVerification':True,
+            'credentialsExported':False,
+            'cookiesExported':False,
+            'jinhakPromotedToOfficial':False,
+            'historicalBindingRelaxed':False,
+            'probabilityInferred':False,
+            'deviceAcceptance':'pending-real-galaxy-jinhak-login-and-batch-start'
+          }
+          open('dist/verification-v0.16.4.json','w').write(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+          print(json.dumps(report,ensure_ascii=False))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.16.4-v0912-auth-baseline
+          path: |
+            dist/*
+            app/build/test-results/testDebugUnitTest/*.xml
+
+      - name: Publish verified v0.16.4 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view v0.16.4 >/dev/null 2>&1 && gh release delete v0.16.4 -y --cleanup-tag || true
+          gh release create v0.16.4 "dist/$APK_NAME" "dist/$APK_NAME.sha256" dist/verification-v0.16.4.json \
+            --target "$GITHUB_SHA" --title "Admission Hub v0.16.4 — v0.9.12 Auth Baseline Restore" \
+            --notes-file docs/releases/v0.16.4.md
