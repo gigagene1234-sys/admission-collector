@@ -10,25 +10,52 @@ import org.json.JSONObject
  * Rebuilds only evidence-backed score artifacts for the user's pinned six applications.
  * No slot is added, removed, reordered or replaced here.
  *
- * v0.15 separates two verification questions that had been incorrectly collapsed:
- * - a current-year scoring formula may be applicable when the official admission component and
- *   recruitment-unit component are separately verified for the same university/year, and
- * - a historical outcome still requires exact application-bound table evidence.
- *
- * The first rule is used only for a deterministic calculator already encoded from official data.
- * It never relaxes the historical outcome binding rule below.
+ * v0.15.1 also repairs a cross-session failure mode: a fresh Adiga run can contain thousands of
+ * official records while the same run's Jinhak authentication fails before rebuilding the current
+ * candidate graph. In that case the six pinned identity keys are still authoritative, so missing
+ * candidate metadata is read from the latest reusable canonical session. The evidence itself is
+ * still rescanned from the CURRENT session's Adiga records; stale official evidence is not copied.
  */
 object AdigaAutoScoreMaterializer {
-    const val SCHEMA_VERSION = 3
+    const val SCHEMA_VERSION = 4
 
     fun materializeSelected(store: LocalCollectorStore, sessionId: String, profile: JSONObject = store.currentStudentScoreProfile()): JSONObject {
         if (sessionId.isBlank()) return JSONObject().put("schemaVersion", SCHEMA_VERSION).put("error", "missing-session")
-        val candidates = store.loadCanonicalApplicationCandidates(sessionId)
-        val byIdentity = (0 until candidates.length()).mapNotNull { candidates.optJSONObject(it) }
-            .associateBy { it.optString("applicationIdentityKey") }
+
         val slots = store.loadHubApplicationSlots()
         val selected = (0 until slots.length()).mapNotNull { slots.optJSONObject(it)?.optString("applicationIdentityKey") }
             .filter { it.isNotBlank() }.distinct()
+
+        val currentCandidates = store.loadCanonicalApplicationCandidates(sessionId)
+        val byIdentity = linkedMapOf<String, JSONObject>()
+        for (i in 0 until currentCandidates.length()) {
+            val item = currentCandidates.optJSONObject(i) ?: continue
+            item.optString("applicationIdentityKey").takeIf { it.isNotBlank() }?.let { byIdentity[it] = item }
+        }
+
+        val missingSelected = selected.filterNot(byIdentity::containsKey)
+        var fallbackSessionId: String? = null
+        var fallbackCandidatesUsed = 0
+        if (missingSelected.isNotEmpty()) {
+            fallbackSessionId = store.latestReusableCanonicalSessionId()
+                ?.takeIf { it.isNotBlank() && it != sessionId }
+            if (!fallbackSessionId.isNullOrBlank()) {
+                val fallback = store.loadCanonicalApplicationCandidates(fallbackSessionId)
+                for (i in 0 until fallback.length()) {
+                    val item = fallback.optJSONObject(i) ?: continue
+                    val identity = item.optString("applicationIdentityKey")
+                    if (identity in missingSelected && !byIdentity.containsKey(identity)) {
+                        // Copy only identity/selection metadata used to bind CURRENT-session Adiga
+                        // evidence. Nothing from the fallback provider record set is materialized.
+                        byIdentity[identity] = JSONObject(item.toString())
+                            .put("candidateMetadataSourceSessionId", fallbackSessionId)
+                            .put("candidateMetadataFallbackOnly", true)
+                        fallbackCandidatesUsed++
+                    }
+                }
+            }
+        }
+
         val selectedCandidates = selected.mapNotNull { byIdentity[it] }
         val fullRescan = AdigaFullEvidenceRescan.scanSelected(store, sessionId, selectedCandidates)
         val fullByIdentity = fullRescan.optJSONObject("byIdentity") ?: JSONObject()
@@ -67,6 +94,7 @@ object AdigaAutoScoreMaterializer {
                     .put("bindingSemantics", if (directIdentityBinding) "direct-current-application" else if (scoringScopeBinding) "same-university-year-official-components+verified-formula" else "unverified")
                     .put("historicalBindingRelaxed", false)
                     .put("officialEvidenceCode", official.optString("code"))
+                    .put("candidateMetadataFallbackOnly", candidate.optBoolean("candidateMetadataFallbackOnly", false))
                     .put("fullAdigaRescan", true)
             )
             if (verified && conversionIdentityBinding) conversionsVerified++ else conversionsHeld++
@@ -137,6 +165,7 @@ object AdigaAutoScoreMaterializer {
             results.put(JSONObject()
                 .put("applicationIdentityKey", identity)
                 .put("displayLabel", candidate.optString("displayLabel"))
+                .put("candidateMetadataFallbackOnly", candidate.optBoolean("candidateMetadataFallbackOnly", false))
                 .put("officialEvidenceCode", official.optString("code"))
                 .put("currentComponentsVerified", official.optBoolean("currentComponentsVerified", false))
                 .put("directCurrentBinding", directIdentityBinding)
@@ -150,6 +179,9 @@ object AdigaAutoScoreMaterializer {
         return JSONObject()
             .put("schemaVersion", SCHEMA_VERSION)
             .put("selected", selected.size)
+            .put("selectedCandidatesResolved", selectedCandidates.size)
+            .put("fallbackCandidateSessionId", fallbackSessionId ?: JSONObject.NULL)
+            .put("fallbackCandidatesUsed", fallbackCandidatesUsed)
             .put("conversionsVerified", conversionsVerified)
             .put("conversionsHeld", conversionsHeld)
             .put("directHistoricalRowsFound", directHistoricalRowsFound)
