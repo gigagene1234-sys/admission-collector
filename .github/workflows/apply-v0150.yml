@@ -23,6 +23,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Normalize patch runner
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('.github/scripts/patch_v0150.py')
+          s=p.read_text()
+          old='s = replace_once(s, \'text = "통합 동기화 시작"\', \'text = "어디가 + 진학사 자동 수집"\', \'primary unified label\')'
+          new='s = s.replace(\'text = "통합 동기화 시작"\', \'text = "어디가 + 진학사 자동 수집"\')'
+          if old not in s:
+              raise SystemExit('primary unified label normalization anchor missing')
+          p.write_text(s.replace(old,new,1))
+          PY
       - name: Apply v0.15.0 product patch
         run: python3 .github/scripts/patch_v0150.py
       - name: Verify focused source diff
@@ -44,4 +57,5 @@ jobs:
           git add app .github/scripts/patch_v0150.py
           git diff --cached --quiet && { echo 'Expected v0.15.0 product changes'; exit 1; }
           git commit -m "feat: v0.15.0 full automatic dual-provider evidence flow"
+          git pull --rebase origin codex/v0150-full-auto-evidence
           git push origin HEAD:codex/v0150-full-auto-evidence
