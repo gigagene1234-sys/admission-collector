@@ -1,0 +1,42 @@
+name: Apply Admission Hub v0.14.2 Product Patch
+
+on:
+  push:
+    branches: [codex/v0142-one-step-score-auth]
+    paths:
+      - ".github/workflows/apply-v0142.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0142-apply
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply bounded v0.14.2 source patch
+        run: python3 .github/scripts/patch_v0142.py
+      - name: Verify patch scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff -- app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/score/ScoreReviewUi.kt
+          test -z "$(git diff --name-only | grep -vE '^(app/src/main/java/com/admissionhub/collector/MainActivity.kt|app/src/main/java/com/admissionhub/collector/score/ScoreReviewUi.kt)$' || true)"
+      - name: Commit product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/score/ScoreReviewUi.kt
+          git diff --cached --exit-code && { echo 'Expected v0.14.2 patch produced no changes'; exit 1; } || true
+          git commit -m "feat: restore encrypted auto login and one-step score entry"
+          git push origin HEAD:codex/v0142-one-step-score-auth
