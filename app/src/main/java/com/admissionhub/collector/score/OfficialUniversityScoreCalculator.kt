@@ -163,7 +163,11 @@ object OfficialUniversityScoreCalculator {
             else -> null
         }
     }
-    private fun normalize(v: String) = v.lowercase(Locale.ROOT).replace(Regex("[\\s·・ㆍ_\\-\\/\\[\\]\\(\\)]"), "").replace("Ⅰ", "1").replace("Ⅱ", "2")
+    private fun normalize(v: String) = v
+        .replace("Ⅰ", "1").replace("Ⅱ", "2")
+        .replace("ⅰ", "1").replace("ⅱ", "2")
+        .lowercase(Locale.ROOT)
+        .replace(Regex("[\\s·・ㆍ_\\-\\/\\[\\]\\(\\)]"), "")
 
     private fun verified(base: JSONObject, score: Double, max: Double, scale: String, version: String, detail: JSONObject): JSONObject = base
         .put("verified", true).put("status", "verified").put("scoreValue", score).put("maxScore", max)
