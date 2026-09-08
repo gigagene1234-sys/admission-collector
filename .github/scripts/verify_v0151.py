@@ -39,6 +39,12 @@ assert 'jinhak-lower-grade-redirect-stopped' in main
 assert 'jinhak-popup-lower-grade-navigation-blocked' in main
 assert 'lowerGradeNavigationsBlocked' in main
 
+# Reauthentication is finite even if the site keeps bouncing back to login.
+assert 'private const val MAX_JINHAK_REAUTH_CYCLES = 3' in main
+assert 'jinhakReauthCycles >= MAX_JINHAK_REAUTH_CYCLES' in main
+assert 'jinhak-reauth-circuit-open' in main
+assert 'finishBatch("jinhak-reauth-circuit-open")' in main
+
 # Current Adiga evidence can be materialized against pinned identities even when the fresh
 # Jinhak run failed before rebuilding a candidate graph. Only candidate metadata may fall back.
 assert 'latestReusableCanonicalSessionId()' in materializer
