@@ -1,5 +1,5 @@
 name: Apply Build Release Admission Hub v0.16.6 High3 Route Isolation
-# verifier retry: nested-encoding production comment is valid
+# idempotent retry: product source may already be patched; expose build-tools for APK verification
 
 on:
   push:
@@ -28,27 +28,28 @@ jobs:
           fetch-depth: 0
           ref: codex/v0166-hard-high3-route-isolation
 
-      - name: Apply v0.16.6 product patch
+      - name: Prepare exact v0.16.6 product source
         shell: bash
         run: |
           set -euo pipefail
-          python3 .github/scripts/patch_v0166.py
-          python3 .github/scripts/patch_v0166_post.py
+          MAIN=app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          if grep -F 'private const val VERSION = "0.16.6"' "$MAIN" >/dev/null; then
+            echo "v0.16.6 product source is already committed; skip patch replay"
+          else
+            python3 .github/scripts/patch_v0166.py
+            python3 .github/scripts/patch_v0166_post.py
+            git diff --check
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
+            git diff --cached --quiet && { echo "expected v0.16.6 source changes"; exit 1; }
+            git commit -m "Admission Hub v0.16.6 hard high3 route isolation"
+            git push origin HEAD:codex/v0166-hard-high3-route-isolation
+          fi
           python3 .github/scripts/verify_v0166.py
-          git diff --check
-
-      - name: Commit exact v0.16.6 product source
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/build.gradle.kts app/src/main/AndroidManifest.xml
-          git diff --cached --exit-code && { echo "v0.16.6 patch produced no source changes"; exit 1; } || true
-          git commit -m "Admission Hub v0.16.6 hard high3 route isolation"
           PRODUCT_SHA="$(git rev-parse HEAD)"
           echo "PRODUCT_SHA=$PRODUCT_SHA" >> "$GITHUB_ENV"
-          git push origin HEAD:codex/v0166-hard-high3-route-isolation
+          git diff --exit-code
 
       - name: Verify committed source contracts
         shell: bash
@@ -89,8 +90,12 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK 35
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Install Android SDK 35 and expose build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
