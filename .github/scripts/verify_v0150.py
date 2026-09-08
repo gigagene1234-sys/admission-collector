@@ -84,7 +84,7 @@ for required in [
     assert required in recognizer, 'Missing structural transcript recognizer safety: ' + required
 # Blank grade must remain blank/null; automatic recognizer must not assert completeness.
 assert '.put("completeTranscriptConfirmedByUser", complete)' in (root / 'score/StudentScoreImport.kt').read_text()
-assert 'false' in recognizer.split('StudentScoreImport.parse(', 1)[1].split(')', 1)[0]
+assert re.search(r'StudentScoreImport\.parse\([\s\S]{0,800}?admissionYear,\s*false\s*\)', recognizer), 'Structural recognizer must pass complete=false'
 assert 'grade.isBlank()' in recognizer
 
 # Dashboard separates official component verification from strict same-row/direct binding.
