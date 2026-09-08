@@ -50,8 +50,21 @@ object StudentScoreImport {
             val achievement = if (r.isNull("achievement")) "" else r.optString("achievement").trim().uppercase()
             require(achievement in setOf("", "A", "B", "C", "D", "E", "P")) { "${i + 1}행: 성취도를 확인하세요." }
             if (grade == null) ungraded++ else { graded++; if (credits == null) missingCredits++ else { weighted += grade * credits; totalCredits += credits } }
-            normalized.put(JSONObject().put("gradeYear", year).put("semester", semester).put("group", r.optString("group").take(60))
-                .put("subject", subject).put("grade", grade ?: JSONObject.NULL).put("credits", credits ?: JSONObject.NULL).put("achievement", achievement))
+
+            val out = JSONObject().put("gradeYear", year).put("semester", semester).put("group", r.optString("group").take(60))
+                .put("subject", subject).put("grade", grade ?: JSONObject.NULL).put("credits", credits ?: JSONObject.NULL).put("achievement", achievement)
+            val distribution = r.optJSONObject("achievementDistribution")
+            if (distribution != null) {
+                val safe = JSONObject()
+                for (letter in listOf("A", "B", "C", "D", "E")) {
+                    if (!distribution.has(letter) || distribution.isNull(letter)) continue
+                    val value = distribution.optDouble(letter, Double.NaN)
+                    require(value.isFinite() && value in 0.0..100.0) { "${i + 1}행: 성취도별 분포 $letter 값을 확인하세요." }
+                    safe.put(letter, value)
+                }
+                if (safe.length() > 0) out.put("achievementDistribution", safe)
+            }
+            normalized.put(out)
         }
         val payload = JSONObject().put("academicYear", admissionYear).put("subjects", normalized).put("completeTranscriptConfirmedByUser", complete)
         return payload.put("fingerprint", fingerprint(payload.toString())).put("status", "IMPORTED")
