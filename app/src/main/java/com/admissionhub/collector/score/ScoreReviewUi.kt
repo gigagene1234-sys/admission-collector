@@ -53,7 +53,7 @@ class ScoreReviewUi(
         text(p, "과목별 성적을 직접 입력하거나 XLS·XLSX·CSV·TSV·성적 JSON을 가져오세요. 등급이 없는 과목은 빈칸으로 보존합니다.")
         val defaultYear = session()?.let { store.loadCanonicalApplicationCandidates(it).optJSONObject(0)?.optInt("academicYear") } ?: 2027
         val year = field(p, "지원 학년도", old.optInt("academicYear", defaultYear).toString(), true)
-        button(p, "XLS / XLS / XLSX 파일 가져오기 · 시트/열 미리보기") {
+        button(p, "학생부 Excel 분석 · 입력 · 대학환산 한 번에") {
             activity.startActivity(Intent(activity, XlsxImportActivity::class.java).putExtra(XlsxImportActivity.EXTRA_SESSION_ID, session()))
         }
         button(p, "CSV / TSV / 성적 JSON 파일 가져오기", importFile)
