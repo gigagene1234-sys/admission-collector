@@ -17,6 +17,7 @@ import android.webkit.WebChromeClient
 import android.webkit.JsResult
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -61,6 +62,7 @@ import com.admissionhub.collector.provider.PaginationPlan
 import com.admissionhub.collector.provider.ProviderAdapter
 import com.admissionhub.collector.provider.ProviderId
 import com.admissionhub.collector.provider.ProviderRegistry
+import java.io.ByteArrayInputStream
 import java.time.Instant
 import java.util.ArrayDeque
 
@@ -329,6 +331,10 @@ class MainActivity : Activity() {
     private var jinhakV0165ManualLoginWaits = 0
     private var jinhakV0165ManualLoginVerifiedHandoffs = 0
     private var jinhakV0165ProbeCompletedFromProtectedCore = 0
+    private var jinhakV0166LowerGradeRequestsIntercepted = 0
+    private var jinhakV0166LowerGradeNavigationsHardBlocked = 0
+    private var jinhakV0166LowerGradeRecoveryDispatches = 0
+    private var jinhakV0166LowerGradeRecoveryPending = false
     private var jinhakPostMissionClosureFences = 0
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
@@ -515,8 +521,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.16.5"
-        private const val BUILD_CODE = 116500
+        private const val VERSION = "0.16.6"
+        private const val BUILD_CODE = 116600
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -1411,19 +1417,24 @@ class MainActivity : Activity() {
         }
 
         webView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                val target = request.url?.toString().orEmpty()
+                if (provider == ProviderId.JINHAK && request.isForMainFrame && JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
+                    handler.post {
+                        if (provider == ProviderId.JINHAK) {
+                            jinhakV0166LowerGradeRequestsIntercepted += 1
+                            hardBlockJinhakLowerGradeNavigation("network-intercept", target)
+                        }
+                    }
+                    return blockedJinhakLowerGradeResponse()
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
+
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val target = request.url?.toString().orEmpty()
-                if (target.isNotBlank() && jinhakHigh3FenceActive() && JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
-                    jinhakLowerGradeNavigationsBlocked += 1
-                    recordRuntimeEvent("jinhak-lower-grade-navigation-blocked", JSONObject()
-                        .put("targetSafePath", runtimeSafePath(target))
-                        .put("currentSafePath", runtimeSafePath(view.url.orEmpty()))
-                        .put("high3CoreSafePath", runtimeSafePath(JinhakGradeRouteFence.protectedHigh3Core())))
-                    if (jinhakLowerGradeAuthFenceShouldTerminate()) {
-                        recoverJinhakLowerGradeLoginContext("lower-grade-navigation", JSONObject().put("targetSafePath", runtimeSafePath(target)))
-                    } else {
-                        status.text = "진학사 고1·고2 화면 이동 차단 · 현재 고3 세션을 유지합니다."
-                    }
+                if (target.isNotBlank() && provider == ProviderId.JINHAK && JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
+                    hardBlockJinhakLowerGradeNavigation("navigation-override", target)
                     return true
                 }
                 if (batchRunning && provider == ProviderId.JINHAK && target.isNotBlank() && !ProviderRegistry.adapter(ProviderId.JINHAK).accepts(target)) {
@@ -1438,25 +1449,18 @@ class MainActivity : Activity() {
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 runtimeLastSafePath = runtimeSafePath(url)
-                if (provider == ProviderId.JINHAK && (
-                        isProviderLoginUrl(ProviderId.JINHAK, url) ||
-                            (jinhakAuthCompatibilityWindowActive() && JinhakGradeRouteFence.isBlockedLowerGrade(url))
-                        )) {
+                if (provider == ProviderId.JINHAK && JinhakGradeRouteFence.isBlockedLowerGrade(url)) {
                     view.visibility = View.INVISIBLE
-                    status.text = "진학사 인증 전환 처리 중 · 고1·2 화면은 표시하지 않고 기존 로그인 흐름을 유지합니다."
-                }
-                if (jinhakHigh3FenceActive() && JinhakGradeRouteFence.isBlockedLowerGrade(url)) {
-                    jinhakLowerGradeNavigationsBlocked += 1
-                    view.stopLoading()
-                    recordRuntimeEvent("jinhak-lower-grade-redirect-stopped", JSONObject()
-                        .put("targetSafePath", runtimeSafePath(url))
-                        .put("high3CoreSafePath", runtimeSafePath(JinhakGradeRouteFence.protectedHigh3Core())))
-                    if (jinhakLowerGradeAuthFenceShouldTerminate()) {
-                        recoverJinhakLowerGradeLoginContext("lower-grade-redirect", JSONObject().put("targetSafePath", runtimeSafePath(url)))
-                    } else {
-                        status.text = "진학사 고1·고2 리다이렉트 차단 · 해당 페이지를 열지 않고 현재 고3 세션을 유지합니다."
-                    }
+                    runCatching { view.stopLoading() }
+                    hardBlockJinhakLowerGradeNavigation("page-started", url)
                     return
+                }
+                if (provider == ProviderId.JINHAK && isProviderLoginUrl(ProviderId.JINHAK, url)) {
+                    // v0.16.6: the shared Jinhak login page is a legitimate user-owned surface.
+                    // Never hide it merely because an auth compatibility window is active.
+                    view.visibility = View.VISIBLE
+                    sessionState.text = "○ 진학사 고3 사이트 로그인 화면"
+                    status.text = "진학사 고3 로그인 화면입니다. 고1·고2 경로는 네트워크 단계에서 차단되며 이 화면만 사용자 로그인용으로 유지합니다."
                 }
                 if (jinhakRealAuthProbeActive && provider == ProviderId.JINHAK) {
                     noteJinhakRealAuthProbeRoute(url, "page-started")
@@ -1568,12 +1572,15 @@ class MainActivity : Activity() {
                 val wasBatchRunning = batchRunning
                 val wasBatchPausedForLogin = batchPausedForLogin
                 val wasUnifiedRunning = unifiedRunning
-                val resumeUrl = currentBatchTarget?.takeIf { it.isNotBlank() }
+                val rawResumeUrl = currentBatchTarget?.takeIf { it.isNotBlank() }
                     ?: runCatching { deadView.url }.getOrNull()?.takeIf { !it.isNullOrBlank() }
                     ?: when (provider) {
                         ProviderId.JINHAK -> ProviderId.JINHAK.homeUrl
                         ProviderId.ADIGA -> ProviderId.ADIGA.homeUrl
                     }
+                val resumeUrl = if (provider == ProviderId.JINHAK && JinhakGradeRouteFence.isBlockedLowerGrade(rawResumeUrl)) {
+                    JinhakGradeRouteFence.protectedHigh3Core().ifBlank { ProviderId.JINHAK.homeUrl }
+                } else rawResumeUrl
                 val didCrash = detail?.didCrash() ?: false
                 val webViewPackage = runCatching { WebView.getCurrentWebViewPackage() }.getOrNull()
                 val now = System.currentTimeMillis()
@@ -1818,9 +1825,24 @@ class MainActivity : Activity() {
                     mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 }
                 child.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                        val target = request.url?.toString().orEmpty()
+                        if (provider == ProviderId.JINHAK && request.isForMainFrame && JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
+                            handler.post {
+                                if (provider == ProviderId.JINHAK) {
+                                    jinhakV0166LowerGradeRequestsIntercepted += 1
+                                    hardBlockJinhakLowerGradeNavigation("popup-network-intercept", target)
+                                    destroyTransientPopup("lower-grade-network-blocked")
+                                }
+                            }
+                            return blockedJinhakLowerGradeResponse()
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+
                     private fun handoff(target: String): Boolean {
                         if (target.isBlank() || target == "about:blank") return false
-                        if (jinhakHigh3FenceActive() && JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
+                        if (provider == ProviderId.JINHAK && JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
                             jinhakLowerGradeNavigationsBlocked += 1
                             recordRuntimeEvent("jinhak-popup-lower-grade-navigation-blocked", JSONObject()
                                 .put("targetSafePath", runtimeSafePath(target)))
@@ -2899,6 +2921,58 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun blockedJinhakLowerGradeResponse(): WebResourceResponse = WebResourceResponse(
+        "text/plain",
+        "UTF-8",
+        403,
+        "Blocked by Admission Hub high3 route isolation",
+        mapOf("Cache-Control" to "no-store", "X-Admission-Hub-Route-Fence" to "high3-only"),
+        ByteArrayInputStream(ByteArray(0))
+    )
+
+    private fun hardBlockJinhakLowerGradeNavigation(source: String, target: String) {
+        if (provider != ProviderId.JINHAK || !JinhakGradeRouteFence.isBlockedLowerGrade(target)) return
+        jinhakLowerGradeNavigationsBlocked += 1
+        jinhakV0166LowerGradeNavigationsHardBlocked += 1
+        runCatching { webView.stopLoading() }
+        webView.visibility = View.INVISIBLE
+        recordRuntimeEvent(
+            "jinhak-v0166-lower-grade-hard-block",
+            JSONObject()
+                .put("source", source.take(80))
+                .put("targetSafePath", runtimeSafePath(target))
+                .put("currentSafePath", runtimeSafePath(webView.url.orEmpty()))
+                .put("high3CoreSafePath", runtimeSafePath(JinhakGradeRouteFence.protectedHigh3Core()))
+                .put("networkRequestAllowed", false)
+                .put("followLowerGrade", false)
+                .put("batchTerminated", false)
+        )
+        scheduleJinhakHigh3RouteIsolationRecovery(source)
+    }
+
+    private fun scheduleJinhakHigh3RouteIsolationRecovery(source: String) {
+        if (provider != ProviderId.JINHAK || jinhakV0166LowerGradeRecoveryPending) return
+        val high3Core = JinhakGradeRouteFence.protectedHigh3Core()
+        if (high3Core.isBlank() || JinhakGradeRouteFence.isBlockedLowerGrade(high3Core)) return
+        jinhakV0166LowerGradeRecoveryPending = true
+        jinhakV0166LowerGradeRecoveryDispatches += 1
+        handler.postDelayed({
+            jinhakV0166LowerGradeRecoveryPending = false
+            if (provider != ProviderId.JINHAK) return@postDelayed
+            // One forbidden redirect causes exactly one deterministic protected-high3 probe.
+            // If authentication is not valid, that probe may return to the shared login page,
+            // where v0.16.5/0.16.6 manual-login handling leaves the page visible and does not
+            // automatically retry again. This breaks the old high3 -> lower-grade -> high3 loop.
+            webView.visibility = View.INVISIBLE
+            recordRuntimeEvent("jinhak-v0166-return-to-protected-high3", JSONObject()
+                .put("source", source.take(80))
+                .put("coreSafePath", runtimeSafePath(high3Core))
+                .put("automaticLowerGradeFollow", false)
+                .put("oneShot", true))
+            webView.loadUrl(high3Core)
+        }, 160L)
+    }
+
     private fun jinhakLowerGradeAuthFenceShouldTerminate(): Boolean {
         if (provider != ProviderId.JINHAK) return false
         val current = if (::webView.isInitialized) webView.url.orEmpty() else ""
@@ -2913,46 +2987,40 @@ class MainActivity : Activity() {
 
     private fun handleJinhakV0912AuthCompatibilityPage(url: String): Boolean {
         if (provider != ProviderId.JINHAK || !jinhakAuthCompatibilityWindowActive()) return false
-        val loginRoute = isProviderLoginUrl(ProviderId.JINHAK, url)
         val lowerGradeTransition = JinhakGradeRouteFence.isBlockedLowerGrade(url)
-        if (!loginRoute && !lowerGradeTransition) return false
+        if (lowerGradeTransition) {
+            // v0.16.6: lower-grade is not an auth transition. It is a forbidden route.
+            hardBlockJinhakLowerGradeNavigation("v0912-compatibility-route", url)
+            return true
+        }
+        val loginRoute = isProviderLoginUrl(ProviderId.JINHAK, url)
+        if (!loginRoute) return false
 
         jinhakV0912AuthCompatibilityTransitions += 1
-        webView.visibility = View.INVISIBLE
-        if (lowerGradeTransition) {
-            recordRuntimeEvent("jinhak-v0912-hidden-auth-transition", JSONObject()
-                .put("safePath", runtimeSafePath(url))
-                .put("transition", jinhakV0912AuthCompatibilityTransitions)
-                .put("blockedBeforeAuth", false)
-                .put("visibleToUser", false))
-        }
-
+        webView.visibility = View.VISIBLE
         checkSessionState { needsLogin, authenticated ->
             if (provider != ProviderId.JINHAK) return@checkSessionState
             if (authenticated && !needsLogin) {
                 val high3Core = JinhakGradeRouteFence.protectedHigh3Core()
                 credentialAwaitingLoginExitProvider = null
                 jinhakReauthCycles = 0
-                jinhakCoreBootstrapState = "v0912-authenticated-handoff-to-protected-core"
+                jinhakCoreBootstrapState = "v0166-authenticated-handoff-to-protected-high3"
                 jinhakLastAuthEvidence = "session-authenticated-before-protected-core"
                 jinhakV0912ProtectedCoreHandoffs += 1
-                if (high3Core.isNotBlank()) {
-                    recordRuntimeEvent("jinhak-v0912-protected-core-handoff", JSONObject()
+                if (high3Core.isNotBlank() && !JinhakGradeRouteFence.isBlockedLowerGrade(high3Core)) {
+                    webView.visibility = View.INVISIBLE
+                    recordRuntimeEvent("jinhak-v0166-protected-core-handoff", JSONObject()
                         .put("sourceSafePath", runtimeSafePath(url))
                         .put("coreSafePath", runtimeSafePath(high3Core))
-                        .put("handoff", jinhakV0912ProtectedCoreHandoffs))
+                        .put("handoff", jinhakV0912ProtectedCoreHandoffs)
+                        .put("lowerGradeFollowed", false))
                     webView.loadUrl(high3Core)
-                    handler.postDelayed({
-                        if (provider == ProviderId.JINHAK && jinhakAuthCompatibilityWindowActive()) {
-                            scheduleJinhakLoginRecovery("v0912-authenticated-handoff")
-                        }
-                    }, 320L)
                 }
             } else {
-                // Keep the real Jinhak login route intact. Only the lower-grade selector is hidden.
-                installJinhakHigh3DomProductFence("v0912-passive-login-visual-fence")
-                scheduleLoginSurfaceDetection(ProviderId.JINHAK, "v0912-passive-login")
-                scheduleJinhakLoginRecovery("v0912-passive-login-wait")
+                webView.visibility = View.VISIBLE
+                installJinhakHigh3DomProductFence("v0166-shared-login-visual-fence")
+                scheduleLoginSurfaceDetection(ProviderId.JINHAK, "v0166-shared-login")
+                scheduleJinhakLoginRecovery("v0166-shared-login-wait")
             }
         }
         return true
@@ -2960,23 +3028,11 @@ class MainActivity : Activity() {
 
     private fun recoverJinhakLowerGradeLoginContext(source: String, detail: JSONObject = JSONObject()) {
         if (provider != ProviderId.JINHAK) return
-        if (jinhakAuthCompatibilityWindowActive()) {
-            // Authentication transitions are handled by the v0.9.12 compatibility path above.
-            handleJinhakV0912AuthCompatibilityPage(webView.url.orEmpty())
-            return
+        val target = detail.optString("targetUrl").takeIf { it.isNotBlank() }
+            ?: webView.url.orEmpty()
+        if (JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
+            hardBlockJinhakLowerGradeNavigation(source, target)
         }
-        val high3Core = JinhakGradeRouteFence.protectedHigh3Core()
-        if (high3Core.isBlank()) return
-        jinhakLowerGradeNavigationsBlocked += 1
-        recordRuntimeEvent("jinhak-post-auth-lower-grade-fenced", JSONObject(detail.toString())
-            .put("source", source.take(80))
-            .put("high3CoreSafePath", runtimeSafePath(high3Core))
-            .put("authVerified", jinhakAuthVerifiedForBatch))
-        runCatching { webView.stopLoading() }
-        webView.visibility = View.INVISIBLE
-        handler.postDelayed({
-            if (provider == ProviderId.JINHAK) webView.loadUrl(high3Core)
-        }, 120L)
     }
 
     private fun verifyRecoveredJinhakHigh3AndResume(url: String): Boolean {
@@ -3968,6 +4024,10 @@ class MainActivity : Activity() {
         jinhakV0165ManualLoginWaits = 0
         jinhakV0165ManualLoginVerifiedHandoffs = 0
         jinhakV0165ProbeCompletedFromProtectedCore = 0
+        jinhakV0166LowerGradeRequestsIntercepted = 0
+        jinhakV0166LowerGradeNavigationsHardBlocked = 0
+        jinhakV0166LowerGradeRecoveryDispatches = 0
+        jinhakV0166LowerGradeRecoveryPending = false
         // Restore both domain leases at the same bootstrap point. WebView CookieManager is
         // domain-scoped, so restoring Jinhak readiness does not require navigating away from Adiga.
         // A restored lease is NOT treated as proof of server authentication; the Jinhak transition
@@ -4410,6 +4470,10 @@ class MainActivity : Activity() {
     private fun scheduleJinhakLoginRecovery(reason: String) {
         if (provider != ProviderId.JINHAK) return
         val v0165Current = webView.url.orEmpty()
+        if (JinhakGradeRouteFence.isBlockedLowerGrade(v0165Current)) {
+            hardBlockJinhakLowerGradeNavigation("login-recovery-entry", v0165Current)
+            return
+        }
         val v0165HasLocalCredential = credentialVault.load(ProviderId.JINHAK.wireName) != null
         if (isProviderLoginUrl(ProviderId.JINHAK, v0165Current) &&
             !v0165HasLocalCredential &&
@@ -4530,6 +4594,10 @@ class MainActivity : Activity() {
             return
         }
         val currentUrl = webView.url.orEmpty()
+        if (JinhakGradeRouteFence.isBlockedLowerGrade(currentUrl)) {
+            hardBlockJinhakLowerGradeNavigation("login-recovery-poll", currentUrl)
+            return
+        }
         if (isProviderLoginUrl(ProviderId.JINHAK, currentUrl)) {
             jinhakProtectedCoreStablePasses = 0
             if (jinhakCoreBootstrapState !in setOf("login-route-wait", "transition-login-wait", "batch-login-route-wait", "keepalive-login-recovery")) {
@@ -4662,7 +4730,7 @@ class MainActivity : Activity() {
         }
         handler.postDelayed({
             if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK) return@postDelayed
-            if (!retry.isNullOrBlank() && isProviderUrl(retry)) webView.loadUrl(retry)
+            if (!retry.isNullOrBlank() && isProviderUrl(retry) && !JinhakGradeRouteFence.isBlockedLowerGrade(retry)) webView.loadUrl(retry)
             else loadNextBatchPage()
         }, 180L)
     }
@@ -8379,6 +8447,10 @@ class MainActivity : Activity() {
                     .put("jinhakV0165ManualLoginWaits", jinhakV0165ManualLoginWaits)
                     .put("jinhakV0165ManualLoginVerifiedHandoffs", jinhakV0165ManualLoginVerifiedHandoffs)
                     .put("jinhakV0165ProbeCompletedFromProtectedCore", jinhakV0165ProbeCompletedFromProtectedCore)
+                    .put("jinhakV0166LowerGradeRequestsIntercepted", jinhakV0166LowerGradeRequestsIntercepted)
+                    .put("jinhakV0166LowerGradeNavigationsHardBlocked", jinhakV0166LowerGradeNavigationsHardBlocked)
+                    .put("jinhakV0166LowerGradeRecoveryDispatches", jinhakV0166LowerGradeRecoveryDispatches)
+                    .put("jinhakV0166LowerGradeRecoveryPending", jinhakV0166LowerGradeRecoveryPending)
                         .put("jinhakPostMissionClosureFences", jinhakPostMissionClosureFences)
                         .put("jinhakLoginRecoveryTimeoutMs", JINHAK_LOGIN_RECOVERY_TIMEOUT_MS)
                         .put("jinhakLoginRecoveryMaxPolls", MAX_JINHAK_LOGIN_RECOVERY_POLLS)
@@ -8727,7 +8799,13 @@ class MainActivity : Activity() {
 
     private fun isJinhakDefaultCoreQueueUrl(url: String): Boolean {
         if (provider != ProviderId.JINHAK) return true
-        val allowed = JinhakSiteTopology.isDefaultSusiCoreTraversalUrl(url)
+        if (JinhakGradeRouteFence.isBlockedLowerGrade(url)) {
+            recordJinhakCoreScopeBlock(url)
+            return false
+        }
+        val lane = JinhakSiteTopology.lane(url)
+        val allowed = JinhakSiteTopology.isDefaultSusiCoreTraversalUrl(url) ||
+            (JinhakGradeRouteFence.isHigh3(url) && lane == com.admissionhub.collector.jinhak.JinhakMissionLane.UNKNOWN)
         if (!allowed) recordJinhakCoreScopeBlock(url)
         return allowed
     }
