@@ -318,6 +318,10 @@ class MainActivity : Activity() {
     private var jinhakDomLowerGradeBlocks = 0
     private var jinhakLowerGradeLoginTerminalStops = 0
     private var jinhakLowerGradeLoginFenceLatched = false
+    private var jinhakLowerGradeHigh3RecoveryAttempts = 0
+    private var jinhakLowerGradeHigh3RecoverySuccesses = 0
+    private var jinhakLowerGradeRecoveryInFlight = false
+    private var jinhakLowerGradeManualGateActive = false
     private var jinhakPostMissionClosureFences = 0
     private var jinhakStallWatchdogGeneration = 0
     private var jinhakConsecutiveStalls = 0
@@ -468,6 +472,8 @@ class MainActivity : Activity() {
         private const val JINHAK_LOGIN_RECOVERY_TIMEOUT_MS = 60_000L
         private const val MAX_JINHAK_LOGIN_RECOVERY_POLLS = 40
         private const val MAX_JINHAK_REAUTH_CYCLES = 3
+        private const val MAX_JINHAK_LOWER_GRADE_HIGH3_RECOVERIES = 2
+        private const val JINHAK_LOWER_GRADE_RECOVERY_DELAY_MS = 450L
         private const val MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS = 2
         private const val MAX_JINHAK_CONSECUTIVE_STALLS = 4
         private const val MAX_JINHAK_GENERIC_ACTIONS = 180
@@ -502,8 +508,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.16.2"
-        private const val BUILD_CODE = 116200
+        private const val VERSION = "0.16.3"
+        private const val BUILD_CODE = 116300
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -1407,7 +1413,7 @@ class MainActivity : Activity() {
                         .put("currentSafePath", runtimeSafePath(view.url.orEmpty()))
                         .put("high3CoreSafePath", runtimeSafePath(JinhakGradeRouteFence.protectedHigh3Core())))
                     if (jinhakLowerGradeAuthFenceShouldTerminate()) {
-                        terminateJinhakLowerGradeLoginLoop("lower-grade-navigation", JSONObject().put("targetSafePath", runtimeSafePath(target)))
+                        recoverJinhakLowerGradeLoginContext("lower-grade-navigation", JSONObject().put("targetSafePath", runtimeSafePath(target)))
                     } else {
                         status.text = "진학사 고1·고2 화면 이동 차단 · 현재 고3 세션을 유지합니다."
                     }
@@ -1436,7 +1442,7 @@ class MainActivity : Activity() {
                         .put("targetSafePath", runtimeSafePath(url))
                         .put("high3CoreSafePath", runtimeSafePath(JinhakGradeRouteFence.protectedHigh3Core())))
                     if (jinhakLowerGradeAuthFenceShouldTerminate()) {
-                        terminateJinhakLowerGradeLoginLoop("lower-grade-redirect", JSONObject().put("targetSafePath", runtimeSafePath(url)))
+                        recoverJinhakLowerGradeLoginContext("lower-grade-redirect", JSONObject().put("targetSafePath", runtimeSafePath(url)))
                     } else {
                         status.text = "진학사 고1·고2 리다이렉트 차단 · 해당 페이지를 열지 않고 현재 고3 세션을 유지합니다."
                     }
@@ -1460,6 +1466,9 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
+                if (provider == ProviderId.JINHAK && verifyRecoveredJinhakHigh3AndResume(url)) {
+                    return
+                }
                 if (provider == ProviderId.JINHAK) {
                     installJinhakHigh3DomProductFence("page-finished")
                     // Product verification is asynchronous. Do not launch a competing login probe
@@ -2879,61 +2888,153 @@ class MainActivity : Activity() {
             (unifiedRunning && unifiedPhase == "jinhak" && !jinhakAuthVerifiedForBatch)
     }
 
-    private fun terminateJinhakLowerGradeLoginLoop(source: String, detail: JSONObject = JSONObject()) {
-        if (provider != ProviderId.JINHAK || jinhakLowerGradeLoginFenceLatched) return
-        jinhakLowerGradeLoginFenceLatched = true
-        jinhakLowerGradeLoginTerminalStops += 1
+    private fun recoverJinhakLowerGradeLoginContext(source: String, detail: JSONObject = JSONObject()) {
+        if (provider != ProviderId.JINHAK) return
+        if (jinhakLowerGradeRecoveryInFlight) return
 
-        // Cancel every producer that can reopen/poll the login route. This is intentionally
-        // terminal for the current Jinhak phase; the next explicit unified run resets the latch.
-        ++credentialLoginSurfaceGeneration
-        ++jinhakLoginRecoveryGeneration
-        ++startupLoginPollGeneration
-        ++jinhakRealAuthProbeGeneration
-        credentialAutoLoginInFlight = false
-        credentialAwaitingLoginExitProvider = null
-        jinhakTransitionAuthGateActive = false
-        startupLoginPreflightActive = false
-        startupLoginPreflightVerified = false
-        jinhakRealAuthProbeActive = false
-        unifiedPendingJinhakStart = false
-        batchPausedForLogin = false
+        val high3Core = JinhakGradeRouteFence.protectedHigh3Core()
+        val canAutoRecover = high3Core.isNotBlank() &&
+            jinhakLowerGradeHigh3RecoveryAttempts < MAX_JINHAK_LOWER_GRADE_HIGH3_RECOVERIES
+
+        if (canAutoRecover) {
+            jinhakLowerGradeHigh3RecoveryAttempts += 1
+            val attempt = jinhakLowerGradeHigh3RecoveryAttempts
+            jinhakLowerGradeRecoveryInFlight = true
+            jinhakLowerGradeLoginFenceLatched = true
+
+            // Cancel only the competing login callbacks. Do NOT terminate the batch/unified phase.
+            ++credentialLoginSurfaceGeneration
+            ++jinhakLoginRecoveryGeneration
+            credentialAutoLoginInFlight = false
+            credentialAwaitingLoginExitProvider = null
+            jinhakAuthVerifiedForBatch = false
+            jinhakCoreBootstrapState = "lower-grade-high3-recovery"
+            jinhakLastAuthEvidence = "lower-grade-login-context-blocked-recovering"
+            if (batchRunning) batchPausedForLogin = true
+
+            runCatching { webView.stopLoading() }
+            webView.visibility = View.INVISIBLE
+            val event = JSONObject(detail.toString())
+                .put("source", source.take(80))
+                .put("attempt", attempt)
+                .put("maxAttempts", MAX_JINHAK_LOWER_GRADE_HIGH3_RECOVERIES)
+                .put("high3CoreSafePath", runtimeSafePath(high3Core))
+                .put("jinhakPhaseTerminated", false)
+                .put("retrySuppressed", false)
+                .put("adigaOfficialEvidencePreserved", true)
+                .put("probabilityInferred", false)
+            batchErrors.put(JSONObject(event.toString()).put("type", "jinhak-lower-grade-high3-recovery"))
+            recordRuntimeEvent("jinhak-lower-grade-high3-recovery", event)
+            unifiedSessionId?.let { sessionId ->
+                localStore.recordSyncState(
+                    sessionId,
+                    "JINHAK_LOWER_GRADE_HIGH3_RECOVERY",
+                    ProviderId.JINHAK.wireName,
+                    JSONObject(event.toString()).put("nextAction", "reload-protected-high3-core-and-resume-auth"),
+                    false
+                )
+            }
+            sessionState.text = "○ 진학사 고1·2 차단 · 고3·N수 보호경로 복구 $attempt/$MAX_JINHAK_LOWER_GRADE_HIGH3_RECOVERIES"
+            status.text = "고1·2 로그인 컨텍스트를 닫고 진학사 고3·N수 보호경로로 즉시 복귀합니다. 인증되면 같은 수집 target을 자동 재개합니다."
+            handler.postDelayed({
+                if (provider != ProviderId.JINHAK) return@postDelayed
+                jinhakLowerGradeLoginFenceLatched = false
+                jinhakLowerGradeRecoveryInFlight = false
+                webView.visibility = View.INVISIBLE
+                webView.loadUrl(high3Core)
+            }, JINHAK_LOWER_GRADE_RECOVERY_DELAY_MS)
+            return
+        }
+
+        // Automatic high3 bounce was exhausted. Keep the integrated Jinhak phase alive and expose
+        // only the high3/N수 login surface. This is a user/credential gate, not a terminal state.
+        jinhakLowerGradeManualGateActive = true
+        jinhakLowerGradeLoginFenceLatched = false
+        jinhakLowerGradeRecoveryInFlight = false
         jinhakAuthVerifiedForBatch = false
-        jinhakCoreBootstrapState = "lower-grade-login-terminal-fence"
-        jinhakLastAuthEvidence = "lower-grade-login-context-blocked"
-
-        runCatching { webView.stopLoading() }
-        runCatching { webView.loadUrl("about:blank") }
-        webView.visibility = View.VISIBLE
-        if (::unifiedButton.isInitialized) unifiedButton.isEnabled = true
-
+        jinhakCoreBootstrapState = "high3-login-gate"
+        jinhakLastAuthEvidence = "high3-login-required-after-lower-grade-block"
+        if (batchRunning) batchPausedForLogin = true
         val event = JSONObject(detail.toString())
             .put("source", source.take(80))
-            .put("retrySuppressed", true)
-            .put("loginPageReopenAllowed", false)
+            .put("automaticRecoveriesExhausted", jinhakLowerGradeHigh3RecoveryAttempts)
+            .put("manualHigh3Gate", true)
+            .put("jinhakPhaseTerminated", false)
             .put("adigaOfficialEvidencePreserved", true)
-            .put("jinhakPromotedToOfficial", false)
             .put("probabilityInferred", false)
-        batchErrors.put(JSONObject(event.toString()).put("type", "jinhak-lower-grade-login-terminal-fence"))
-        recordRuntimeEvent("jinhak-lower-grade-login-terminal-fence", event)
+        recordRuntimeEvent("jinhak-high3-login-gate", event)
         unifiedSessionId?.let { sessionId ->
             localStore.recordSyncState(
                 sessionId,
-                "JINHAK_LOWER_GRADE_LOGIN_FENCED",
+                "JINHAK_HIGH3_LOGIN_GATE",
                 ProviderId.JINHAK.wireName,
-                JSONObject(event.toString())
-                    .put("terminalStops", jinhakLowerGradeLoginTerminalStops)
-                    .put("nextAction", "finish-jinhak-phase-without-login-retry"),
-                true
+                JSONObject(event.toString()).put("nextAction", "authenticate-on-high3-login-then-resume-crawl"),
+                false
             )
         }
-        sessionState.text = "△ 진학사 고1·2 로그인 차단 · 진학사 단계 종료"
-        status.text = "고1·2 로그인 컨텍스트를 감지해 해당 페이지 재진입을 중단했습니다. 진학사 재시도 없이 어디가 공식자료·저장된 근거 분석을 계속합니다."
-
-        when {
-            batchRunning -> handler.post { if (batchRunning) finishBatch("jinhak-lower-grade-login-fenced") }
-            unifiedRunning && unifiedPhase == "jinhak" -> handler.post { finishUnifiedCollection("jinhak-lower-grade-login-fenced") }
+        sessionState.text = "○ 진학사 고3·N수 로그인 필요 · 수집 target 보존"
+        status.text = "고1·2 이동은 차단했습니다. 진학사 단계는 종료하지 않습니다. 고3·N수 로그인 인증이 끝나면 같은 수집 단계로 자동 복귀합니다."
+        // The common login surface is allowed only with the lower-grade selector hidden. If the
+        // current page is not the shared login surface, bounce once more through the protected core.
+        val current = webView.url.orEmpty()
+        if (isProviderLoginUrl(ProviderId.JINHAK, current)) {
+            installJinhakHigh3DomProductFence("manual-high3-gate")
+            if (credentialVault.has(ProviderId.JINHAK.wireName)) {
+                handler.postDelayed({
+                    if (provider == ProviderId.JINHAK && jinhakLowerGradeManualGateActive) {
+                        attemptSavedCredentialLogin(ProviderId.JINHAK, "manual-high3-gate")
+                    }
+                }, 850L)
+            }
+        } else if (high3Core.isNotBlank()) {
+            webView.visibility = View.INVISIBLE
+            handler.postDelayed({
+                if (provider == ProviderId.JINHAK && jinhakLowerGradeManualGateActive) webView.loadUrl(high3Core)
+            }, 350L)
         }
+    }
+
+    private fun verifyRecoveredJinhakHigh3AndResume(url: String): Boolean {
+        if (provider != ProviderId.JINHAK || !JinhakGradeRouteFence.isHigh3(url)) return false
+        if (jinhakLowerGradeHigh3RecoveryAttempts <= 0 && !jinhakLowerGradeManualGateActive) return false
+        val expectedUrl = url
+        checkSessionState { needsLogin, authenticated ->
+            if (provider != ProviderId.JINHAK || webView.url.orEmpty() != expectedUrl) return@checkSessionState
+            if (!needsLogin && authenticated) {
+                jinhakLowerGradeHigh3RecoverySuccesses += 1
+                jinhakLowerGradeRecoveryInFlight = false
+                jinhakLowerGradeManualGateActive = false
+                jinhakLowerGradeLoginFenceLatched = false
+                jinhakAuthVerifiedForBatch = true
+                jinhakCoreBootstrapState = "protected-core-verified-after-lower-grade-recovery"
+                jinhakLastAuthEvidence = "protected-core-stable-after-lower-grade-recovery"
+                jinhakLastCoreVerifiedAtMs = System.currentTimeMillis()
+                runCatching { sessionVault.captureAuthenticated(ProviderId.JINHAK.wireName, url, VERSION) }
+                recordRuntimeEvent("jinhak-lower-grade-high3-recovery-success", JSONObject()
+                    .put("attempts", jinhakLowerGradeHigh3RecoveryAttempts)
+                    .put("batchRunning", batchRunning)
+                    .put("transitionGate", jinhakTransitionAuthGateActive))
+                sessionState.text = "● 진학사 고3·N수 인증 복구 · 수집 재개"
+                when {
+                    batchRunning && batchPausedForLogin -> resumeBatchAfterVerifiedJinhakAuth("lower-grade-high3-recovered")
+                    unifiedRunning && unifiedPhase == "jinhak" && jinhakTransitionAuthGateActive && !batchRunning -> {
+                        jinhakTransitionAuthGateActive = false
+                        unifiedPendingJinhakStart = false
+                        status.text = "진학사 고3·N수 인증 복구 완료 · 진학사 수집 엔진을 시작합니다."
+                        handler.postDelayed({
+                            if (unifiedRunning && unifiedPhase == "jinhak" && !batchRunning) startBatch()
+                        }, 220L)
+                    }
+                    startupLoginPreflightActive -> onStartupProviderAuthenticated(ProviderId.JINHAK, startupLoginPollGeneration)
+                    else -> status.text = "진학사 고3·N수 인증이 복구되었습니다."
+                }
+            } else {
+                jinhakCoreBootstrapState = "high3-recovery-auth-required"
+                jinhakLastAuthEvidence = "high3-protected-route-still-requires-login"
+                status.text = "고3·N수 보호경로가 아직 로그인을 요구합니다. 고1·2는 차단한 채 고3·N수 인증만 계속합니다."
+            }
+        }
+        return true
     }
 
     private fun installJinhakHigh3DomProductFence(reason: String) {
@@ -2993,11 +3094,18 @@ class MainActivity : Activity() {
             } else if (isProviderLoginUrl(ProviderId.JINHAK, currentUrl)) {
                 if (result.optBoolean("safeHigh3", false)) {
                     webView.visibility = View.VISIBLE
-                    status.text = "진학사 고3·N수 로그인 컨텍스트 확인 완료 · 자동 로그인을 계속합니다."
+                    status.text = "진학사 고3·N수 로그인 컨텍스트 확인 완료 · 인증 후 수집을 자동 재개합니다."
+                    if (jinhakLowerGradeManualGateActive && credentialVault.has(ProviderId.JINHAK.wireName)) {
+                        handler.postDelayed({
+                            if (provider == ProviderId.JINHAK && jinhakLowerGradeManualGateActive) {
+                                attemptSavedCredentialLogin(ProviderId.JINHAK, "safe-high3-login-gate")
+                            }
+                        }, 180L)
+                    }
                 } else {
                     webView.visibility = View.INVISIBLE
-                    status.text = "진학사 고1·2 로그인 컨텍스트 차단 · 해당 로그인 페이지 재시도를 중단합니다."
-                    terminateJinhakLowerGradeLoginLoop(
+                    status.text = "진학사 고1·2 로그인 컨텍스트 차단 · 고3·N수 인증 경로로 복구합니다."
+                    recoverJinhakLowerGradeLoginContext(
                         "unsafe-login-dom",
                         JSONObject(result.toString()).put("currentSafePath", runtimeSafePath(currentUrl))
                     )
@@ -3765,6 +3873,10 @@ class MainActivity : Activity() {
         }
         jinhakLowerGradeLoginFenceLatched = false
         jinhakLowerGradeLoginTerminalStops = 0
+        jinhakLowerGradeHigh3RecoveryAttempts = 0
+        jinhakLowerGradeHigh3RecoverySuccesses = 0
+        jinhakLowerGradeRecoveryInFlight = false
+        jinhakLowerGradeManualGateActive = false
         // Restore both domain leases at the same bootstrap point. WebView CookieManager is
         // domain-scoped, so restoring Jinhak readiness does not require navigating away from Adiga.
         // A restored lease is NOT treated as proof of server authentication; the Jinhak transition
@@ -4214,7 +4326,11 @@ class MainActivity : Activity() {
                 .put("reason", reason.take(80))
                 .put("reauthCycles", jinhakReauthCycles)
                 .put("maxReauthCycles", MAX_JINHAK_REAUTH_CYCLES)
-                .put("lowerGradeNavigationsBlocked", jinhakLowerGradeNavigationsBlocked))
+                .put("lowerGradeNavigationsBlocked", jinhakLowerGradeNavigationsBlocked)
+                        .put("lowerGradeHigh3RecoveryAttempts", jinhakLowerGradeHigh3RecoveryAttempts)
+                        .put("lowerGradeHigh3RecoverySuccesses", jinhakLowerGradeHigh3RecoverySuccesses)
+                        .put("lowerGradeRecoveryInFlight", jinhakLowerGradeRecoveryInFlight)
+                        .put("lowerGradeManualGateActive", jinhakLowerGradeManualGateActive))
             recordRuntimeEvent("jinhak-reauth-circuit-open", JSONObject()
                 .put("reason", reason.take(80))
                 .put("reauthCycles", jinhakReauthCycles)

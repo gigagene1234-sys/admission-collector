@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.16.2 Jinhak Fail-Closed"
+        android:label="Admission Hub v0.16.3 High3 Recover"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
