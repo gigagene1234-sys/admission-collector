@@ -1,0 +1,47 @@
+name: Apply Admission Hub v0.14.2 Unified Auto Patch
+
+on:
+  push:
+    branches: [codex/v0142-unified-auto-flow]
+    paths:
+      - ".github/workflows/apply-v0142.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0142-apply
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply bounded v0.14.2 patch
+        run: python3 .github/scripts/patch_v0142.py
+      - name: Verify intended product diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff -- app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+                     app/src/main/java/com/admissionhub/collector/score/ScoreReviewUi.kt \
+                     app/src/main/AndroidManifest.xml app/build.gradle.kts
+          test -z "$(git diff --name-only | grep -vE '^(app/src/main/java/com/admissionhub/collector/MainActivity.kt|app/src/main/java/com/admissionhub/collector/score/ScoreReviewUi.kt|app/src/main/AndroidManifest.xml|app/build.gradle.kts)$' || true)"
+      - name: Commit patched runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+                  app/src/main/java/com/admissionhub/collector/score/ScoreReviewUi.kt \
+                  app/src/main/AndroidManifest.xml app/build.gradle.kts
+          git diff --cached --quiet && { echo 'Expected patch produced no changes'; exit 1; }
+          git commit -m "feat: wire v0.14.2 auto-login and unified Excel flow"
+          git push origin HEAD:codex/v0142-unified-auto-flow
