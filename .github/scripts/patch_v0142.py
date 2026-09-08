@@ -9,7 +9,8 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 
 
 def regex_once(text: str, pattern: str, replacement: str, label: str) -> str:
-    out, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+    compiled = re.compile(pattern, re.S)
+    out, count = compiled.subn(lambda _match: replacement, text, count=1)
     assert count == 1, f"{label}: expected 1 regex match, found {count}"
     return out
 
@@ -206,11 +207,9 @@ main = regex_once(
     auto_login,
     'attemptSavedCredentialLogin'
 )
-# Runtime wording must reflect local encrypted credentials without implying they are exported.
 main = main.replace('.put("passwordStored", false)', '.put("passwordStored", credentialVault.has(ProviderId.ADIGA.wireName) || credentialVault.has(ProviderId.JINHAK.wireName))')
 main_path.write_text(main)
 
-# Route the normal score-import path into the one-screen automatic activity.
 score_path = root / 'score/ScoreReviewUi.kt'
 score = score_path.read_text()
 score = replace_once(
