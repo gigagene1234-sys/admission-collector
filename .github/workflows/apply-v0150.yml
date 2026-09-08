@@ -1,0 +1,50 @@
+name: Apply Admission Hub v0.15.0 Dual Auto Patch
+
+on:
+  push:
+    branches: [codex/v0150-dual-provider-score-link]
+    paths:
+      - ".github/workflows/apply-v0150.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0150-patch
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply bounded v0.15.0 source patch
+        run: python3 .github/scripts/patch_v0150.py
+      - name: Verify focused source diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          changed="$(git diff --name-only | sort)"
+          printf '%s\n' "$changed"
+          expected="$(printf '%s\n' \
+            app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+            app/src/main/java/com/admissionhub/collector/hub/HubDashboardModel.kt \
+            app/src/main/java/com/admissionhub/collector/score/UnifiedExcelScoreActivity.kt | sort)"
+          test "$changed" = "$expected"
+      - name: Commit product patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+                  app/src/main/java/com/admissionhub/collector/hub/HubDashboardModel.kt \
+                  app/src/main/java/com/admissionhub/collector/score/UnifiedExcelScoreActivity.kt
+          git diff --cached --quiet && { echo 'Expected v0.15 source patch produced no changes'; exit 1; }
+          git commit -m "feat: automate dual-provider collection and official score linking"
+          git push origin HEAD:codex/v0150-dual-provider-score-link
