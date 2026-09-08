@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.16.6 High3 Route Isolation"
+        android:label="Admission Hub v0.16.7 Direct High3 Auth"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
