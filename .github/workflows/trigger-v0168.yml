@@ -1,0 +1,12 @@
+name: Trigger v0.16.8 Build Release
+on:
+  push:
+    branches:
+      - codex/v0168-event-driven-jinhak-auth
+    paths:
+      - '.github/workflows/trigger-v0168.yml'
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'v0.16.8 workflow trigger marker'
