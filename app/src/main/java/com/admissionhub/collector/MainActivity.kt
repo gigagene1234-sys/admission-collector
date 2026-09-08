@@ -49,6 +49,7 @@ import com.admissionhub.collector.jinhak.JinhakMissionTargetLedger
 import com.admissionhub.collector.jinhak.JinhakMissionCoverageLedger
 import com.admissionhub.collector.jinhak.JinhakMissionCellSupervisor
 import com.admissionhub.collector.jinhak.JinhakAuthDomainPolicy
+import com.admissionhub.collector.jinhak.JinhakGradeRouteFence
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -379,6 +380,7 @@ class MainActivity : Activity() {
     private var jinhakSessionExtensionClicks = 0
     private var jinhakOriginInferredMissionTargets = 0
     private var jinhakExternalNavigationsBlocked = 0
+    private var jinhakLowerGradeNavigationsBlocked = 0
     private var jinhakBatchStartCount = 0
     private val jinhakNormalizedMissionSeedContexts = linkedMapOf<String, JinhakApplicationMission.Context>()
     private val jinhakNormalizedIdentitySeedKeys = linkedSetOf<String>()
@@ -493,8 +495,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.15.0"
-        private const val BUILD_CODE = 115000
+        private const val VERSION = "0.15.1"
+        private const val BUILD_CODE = 115100
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -1379,6 +1381,15 @@ class MainActivity : Activity() {
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val target = request.url?.toString().orEmpty()
+                if (target.isNotBlank() && jinhakHigh3FenceActive() && JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
+                    jinhakLowerGradeNavigationsBlocked += 1
+                    recordRuntimeEvent("jinhak-lower-grade-navigation-blocked", JSONObject()
+                        .put("targetSafePath", runtimeSafePath(target))
+                        .put("currentSafePath", runtimeSafePath(view.url.orEmpty()))
+                        .put("high3CoreSafePath", runtimeSafePath(JinhakGradeRouteFence.protectedHigh3Core())))
+                    status.text = "진학사 고1·고2 화면 이동 차단 · 고3 세션을 그대로 유지합니다."
+                    return true
+                }
                 if (batchRunning && provider == ProviderId.JINHAK && target.isNotBlank() && !ProviderRegistry.adapter(ProviderId.JINHAK).accepts(target)) {
                     jinhakExternalNavigationsBlocked += 1
                     recordRuntimeEvent("jinhak-external-navigation-blocked", JSONObject()
@@ -1391,6 +1402,21 @@ class MainActivity : Activity() {
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 runtimeLastSafePath = runtimeSafePath(url)
+                if (jinhakHigh3FenceActive() && JinhakGradeRouteFence.isBlockedLowerGrade(url)) {
+                    jinhakLowerGradeNavigationsBlocked += 1
+                    view.stopLoading()
+                    recordRuntimeEvent("jinhak-lower-grade-redirect-stopped", JSONObject()
+                        .put("targetSafePath", runtimeSafePath(url))
+                        .put("high3CoreSafePath", runtimeSafePath(JinhakGradeRouteFence.protectedHigh3Core())))
+                    status.text = "진학사 고1·고2 리다이렉트 차단 · 로그인 재시도 없이 고3 보호경로로 복귀합니다."
+                    val high3 = JinhakGradeRouteFence.protectedHigh3Core()
+                    if (high3.isNotBlank()) handler.postDelayed({
+                        if (jinhakHigh3FenceActive() && JinhakGradeRouteFence.isBlockedLowerGrade(webView.url.orEmpty())) {
+                            webView.loadUrl(high3)
+                        }
+                    }, 80L)
+                    return
+                }
                 if (jinhakRealAuthProbeActive && provider == ProviderId.JINHAK) {
                     noteJinhakRealAuthProbeRoute(url, "page-started")
                 }
@@ -1738,6 +1764,13 @@ class MainActivity : Activity() {
                 child.webViewClient = object : WebViewClient() {
                     private fun handoff(target: String): Boolean {
                         if (target.isBlank() || target == "about:blank") return false
+                        if (jinhakHigh3FenceActive() && JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
+                            jinhakLowerGradeNavigationsBlocked += 1
+                            recordRuntimeEvent("jinhak-popup-lower-grade-navigation-blocked", JSONObject()
+                                .put("targetSafePath", runtimeSafePath(target)))
+                            handler.post { destroyTransientPopup("lower-grade-blocked") }
+                            return true
+                        }
                         if (batchRunning && provider == ProviderId.JINHAK &&
                             !ProviderRegistry.adapter(ProviderId.JINHAK).accepts(target)) {
                             jinhakExternalNavigationsBlocked += 1
@@ -1804,6 +1837,9 @@ class MainActivity : Activity() {
             }
         }
     }
+
+    private fun jinhakHigh3FenceActive(): Boolean = provider == ProviderId.JINHAK &&
+        (unifiedRunning || batchRunning || startupLoginPreflightActive || jinhakTransitionAuthGateActive || jinhakRealAuthProbeActive)
 
     private fun currentAdapter(): ProviderAdapter = ProviderRegistry.adapter(provider)
 
@@ -3220,6 +3256,7 @@ class MainActivity : Activity() {
         jinhakSessionExtensionClicks = 0
         jinhakOriginInferredMissionTargets = 0
         jinhakExternalNavigationsBlocked = 0
+        jinhakLowerGradeNavigationsBlocked = 0
 
         // v0.9.2: restore the encrypted provider session bundles first. When both are
         // present, do not navigate through the login-preflight UI at all. Server-side
@@ -4883,6 +4920,7 @@ class MainActivity : Activity() {
                 .put("normalizedApplicationAmbiguousBindings", jinhakNormalizedAmbiguousBindings)
                         .put("originInferredMissionTargets", jinhakOriginInferredMissionTargets)
                         .put("externalNavigationsBlocked", jinhakExternalNavigationsBlocked)
+                        .put("lowerGradeNavigationsBlocked", jinhakLowerGradeNavigationsBlocked)
                 .put("jinhakBatchStartCount", jinhakBatchStartCount)
                 .put("applicationAnchorActionsParsed", jinhakMissionAnchorParsedKeys.size)
                 .put("applicationAnchorActionsAttempted", jinhakMissionAnchorActionsAttempted)
@@ -7872,12 +7910,14 @@ class MainActivity : Activity() {
                         .put("normalizedApplicationAmbiguousBindings", jinhakNormalizedAmbiguousBindings)
                         .put("originInferredMissionTargets", jinhakOriginInferredMissionTargets)
                         .put("externalNavigationsBlocked", jinhakExternalNavigationsBlocked)
+                        .put("lowerGradeNavigationsBlocked", jinhakLowerGradeNavigationsBlocked)
                         .put("jinhakBatchStartCount", jinhakBatchStartCount)
                 .put("normalizedApplicationIdentitySeeds", jinhakNormalizedIdentitySeedKeys.size)
                 .put("normalizedApplicationCandidateBindings", jinhakNormalizedCandidateBindingKeys.size)
                 .put("normalizedApplicationAmbiguousBindings", jinhakNormalizedAmbiguousBindings)
                         .put("originInferredMissionTargets", jinhakOriginInferredMissionTargets)
                         .put("externalNavigationsBlocked", jinhakExternalNavigationsBlocked)
+                        .put("lowerGradeNavigationsBlocked", jinhakLowerGradeNavigationsBlocked)
                 .put("jinhakBatchStartCount", jinhakBatchStartCount)
                         .put("applicationAnchorBindingSources", JSONObject(jinhakMissionBindingSourceCounts as Map<*, *>))
                         .put("applicationAnchorActionsParsed", jinhakMissionAnchorParsedKeys.size)
