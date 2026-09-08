@@ -59,13 +59,13 @@ object XlsxStudentScoreImport {
     data class Workbook(val sheets: List<Sheet>, val sharedStringCount: Int, val formulaCellCount: Int)
 
     private val aliases = mapOf(
-        Field.GRADE_YEAR to setOf("학년", "gradeyear", "year"),
-        Field.SEMESTER to setOf("학기", "semester", "term"),
+        Field.GRADE_YEAR to setOf("학년", "학년도", "학년학기", "gradeyear", "year"),
+        Field.SEMESTER to setOf("학기", "학년학기", "semester", "term"),
         Field.GROUP to setOf("교과", "교과군", "교과영역", "과목군", "group"),
-        Field.SUBJECT to setOf("과목", "과목명", "교과목", "교과목명", "subject"),
-        Field.GRADE to setOf("등급", "석차등급", "내신등급", "grade"),
-        Field.CREDITS to setOf("학점", "이수단위", "단위수", "이수학점", "credits", "credit"),
-        Field.ACHIEVEMENT to setOf("성취도", "성취수준", "achievement")
+        Field.SUBJECT to setOf("과목", "과목명", "교과목", "교과목명", "과목명칭", "subject"),
+        Field.GRADE to setOf("등급", "석차등급", "석차 등급", "내신등급", "등급(석차)", "grade"),
+        Field.CREDITS to setOf("학점", "이수단위", "단위수", "단위 수", "이수학점", "이수 학점", "credits", "credit"),
+        Field.ACHIEVEMENT to setOf("성취도", "성취수준", "성취 수준", "성취도(수강자수)", "achievement")
     )
 
     fun parse(bytes: ByteArray): Workbook {

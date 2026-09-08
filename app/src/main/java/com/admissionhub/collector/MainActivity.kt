@@ -35,6 +35,7 @@ import com.admissionhub.collector.cloud.CloudOffloadCoordinator
 import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.hub.HubDashboardModel
 import com.admissionhub.collector.score.ScoreReviewUi
+import com.admissionhub.collector.score.AdigaAutoScoreMaterializer
 import com.admissionhub.collector.hub.HubFirstLayoutPolicy
 import com.admissionhub.collector.observation.ObservationEvidence
 import com.admissionhub.collector.jinhak.JinhakCapabilityProbe
@@ -492,8 +493,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.14.2"
-        private const val BUILD_CODE = 114200
+        private const val VERSION = "0.15.0"
+        private const val BUILD_CODE = 115000
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -685,7 +686,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         unifiedButton = Button(this).apply {
-            text = "통합 동기화 시작"
+            text = "어디가 + 진학사 자동 수집"
             setOnClickListener {
                 when {
                     startupLoginPreflightActive -> cancelStartupLoginPreflight("user-cancel")
@@ -932,11 +933,12 @@ class MainActivity : Activity() {
         val age = sync.optLong("lastProgressAgeSeconds", -1L)
         val ageText = if (age >= 0 && age < 86_400) " · 마지막 진행 ${age}초 전" else ""
         val qualityText = buildString {
-            append("공식연결 ").append(summary.optInt("accepted", 0)).append("/6")
+            append("공식확인 ").append(summary.optInt("officialVerified", 0)).append("/6")
+            append(" · 직접결합 ").append(summary.optInt("directOfficialBound", 0)).append("/6")
             val provisional = summary.optInt("provisional", 0)
             val providerOnly = summary.optInt("providerOnly", 0)
-            if (provisional > 0) append(" · 확인필요 ").append(provisional)
-            if (providerOnly > 0) append(" · 공식결합없음 ").append(providerOnly)
+            if (provisional > 0) append(" · 구조확인 ").append(provisional)
+            if (providerOnly > 0) append(" · 공식근거부족 ").append(providerOnly)
         }
         hubDashboardStatus.text = "${sync.optString("stateLabel", "대기")} · ${sync.optString("progressText", "진행 수치 대기")}$ageText\n지원 6장 ${summary.optInt("resolvable", 0)}/6 · 핵심자료 ${summary.optInt("fullCoreCoverage", 0)}/6 · $qualityText"
         if (::hubDecisionSummary.isInitialized) {
@@ -1159,26 +1161,21 @@ class MainActivity : Activity() {
     }
 
     private fun startLaunchAwareCollection() {
-        // On app launch, six-slot Hub state is authoritative. Never silently spend another
-        // full 27-target run when the user has already fixed their six applications.
+        // v0.15.0: app launch always enters one dual-provider preflight. Existing WebView sessions
+        // are reused, but six-card coverage never suppresses Adiga/Jinhak freshness collection.
         when {
-            selectedSixRecoveryNeeded() -> startSelectedSixRecovery()
-            selectedSixAlreadyComplete() -> {
-                rebuildCanonicalHubFromLatestSessionIfReady("launch-six-complete")
-                openProvider(ProviderId.JINHAK)
-                status.text = "선택한 6장의 핵심 coverage가 완료되어 앱 시작 시 전체 재수집을 생략했습니다. 필요할 때 통합 수집 버튼으로 갱신하세요."
-            }
-            isFreshJinhakRealAuthProbe() -> startAutomaticLoginAndCollectionSequence("app-launch-restored-real-auth")
-            else -> startJinhakRealAuthProbe(autoContinue = true, trigger = "app-launch")
+            unifiedRunning || batchRunning || startupLoginPreflightActive -> Unit
+            else -> startAutomaticLoginAndCollectionSequence("app-launch-v0150-full-auto")
         }
     }
 
     private fun startPreferredHubCollection() {
-        if (selectedSixRecoveryNeeded()) {
-            startSelectedSixRecovery()
-        } else {
-            startUnifiedCollection()
-        }
+        if (unifiedRunning || batchRunning || startupLoginPreflightActive) return
+        // One button now owns both provider authentication checks and both provider collections.
+        // Selected-six recovery is performed by the resulting canonical/evidence materialization,
+        // not as a substitute for collecting a provider.
+        startupLoginPreflightVerified = false
+        startAutomaticLoginAndCollectionSequence("manual-v0150-full-auto")
     }
 
     private fun startSelectedSixRecovery() {
@@ -3261,7 +3258,7 @@ class MainActivity : Activity() {
         startupLoginStage = "cancelled"
         startupLoginOpenAttempted = false
         startupLoginPollGeneration += 1
-        unifiedButton.text = "통합 동기화 시작"
+        unifiedButton.text = "어디가 + 진학사 자동 수집"
         status.text = "로그인 상태 확인가 취소되었습니다. 다시 시작하면 어디가→진학사 로그인 확인 후 수집합니다."
         recordRuntimeEvent("startup-login-sequence-cancel", JSONObject().put("reason", reason.take(80)))
     }
@@ -4203,7 +4200,7 @@ class MainActivity : Activity() {
             ++jinhakAbsoluteTargetGeneration
 
             if (sessionId == null) {
-                unifiedButton.text = "통합 동기화 시작"
+                unifiedButton.text = "어디가 + 진학사 자동 수집"
                 status.text = "종료할 통합 수집 세션이 없습니다."
                 return
             }
@@ -4254,7 +4251,7 @@ class MainActivity : Activity() {
                 .put("fullExport", "Use JSON 저장; records are streamed from SQLite to the destination file.")
                 .toString(2)
             showPreview(lastJson)
-            unifiedButton.text = "통합 동기화 시작"
+            unifiedButton.text = "어디가 + 진학사 자동 수집"
             pendingUnifiedExportSessionId = sessionId
             cloudOffload.sendDiagnostic(
                 "unified", VERSION,
@@ -4266,6 +4263,11 @@ class MainActivity : Activity() {
             recordRuntimeEvent("unified-finish-memory-safe", JSONObject()
                 .put("reason", reason.take(120))
                 .put("sessionIdPresent", true))
+            if (sessionId != null) {
+                runCatching { localStore.rebuildCanonicalApplicationGraph(sessionId) }
+                runCatching { AdigaAutoScoreMaterializer.materializeSelected(localStore, sessionId) }
+                refreshHubDashboardFromStore("unified-finish-v0150-materialized")
+            }
             val hubAudit = summary.optJSONObject("canonicalHub")?.optJSONObject("qualityAudit") ?: JSONObject()
             val selected = hubAudit.optJSONObject("sixSlots")?.optInt("selected", 0) ?: 0
             val recoveryWasActive = selectedSixRecoveryMode || selectedSixRecoverySessionId == sessionId

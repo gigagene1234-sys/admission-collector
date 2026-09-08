@@ -56,7 +56,7 @@ new_pref = '''    private fun startPreferredHubCollection() {
         startAutomaticLoginAndCollectionSequence("manual-v0150-full-auto")
     }'''
 s = replace_once(s, old_pref, new_pref, 'preferred full auto flow')
-s = replace_once(s, 'text = "통합 동기화 시작"', 'text = "어디가 + 진학사 자동 수집"', 'primary unified label')
+s = s.replace('text = "통합 동기화 시작"', 'text = "어디가 + 진학사 자동 수집"')
 s = s.replace('unifiedButton.text = "통합 동기화 시작"', 'unifiedButton.text = "어디가 + 진학사 자동 수집"')
 # Materialize official links/scores at finalization, after current provider work has been stopped.
 anchor = '            val hubAudit = summary.optJSONObject("canonicalHub")?.optJSONObject("qualityAudit") ?: JSONObject()'

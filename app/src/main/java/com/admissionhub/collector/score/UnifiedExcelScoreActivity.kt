@@ -102,10 +102,14 @@ class UnifiedExcelScoreActivity : Activity() {
                     }
                     else -> throw IllegalArgumentException("실제 .xls 또는 .xlsx 형식이 아닙니다.")
                 }
-                autoRecognize(workbook)
+                runCatching { autoRecognize(workbook) }.getOrElse {
+                    val defaultYear = sessionId?.let { id -> store.loadCanonicalApplicationCandidates(id).optJSONObject(0)?.optInt("academicYear") }
+                        ?.takeIf { y -> y in 2000..2100 } ?: 2027
+                    FlexibleTranscriptExtractor.extract(workbook, defaultYear, false, fileName, sourceFormat)
+                }
             }
             runOnUiThread {
-                result.onSuccess { profile -> parsedProfile = profile; renderEditable(profile) }
+                result.onSuccess { profile -> parsedProfile = profile; persistDraft(profile); renderEditable(profile) }
                     .onFailure { renderRecognitionFailure(it.message ?: "학생부 표를 자동 인식하지 못했습니다.") }
             }
         }.start()
@@ -161,13 +165,27 @@ class UnifiedExcelScoreActivity : Activity() {
             ?: throw IllegalArgumentException("학년·학기·과목 열을 자동으로 확정하지 못했습니다. 고급 열 연결을 사용하면 직접 지정할 수 있습니다.")
     }
 
+    private fun persistDraft(profile: JSONObject) {
+        // Successful recognition is already an input operation. Save it immediately so returning to
+        // the Hub never shows 0 courses merely because the user has not scrolled to the final button.
+        runCatching {
+            profile.put("completeTranscriptConfirmedByUser", false)
+                .put("importState", "AUTO_RECOGNIZED_DRAFT")
+            store.saveStudentScoreImport(profile)
+            sessionId?.takeIf { it.isNotBlank() }?.let { sid ->
+                runCatching { store.rebuildCanonicalApplicationGraph(sid) }
+                runCatching { AdigaAutoScoreMaterializer.materializeSelected(store, sid, profile) }
+            }
+        }
+    }
+
     private fun renderEditable(profile: JSONObject) {
         root.removeAllViews(); rows.clear()
         title("학생부 자동 분석 · 입력")
         val subjects = profile.optJSONArray("subjects") ?: JSONArray()
         val average = if (profile.isNull("ownWeightedGrade")) "산출 대기" else String.format(Locale.US, "%.3f", profile.optDouble("ownWeightedGrade"))
         info("$fileName · $sourceFormat · ${profile.optString("xlsxSheetName")} · ${subjects.length()}과목 인식 · 등급 없음 ${profile.optInt("ungradedRows")}과목 · 현재 가중평균 $average")
-        info("아래 인식값 자체가 입력값입니다. 틀린 셀만 바로 수정한 뒤 맨 아래의 ‘저장 + 6장 통합 분석’을 누르세요.")
+        info("인식된 과목은 이미 학생부 입력 초안으로 저장되었습니다. 틀린 셀만 수정하고, 전체 과목 누락 여부를 확인한 뒤 ‘저장 + 6장 통합 분석’을 누르세요.")
 
         val defaultYear = profile.optInt("academicYear", 2027)
         yearEdit = labeledEdit("지원 학년도", defaultYear.toString(), true)

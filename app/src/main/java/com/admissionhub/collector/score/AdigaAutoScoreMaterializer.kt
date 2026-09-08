@@ -2,6 +2,7 @@ package com.admissionhub.collector.score
 
 import com.admissionhub.collector.canonical.AdigaApplicationEvidenceAnalyzer
 import com.admissionhub.collector.canonical.AdigaFullEvidenceRescan
+import com.admissionhub.collector.canonical.OfficialEvidenceAutoLinker
 import com.admissionhub.collector.local.LocalCollectorStore
 import org.json.JSONArray
 import org.json.JSONObject
@@ -15,6 +16,7 @@ object AdigaAutoScoreMaterializer {
 
     fun materializeSelected(store: LocalCollectorStore, sessionId: String, profile: JSONObject = store.currentStudentScoreProfile()): JSONObject {
         if (sessionId.isBlank()) return JSONObject().put("schemaVersion", SCHEMA_VERSION).put("error", "missing-session")
+        val relink = OfficialEvidenceAutoLinker.relinkSelected(store, sessionId)
         val candidates = store.loadCanonicalApplicationCandidates(sessionId)
         val byIdentity = (0 until candidates.length()).mapNotNull { candidates.optJSONObject(it) }
             .associateBy { it.optString("applicationIdentityKey") }
@@ -140,6 +142,7 @@ object AdigaAutoScoreMaterializer {
             .put("directHistoricalRowsFound", directHistoricalRowsFound)
             .put("historicalOutcomesStored", historicalOutcomesStored)
             .put("fullAdigaRecordsScanned", fullRescan.optInt("recordsScanned"))
+            .put("officialAutoRelink", relink)
             .put("results", results)
             .put("slotsMutated", false)
             .put("networkUsed", false)

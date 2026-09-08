@@ -42,9 +42,11 @@ object HubDashboardModel {
         val sync = buildSync(syncStatus, runtime)
         val selected = auditSlots.optInt("selected", cards.countOccupied())
         val resolvable = auditSlots.optInt("resolvable", cards.countResolvable())
-        val accepted = auditSlots.optInt("accepted", cards.countQuality("accepted"))
-        val provisional = auditSlots.optInt("provisional", cards.countQuality("provisional"))
-        val providerOnly = auditSlots.optInt("providerOnly", cards.countQuality("provider-only"))
+        val directOfficialBound = cards.countDirectOfficialBound()
+        val officialVerified = cards.countOfficialVerified()
+        val accepted = maxOf(auditSlots.optInt("accepted", 0), directOfficialBound)
+        val provisional = maxOf(auditSlots.optInt("provisional", 0), (officialVerified - directOfficialBound).coerceAtLeast(0))
+        val providerOnly = maxOf(auditSlots.optInt("providerOnly", 0), (selected - officialVerified).coerceAtLeast(0))
         val fullCoverage = auditSlots.optInt("fullCoreCoverage", cards.countFullCoverage())
         val scoreSummary = scoreDecisionSummary.optJSONObject("summary") ?: JSONObject()
 
@@ -60,6 +62,8 @@ object HubDashboardModel {
                 .put("accepted", accepted)
                 .put("provisional", provisional)
                 .put("providerOnly", providerOnly)
+                .put("officialVerified", officialVerified)
+                .put("directOfficialBound", directOfficialBound)
                 .put("fullCoreCoverage", fullCoverage)
                 .put("verifiedConversions", scoreSummary.optInt("verifiedConversions", 0))
                 .put("officialOutcomeAvailable", scoreSummary.optInt("officialOutcomeAvailable", 0))
@@ -246,6 +250,19 @@ object HubDashboardModel {
         "COMPLETE_WITH_WARNINGS" -> "완료 · 일부 오류 있음"
         "COMPLETE" -> "완료"
         else -> "대기"
+    }
+
+    private fun JSONArray.countOfficialVerified(): Int = (0 until length()).count { i ->
+        val card = optJSONObject(i) ?: return@count false
+        if (!card.optBoolean("occupied", false)) return@count false
+        val official = card.optJSONObject("officialEvidence") ?: return@count false
+        official.optBoolean("currentComponentsVerified", false) || official.optInt("currentApplicationBoundCount", 0) > 0
+    }
+
+    private fun JSONArray.countDirectOfficialBound(): Int = (0 until length()).count { i ->
+        val card = optJSONObject(i) ?: return@count false
+        if (!card.optBoolean("occupied", false)) return@count false
+        (card.optJSONObject("officialEvidence") ?: JSONObject()).optInt("currentApplicationBoundCount", 0) > 0
     }
 
     private fun JSONObject.nullableString(key: String): String? =
