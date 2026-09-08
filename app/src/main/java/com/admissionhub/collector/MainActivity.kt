@@ -1419,6 +1419,10 @@ class MainActivity : Activity() {
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 runtimeLastSafePath = runtimeSafePath(url)
+                if (jinhakHigh3FenceActive() && provider == ProviderId.JINHAK && isProviderLoginUrl(ProviderId.JINHAK, url)) {
+                    view.visibility = View.INVISIBLE
+                    status.text = "진학사 고3·N수 로그인 컨텍스트 확인 중 · 고1·2 화면은 표시하지 않습니다."
+                }
                 if (jinhakHigh3FenceActive() && JinhakGradeRouteFence.isBlockedLowerGrade(url)) {
                     jinhakLowerGradeNavigationsBlocked += 1
                     view.stopLoading()
@@ -2865,11 +2869,16 @@ class MainActivity : Activity() {
                 function enforce(source){
                   var els=all(), h=els.find(high), l=els.find(low), now=Date.now();
                   var lowActive=!!(l&&active(l)); var highActive=!!(h&&active(h));
+                  if(l){
+                    try{l.style.setProperty('display','none','important');}catch(e){}
+                    try{l.setAttribute('aria-hidden','true');l.setAttribute('tabindex','-1');}catch(e){}
+                  }
                   if(h&&l&&(lowActive||!highActive)&&(!window.__admissionHigh3LastClick||now-window.__admissionHigh3LastClick>1200)){
                     window.__admissionHigh3LastClick=now; try{h.click();}catch(e){}
-                    return {corrected:true,source:source,high:label(h).trim(),low:label(l).trim(),lowActive:lowActive,highActive:highActive};
+                    return {corrected:true,safeHigh3:false,source:source,highFound:true,lowFound:true,lowActive:lowActive,highActive:highActive};
                   }
-                  return {corrected:false,source:source,high:!!h,low:!!l,lowActive:lowActive,highActive:highActive};
+                  var safeHigh3=!l || (!!h&&highActive&&!lowActive);
+                  return {corrected:false,safeHigh3:safeHigh3,source:source,highFound:!!h,lowFound:!!l,lowActive:lowActive,highActive:highActive};
                 }
                 if(!window.__admissionHigh3FenceInstalled){
                   window.__admissionHigh3FenceInstalled=true;
@@ -2888,10 +2897,33 @@ class MainActivity : Activity() {
             val result = runCatching { JSONObject(decoded) }.getOrDefault(JSONObject())
             val blocked = result.optInt("blocked", 0)
             if (blocked > jinhakDomLowerGradeBlocks) jinhakDomLowerGradeBlocks = blocked
-            if (result.optBoolean("corrected", false)) {
+            val corrected = result.optBoolean("corrected", false)
+            val currentUrl = webView.url.orEmpty()
+            if (corrected) {
                 jinhakDomProductFenceCorrections += 1
+                webView.visibility = View.INVISIBLE
                 recordRuntimeEvent("jinhak-high3-dom-product-corrected", JSONObject(result.toString()).put("reason", reason))
-                status.text = "진학사 고1·2 제품 전환을 차단하고 고3·N수 컨텍스트를 복구했습니다."
+                status.text = "진학사 고1·2 컨텍스트를 표시하지 않고 고3·N수로 전환 확인 중입니다."
+                handler.postDelayed({
+                    if (provider == ProviderId.JINHAK && jinhakHigh3FenceActive()) {
+                        installJinhakHigh3DomProductFence("post-correction-confirm")
+                    }
+                }, 350L)
+            } else if (isProviderLoginUrl(ProviderId.JINHAK, currentUrl)) {
+                if (result.optBoolean("safeHigh3", false)) {
+                    webView.visibility = View.VISIBLE
+                    status.text = "진학사 고3·N수 로그인 컨텍스트 확인 완료 · 자동 로그인을 계속합니다."
+                } else {
+                    webView.visibility = View.INVISIBLE
+                    status.text = "진학사 고1·2 로그인 컨텍스트 차단 · 고3·N수 확인 전에는 로그인 화면을 표시하지 않습니다."
+                    handler.postDelayed({
+                        if (provider == ProviderId.JINHAK && jinhakHigh3FenceActive() && isProviderLoginUrl(ProviderId.JINHAK, webView.url.orEmpty())) {
+                            installJinhakHigh3DomProductFence("unsafe-login-recheck")
+                        }
+                    }, 500L)
+                }
+            } else if (!JinhakGradeRouteFence.isBlockedLowerGrade(currentUrl)) {
+                webView.visibility = View.VISIBLE
             }
         }
     }
@@ -2935,6 +2967,7 @@ class MainActivity : Activity() {
                 var pels=[];try{pels=Array.from(document.querySelectorAll('a,button,[role=tab],[role=button]'));}catch(e){}
                 var phigh=pels.find(function(el){var n=pnorm(plabel(el));return n.indexOf('고3')>=0&&(n.indexOf('n수')>=0||n.indexOf('재수')>=0||n==='고3');});
                 var plow=pels.find(function(el){var n=pnorm(plabel(el));return n==='고12'||n==='고1~2'||n.indexOf('고1고2')>=0||n.indexOf('고12학년')>=0;});
+                if(plow){try{plow.style.setProperty('display','none','important');plow.setAttribute('aria-hidden','true');plow.setAttribute('tabindex','-1');}catch(e){}}
                 var pnow=Date.now(), plast=0;try{plast=Number(sessionStorage.getItem('__admissionHigh3CredentialReadyAt')||0);}catch(e){}
                 if(phigh&&plow&&(!plast||pnow-plast>3000)){
                   try{sessionStorage.setItem('__admissionHigh3CredentialReadyAt',String(pnow));}catch(e){}
