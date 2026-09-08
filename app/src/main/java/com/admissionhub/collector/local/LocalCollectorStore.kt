@@ -1688,6 +1688,14 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
         writableDatabase.insertWithOnConflict("score_conversion_results", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
+    fun hasVerifiedNumericOfficialOutcome(applicationIdentityKey: String): Boolean {
+        if (applicationIdentityKey.isBlank()) return false
+        return readableDatabase.rawQuery(
+            "SELECT 1 FROM score_official_outcomes WHERE application_identity_key=? AND verified=1 AND metric_value IS NOT NULL LIMIT 1",
+            arrayOf(applicationIdentityKey)
+        ).use { it.moveToFirst() }
+    }
+
     fun storeOfficialAdmissionOutcome(
         applicationIdentityKey: String,
         academicYear: Int,

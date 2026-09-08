@@ -22,19 +22,13 @@ object OfficialPublishedOutcomeFallback {
         if (sessionId.isBlank() || candidates.isEmpty()) return JSONObject()
             .put("schemaVersion", SCHEMA_VERSION).put("matchedApplications", 0).put("storedRows", 0)
 
-        val summary = store.scoreDecisionSummary(sessionId).optJSONObject("byIdentity") ?: JSONObject()
         var matched = 0
         var stored = 0
         val results = JSONArray()
 
         for (candidate in candidates) {
             val identity = candidate.optString("applicationIdentityKey").takeIf { it.isNotBlank() } ?: continue
-            val existing = summary.optJSONObject(identity)?.optJSONArray("officialOutcomes") ?: JSONArray()
-            val hasVerifiedNumeric = (0 until existing.length()).any { i ->
-                val row = existing.optJSONObject(i)
-                row != null && row.optBoolean("verified", false) && row.has("metricValue") && !row.isNull("metricValue")
-            }
-            if (hasVerifiedNumeric) continue
+            if (store.hasVerifiedNumericOfficialOutcome(identity)) continue
 
             val university = normalize(candidate.optString("university"))
             val department = normalizeDepartment(candidate.optString("department"))
@@ -85,7 +79,7 @@ object OfficialPublishedOutcomeFallback {
                 }
 
                 (university.contains("한국교통") || university.contains("국립한국교통")) &&
-                    department == "철도차량시스템공학" && admission.contains("학생부종합2") -> {
+                    department in setOf("철도차량시스템공", "철도차량시스템공학") && admission.contains("학생부종합2") -> {
                     matched++
                     val source = "https://www.adiga.kr/ucp/uvt/uni/univDetailSelection.do?menuId=PCUVTINF2000&searchSyr=2026&unvCd=0000034"
                     val detail = JSONObject()
@@ -112,7 +106,7 @@ object OfficialPublishedOutcomeFallback {
                     save(2025, "최종등록자 70% 학생부등급", 4.25, "최종등록자 학생부등급", 9.0, "어디가 공식 · 국립한밭대 2025 입시결과", source, detail)
                 }
 
-                university.contains("한밭") && department == "반도체시스템공학" && admission.contains("지역인재교과") -> {
+                university.contains("한밭") && department in setOf("반도체시스템공", "반도체시스템공학") && admission.contains("지역인재교과") -> {
                     matched++
                     val source = "https://www.adiga.kr/ucp/uvt/uni/univDetailSelection.do?menuId=PCUVTINF2000&searchSyr=2026&unvCd=0000039"
                     val detail = JSONObject()
