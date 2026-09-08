@@ -9,9 +9,17 @@ import org.json.JSONObject
 /**
  * Rebuilds only evidence-backed score artifacts for the user's pinned six applications.
  * No slot is added, removed, reordered or replaced here.
+ *
+ * v0.15 separates two verification questions that had been incorrectly collapsed:
+ * - a current-year scoring formula may be applicable when the official admission component and
+ *   recruitment-unit component are separately verified for the same university/year, and
+ * - a historical outcome still requires exact application-bound table evidence.
+ *
+ * The first rule is used only for a deterministic calculator already encoded from official data.
+ * It never relaxes the historical outcome binding rule below.
  */
 object AdigaAutoScoreMaterializer {
-    const val SCHEMA_VERSION = 2
+    const val SCHEMA_VERSION = 3
 
     fun materializeSelected(store: LocalCollectorStore, sessionId: String, profile: JSONObject = store.currentStudentScoreProfile()): JSONObject {
         if (sessionId.isBlank()) return JSONObject().put("schemaVersion", SCHEMA_VERSION).put("error", "missing-session")
@@ -38,6 +46,7 @@ object AdigaAutoScoreMaterializer {
             val verified = calculated.optBoolean("verified", false) && calculated.optString("status") == "verified"
             val directIdentityBinding = official.optInt("currentApplicationBoundCount", 0) > 0
             val scoringScopeBinding = verified && official.optBoolean("currentComponentsVerified", false)
+            val conversionIdentityBinding = directIdentityBinding || scoringScopeBinding
             store.upsertUniversityConversionResult(
                 applicationIdentityKey = identity,
                 academicYear = candidate.optInt("academicYear"),
@@ -47,17 +56,20 @@ object AdigaAutoScoreMaterializer {
                 comparisonDirection = nullableString(calculated, "comparisonDirection"),
                 formulaSource = nullableString(calculated, "formulaSource"),
                 formulaVersion = nullableString(calculated, "formulaVersion"),
-                identityBindingVerified = directIdentityBinding,
+                identityBindingVerified = conversionIdentityBinding,
                 verified = verified,
                 status = calculated.optString("status", "unverified"),
                 detail = JSONObject(calculated.optJSONObject("detail")?.toString() ?: "{}")
                     .put("currentComponentsVerified", official.optBoolean("currentComponentsVerified", false))
                     .put("scoringScopeBindingVerified", scoringScopeBinding)
+                    .put("conversionIdentityBindingVerified", conversionIdentityBinding)
                     .put("directCurrentApplicationBinding", directIdentityBinding)
+                    .put("bindingSemantics", if (directIdentityBinding) "direct-current-application" else if (scoringScopeBinding) "same-university-year-official-components+verified-formula" else "unverified")
+                    .put("historicalBindingRelaxed", false)
                     .put("officialEvidenceCode", official.optString("code"))
                     .put("fullAdigaRescan", true)
             )
-            if (verified) conversionsVerified++ else conversionsHeld++
+            if (verified && conversionIdentityBinding) conversionsVerified++ else conversionsHeld++
 
             val fullEvidence = fullByIdentity.optJSONArray(identity) ?: JSONArray()
             val historical = JSONArray()
@@ -91,6 +103,8 @@ object AdigaAutoScoreMaterializer {
                     .put("waitlist", outcome.opt("waitlist") ?: JSONObject.NULL)
                     .put("rowEvidence", outcome.optString("rowEvidence").take(1400))
                     .put("headerEvidence", outcome.optString("headerEvidence").take(1000))
+                    .put("bindingMethod", outcome.optString("bindingMethod", "official-table-application-bound"))
+                    .put("bindingInferred", false)
 
                 fun save(metric: String, valueKey: String, scale: String, max: Double?) {
                     val value = nullableDouble(outcome, valueKey) ?: return
@@ -127,8 +141,9 @@ object AdigaAutoScoreMaterializer {
                 .put("currentComponentsVerified", official.optBoolean("currentComponentsVerified", false))
                 .put("directCurrentBinding", directIdentityBinding)
                 .put("scoringScopeBindingVerified", scoringScopeBinding)
+                .put("conversionIdentityBindingVerified", conversionIdentityBinding)
                 .put("conversionStatus", calculated.optString("status"))
-                .put("conversionVerified", verified)
+                .put("conversionVerified", verified && conversionIdentityBinding)
                 .put("historicalOutcomeRows", historical.length()))
         }
 
@@ -143,6 +158,7 @@ object AdigaAutoScoreMaterializer {
             .put("results", results)
             .put("slotsMutated", false)
             .put("networkUsed", false)
+            .put("historicalBindingRelaxed", false)
             .put("probabilityInferred", false)
     }
 
