@@ -1,0 +1,140 @@
+name: Build Admission Hub v0.15.0 Dual Auto
+
+on:
+  push:
+    branches: [codex/v0150-dual-provider-score-link]
+    paths-ignore:
+      - ".github/workflows/apply-v0150.yml"
+      - ".github/workflows/apply-v0150-metadata-fix.yml"
+      - ".github/scripts/patch_v0150.py"
+      - ".github/scripts/fix_v0150_metadata.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0150
+  cancel-in-progress: true
+
+jobs:
+  build-test-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.15.0-Dual-Auto.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify v0.15.0 product contracts
+        run: python3 .github/scripts/verify_v0150.py
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Test all application and regression contracts
+        run: gradle --no-daemon :app:testDebugUnitTest
+
+      - name: Compile signed product
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK package version label and stable signer
+        run: bash .github/scripts/verify_apk_v0150.sh
+
+      - name: Clean rebuild and retest exact committed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git reset --hard "$GITHUB_SHA"
+          python3 .github/scripts/verify_v0150.py
+          gradle --no-daemon clean :app:testDebugUnitTest :app:assembleDebug
+          bash .github/scripts/verify_apk_v0150.sh
+          git diff --exit-code
+
+      - name: Package APK and verification report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/$APK_NAME"
+          (cd dist && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          python3 - <<'PY'
+          import glob,json,os,xml.etree.ElementTree as E
+          suites=[E.parse(f).getroot() for f in glob.glob('app/build/test-results/testDebugUnitTest/TEST-*.xml')]
+          counts={k:sum(int(s.get(k,'0')) for s in suites) for k in ['tests','failures','errors','skipped']}
+          assert counts['tests']>=89, counts
+          assert counts['failures']==counts['errors']==counts['skipped']==0, counts
+          report={
+            'productCommit':os.environ['GITHUB_SHA'],
+            'versionName':'0.15.0','versionCode':115000,'tests':counts,
+            'signerSha256':'db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995',
+            'exactCommittedSourceRebuild':True,
+            'normalUserFlow':'one-button-provider-independent-auto',
+            'providerPageTraversal':'single-primary-webview-sequential',
+            'bothProviderLeaseRestoreAttemptedAtBootstrap':True,
+            'adigaBlockedByJinhakAuth':False,
+            'jinhakProtectedAuthRequiredBeforeJinhakOnly':True,
+            'credentialStorage':'android-keystore-aes-gcm-device-only',
+            'credentialExported':False,'sessionSecretExported':False,
+            'officialOutcomeAutoMaterialization':True,
+            'officialHistoricalIndexingWithoutStudentProfile':True,
+            'conversionScopeBinding':'direct-current-or-verified-official-components+verified-formula',
+            'historicalBindingRelaxed':False,
+            'historicalSameRowRequiresVerifiedHeaders':True,
+            'excelFormats':['xls-ole2-biff8','xlsx-ooxml'],
+            'excelRecognitionModes':['strict-column','explicit-korean-transcript-sections'],
+            'excelYearSemesterGuessing':False,
+            'blankGradePolicy':'preserve-null',
+            'transcriptCompletenessAutoAsserted':False,
+            'jinhakRequiredCoreLanes':['saved-application','current-prediction','mock-support','actual-admit','score-analysis','university-result'],
+            'probabilityInferred':False,
+            'deviceAcceptance':'pending-real-galaxy-dual-provider-login-and-actual-transcript-xls-xlsx'
+          }
+          open('dist/verification-v0.15.0.json','w').write(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+          print(json.dumps(report,ensure_ascii=False))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.15.0-dual-auto
+          path: |
+            dist/*
+            app/build/test-results/testDebugUnitTest/*.xml
+
+      - name: Publish verified v0.15.0 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view v0.15.0 >/dev/null 2>&1 && gh release delete v0.15.0 -y --cleanup-tag || true
+          gh release create v0.15.0 "dist/$APK_NAME" "dist/$APK_NAME.sha256" dist/verification-v0.15.0.json \
+            --target "$GITHUB_SHA" --title "Admission Hub v0.15.0 — Dual Auto + Official Evidence Repair" \
+            --notes-file docs/releases/v0.15.0.md
