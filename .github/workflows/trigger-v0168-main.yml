@@ -1,0 +1,17 @@
+name: Force Trigger v0.16.8 Release Pipeline
+on:
+  push:
+    branches:
+      - codex/v0168-event-driven-jinhak-auth
+    paths:
+      - '.github/workflows/trigger-v0168-main.yml'
+permissions:
+  contents: write
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/v0168-event-driven-jinhak-auth
+      - run: echo 'The primary v0.16.8 pipeline was created earlier and is independently triggered by its workflow-file commit.'
