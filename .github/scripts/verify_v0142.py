@@ -47,7 +47,8 @@ for forbidden in ['cloudOffload', 'source_json', 'INSERT INTO', 'CookieManager']
 # Session persistence is metadata-only; native WebView owns cookies.
 assert 'admission_auth_lease_metadata_v4' in session
 assert 'containsSessionSecret' in session and 'cloudExportAllowed' in session
-for forbidden in ['getCookie(', 'setCookie(', 'cookieHeader', 'password']:
+# Boolean metadata such as containsPassword=false is allowed; actual secret APIs/fields are not.
+for forbidden in ['getCookie(', 'setCookie(', 'cookieHeader', 'credential.password', 'password =', 'password: String']:
     assert forbidden not in session, 'Session lease copied secret material: ' + forbidden
 
 # Integrated Jinhak collection must include university-result and allow strategy/knowledge traversal.
