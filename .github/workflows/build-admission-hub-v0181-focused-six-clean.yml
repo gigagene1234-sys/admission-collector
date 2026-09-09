@@ -39,7 +39,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 .github/scripts/patch_v0181_focused_six.py
+          if python3 .github/scripts/verify_v0181_focused_six.py >/dev/null 2>&1; then
+            echo "v0.18.1 product patch already present; skipping patch application"
+          else
+            python3 .github/scripts/patch_v0181_focused_six.py
+          fi
           git diff --check
 
       - name: Verify v0.18.1 source contracts before commit
