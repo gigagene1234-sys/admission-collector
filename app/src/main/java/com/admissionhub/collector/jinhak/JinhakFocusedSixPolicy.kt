@@ -1,77 +1,36 @@
 package com.admissionhub.collector.jinhak
 
-import java.net.URI
-
 /**
- * v0.18.1 mission-scope policy.
+ * v0.19.0 collection-scope policy.
  *
- * Once the user has six pinned applications, Jinhak collection is not an open web crawl.
- * Only routes capable of supplying one of the six evidence lanes may enter the collector
- * frontier. Editorial/strategy/knowledge/reference pages are observation-only and never
- * become autonomous navigation targets during the six-application mission.
+ * The six pinned applications remain the local identity scope, but Jinhak live network collection
+ * no longer chases report/evidence lanes. It reads only the protected early-admission storage and
+ * periodically snapshots same-card competition data. Missing report lanes are therefore not a
+ * crawler error in this mode; they also are not silently treated as satisfied evidence.
  */
 object JinhakFocusedSixPolicy {
-    const val SCHEMA_VERSION = 1
+    const val SCHEMA_VERSION = 2
     const val REQUIRED_PINNED_APPLICATIONS = 6
     const val MAX_UNCHANGED_STATE_SNAPSHOTS = 2
 
-    val REQUIRED_LANES: Set<JinhakMissionLane> = setOf(
-        JinhakMissionLane.SAVED_APPLICATIONS,
-        JinhakMissionLane.CURRENT_PREDICTION,
-        JinhakMissionLane.MOCK_SUPPORT,
-        JinhakMissionLane.ACTUAL_ADMIT,
-        JinhakMissionLane.SCORE_ANALYSIS,
-        JinhakMissionLane.UNIVERSITY_RESULT
-    )
+    val REQUIRED_LANES: Set<JinhakMissionLane> = setOf(JinhakMissionLane.SAVED_APPLICATIONS)
 
-    private val suppressedPathFragments = listOf(
-        "/ipsi-analysis/ipsi-strategy",
-        "/ipsi-knowledge",
-        "/jinhak-tv",
-        "/curation",
-        "/susi-special",
-        "/major-deep-analysis",
-        "/ipsi-deep-analysis"
-    )
+    fun isFocusedCoreUrl(rawUrl: String, label: String = ""): Boolean =
+        JinhakStorageOnlyPolicy.isLibrary(rawUrl)
 
-    fun isFocusedCoreUrl(rawUrl: String, label: String = ""): Boolean {
-        if (rawUrl.isBlank()) return false
-        if (!JinhakStrictHigh3Sandbox.allowsCollectorNavigation(rawUrl)) return false
-        val path = runCatching { URI(rawUrl).path.orEmpty().lowercase() }.getOrDefault("")
-        if (suppressedPathFragments.any(path::contains)) return false
-        return JinhakSiteTopology.lane(rawUrl, label) in REQUIRED_LANES
-    }
-
-    fun shouldSuppressPageType(pageType: String): Boolean = pageType in setOf(
-        "jinhak-home",
-        "jinhak-other",
-        "jinhak-admission-strategy",
-        "jinhak-admission-knowledge",
-        "jinhak-admission-feature",
-        "jinhak-editorial-content",
-        "jinhak-media-content",
-        "jinhak-curation",
-        "jinhak-recommended-university"
-    )
+    fun shouldSuppressPageType(pageType: String): Boolean = pageType != "jinhak-early-storage"
 
     fun shouldAllowGenericNavigation(
         pinnedCount: Int,
         outstandingMissionTargets: Int,
         coreComplete: Boolean
-    ): Boolean {
-        if (pinnedCount >= REQUIRED_PINNED_APPLICATIONS) return false
-        return outstandingMissionTargets == 0 && coreComplete
-    }
+    ): Boolean = false
 
     fun shouldEscapeRepeatedState(
         repeatedCountForState: Int,
         pageType: String,
         hasOutstandingMission: Boolean
-    ): Boolean {
-        if (repeatedCountForState < MAX_UNCHANGED_STATE_SNAPSHOTS) return false
-        if (shouldSuppressPageType(pageType)) return true
-        return !hasOutstandingMission
-    }
+    ): Boolean = pageType != "jinhak-early-storage" && repeatedCountForState >= MAX_UNCHANGED_STATE_SNAPSHOTS
 
     fun pinnedIdentityKeys(slotRows: List<Pair<Boolean, String>>): Set<String> =
         slotRows.asSequence()
