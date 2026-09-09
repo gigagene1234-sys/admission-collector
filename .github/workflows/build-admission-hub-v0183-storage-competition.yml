@@ -5,6 +5,9 @@ on:
     branches: [codex/v0183-storage-only-competition-watch]
     paths:
       - ".github/workflows/build-admission-hub-v0183-storage-competition.yml"
+      - ".github/scripts/patch_v0183_storage_only_competition.py"
+      - ".github/scripts/verify_v0183_storage_only_competition.py"
+      - ".github/scripts/verify_apk_v0183.sh"
   workflow_dispatch:
 
 permissions:
