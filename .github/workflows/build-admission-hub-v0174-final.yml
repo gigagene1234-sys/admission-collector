@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-hub-v0174-final.yml"
       - ".github/scripts/patch_v0174_final.py"
+      - ".github/scripts/patch_v0174_final_safe.py"
       - ".github/scripts/verify_v0174_final.py"
       - "app/src/test/java/com/admissionhub/collector/jinhak/JinhakStrictHigh3SandboxFinalTest.kt"
       - "app/src/test/java/com/admissionhub/collector/jinhak/JinhakAuthEventStateTest.kt"
@@ -36,7 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 .github/scripts/patch_v0174_final.py
+          python3 .github/scripts/patch_v0174_final_safe.py
           git diff --check
 
       - name: Verify final source contracts
