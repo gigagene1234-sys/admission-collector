@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.17.5 Runtime-Stable High3 Sandbox"
+        android:label="Admission Hub v0.18.0 Dedicated Auto Login"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

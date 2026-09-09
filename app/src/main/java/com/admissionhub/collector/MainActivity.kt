@@ -59,6 +59,7 @@ import com.admissionhub.collector.jinhak.JinhakHigh3AuthRoute
 import com.admissionhub.collector.jinhak.JinhakAuthEventState
 import com.admissionhub.collector.jinhak.JinhakUserSessionPolicy
 import com.admissionhub.collector.jinhak.JinhakStrictHigh3Sandbox
+import com.admissionhub.collector.jinhak.JinhakDedicatedAuthPolicy
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -75,6 +76,8 @@ import java.util.ArrayDeque
 
 class MainActivity : Activity() {
     private lateinit var webView: WebView
+    private lateinit var authWebView: WebView
+    private lateinit var authHost: FrameLayout
     private lateinit var status: TextView
     private lateinit var sessionState: TextView
     private lateinit var preview: TextView
@@ -427,6 +430,20 @@ class MainActivity : Activity() {
     private var jinhakV0174MemberLoginAllows = 0
     private var jinhakV0174High3Allows = 0
     private var jinhakV0174ExplicitHigh3Confirmations = 0
+    private var jinhakV0180AuthState = "IDLE"
+    private var jinhakV0180AuthGeneration = 0
+    private var jinhakV0180AuthSubmitGeneration = -1
+    private var jinhakV0180AuthFillAttempt = 0
+    private var jinhakV0180AuthHigh3ProbeGeneration = -1
+    private var jinhakV0180AuthRendererRestarts = 0
+    private var jinhakV0180AuthSubmitAttempts = 0
+    private var jinhakV0180AuthSubmissions = 0
+    private var jinhakV0180AuthSuccesses = 0
+    private var jinhakV0180AuthFailures = 0
+    private var jinhakV0180CollectorLoginRouteLoads = 0
+    private var jinhakV0180LowerGradeBlocks = 0
+    private var jinhakV0180AuthLastReason = ""
+    private var jinhakV0180AuthLastSafePath = ""
     private var jinhakV0174StrictEntryRequests = 0
     private var jinhakV0174ForbiddenPageStartsStopped = 0
     private var jinhakV0174ForbiddenPageFinishesObserved = 0
@@ -529,6 +546,8 @@ class MainActivity : Activity() {
         private const val JINHAK_LOGIN_RECOVERY_TIMEOUT_MS = 60_000L
         private const val MAX_JINHAK_LOGIN_RECOVERY_POLLS = 40
         private const val MAX_JINHAK_REAUTH_CYCLES = 3
+        private const val V0180_AUTH_MAX_FILL_ATTEMPTS = 3
+        private const val V0180_AUTH_RENDERER_RESTART_LIMIT = 2
         private const val MAX_JINHAK_LOWER_GRADE_HIGH3_RECOVERIES = 2
         private const val JINHAK_LOWER_GRADE_RECOVERY_DELAY_MS = 450L
         private const val MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS = 2
@@ -565,8 +584,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.17.4"
-        private const val BUILD_CODE = 117400
+        private const val VERSION = "0.18.0"
+        private const val BUILD_CODE = 118000
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -601,6 +620,7 @@ class MainActivity : Activity() {
             }
         })
         configureWebView()
+        configureDedicatedJinhakAuthWebView()
         initializeProcessResumeJournal()
         restoreJinhakAuthProofCheckpoint("activity-create")
         val localDecision = localStore.localRebindDecision()
@@ -871,6 +891,15 @@ class MainActivity : Activity() {
         webView = WebView(this)
         webView.settings.useWideViewPort = true
         webView.settings.loadWithOverviewMode = false
+        authWebView = WebView(this)
+        authHost = FrameLayout(this).apply {
+            visibility = View.GONE
+            setBackgroundColor(android.graphics.Color.WHITE)
+            addView(authWebView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ))
+        }
         batchCover = TextView(this).apply {
             text = "수집 대기 중"
             gravity = Gravity.CENTER
@@ -892,6 +921,10 @@ class MainActivity : Activity() {
         }
         val browserStack = FrameLayout(this).apply {
             addView(webView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ))
+            addView(authHost, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             ))
@@ -1498,6 +1531,10 @@ class MainActivity : Activity() {
     private fun blockJinhakV0174MainFrame(source: String, target: String, decision: JinhakStrictHigh3Sandbox.MainFrameDecision) {
         if (provider != ProviderId.JINHAK) return
         noteJinhakV0174Decision(source, target, decision)
+        if (JinhakDedicatedAuthPolicy.isLoginSurface(target)) {
+            jinhakV0180CollectorLoginRouteLoads += 1
+            handler.post { startV0180DedicatedJinhakAuth("collector-route:$source") }
+        }
 
         // v0.17.5: strict route rejection and authentication are independent state machines.
         // Dropping high1/high2/shared/generic/external routes must not manufacture a logout,
@@ -1542,17 +1579,13 @@ class MainActivity : Activity() {
 
     private fun loadJinhakV0174SiteMemberLogin(target: String, source: String): Boolean {
         if (provider != ProviderId.JINHAK) return false
-        val decision = JinhakStrictHigh3Sandbox.decision(target)
-        if (decision != JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN) {
-            jinhakV0174AppNavigationBlocks += 1
-            blockJinhakV0174MainFrame("site-member-$source", target, decision)
-            return false
-        }
-        noteJinhakV0174Decision("site-member-$source", target, decision)
-        // This URL comes from a site popup/navigation event and has already passed the
-        // exact member host/path + high3 ReturnURL policy. The app never constructs it.
-        webView.loadUrl(target)
-        return true
+        jinhakV0180CollectorLoginRouteLoads += 1
+        recordRuntimeEvent(
+            "jinhak-v0180-login-rerouted-to-auth-webview",
+            JSONObject().put("source", source.take(80)).put("safePath", runtimeSafePath(target))
+        )
+        startV0180DedicatedJinhakAuth("site-member:$source")
+        return false
     }
 
     private fun loadJinhakV0174High3Only(target: String?, reason: String): Boolean {
@@ -1577,12 +1610,14 @@ class MainActivity : Activity() {
     private fun openJinhakV0174StrictEntry(reason: String) {
         if (provider != ProviderId.JINHAK) provider = ProviderId.JINHAK
         jinhakV0174StrictEntryRequests += 1
-        jinhakUserSessionConfirmed = false
-        jinhakAuthVerifiedForBatch = false
-        batchPausedForLogin = batchRunning
+        if (!jinhakUserSessionConfirmed || !jinhakAuthVerifiedForBatch) {
+            startV0180DedicatedJinhakAuth("strict-entry:$reason")
+            return
+        }
+        batchPausedForLogin = false
         loadJinhakV0174High3Only(JinhakStrictHigh3Sandbox.strictEntryUrl(), "strict-entry:$reason")
-        sessionState.text = "○ 진학사 고3 전용 진입"
-        status.text = "고3 전용 주소만 열었습니다. 로그인이 필요하면 진학사 서버가 정확한 회원 로그인 화면을 표시할 수 있으며, 공통 루트·고1·고2·고12·공용 로그인 라우터는 차단됩니다."
+        sessionState.text = "● 진학사 고3 전용 세션"
+        status.text = "고3 전용 수집 화면을 열었습니다."
     }
 
     private fun safeJinhakV0174Back() {
@@ -1660,6 +1695,13 @@ class MainActivity : Activity() {
                         return jinhakV0174BlockedResponse("lower-grade-any-request")
                     }
                     if (request.isForMainFrame) {
+                        if (JinhakDedicatedAuthPolicy.isLoginSurface(target)) {
+                            handler.post {
+                                jinhakV0180CollectorLoginRouteLoads += 1
+                                startV0180DedicatedJinhakAuth("collector-network-login")
+                            }
+                            return jinhakV0174BlockedResponse("dedicated-auth-route")
+                        }
                         val decision = JinhakStrictHigh3Sandbox.decision(target)
                         when (decision) {
                             JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3,
@@ -1686,6 +1728,11 @@ class MainActivity : Activity() {
                     return true
                 }
                 if (!request.isForMainFrame) return false
+                if (JinhakDedicatedAuthPolicy.isLoginSurface(target)) {
+                    jinhakV0180CollectorLoginRouteLoads += 1
+                    startV0180DedicatedJinhakAuth("collector-navigation-login")
+                    return true
+                }
                 val decision = JinhakStrictHigh3Sandbox.decision(target)
                 return when (decision) {
                     JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3,
@@ -1731,6 +1778,12 @@ class MainActivity : Activity() {
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 runtimeLastSafePath = runtimeSafePath(url)
                 if (provider == ProviderId.JINHAK) {
+                    if (JinhakDedicatedAuthPolicy.isLoginSurface(url)) {
+                        jinhakV0180CollectorLoginRouteLoads += 1
+                        runCatching { view.stopLoading() }
+                        startV0180DedicatedJinhakAuth("collector-page-started-login")
+                        return
+                    }
                     val decision = JinhakStrictHigh3Sandbox.decision(url)
                     when (decision) {
                         JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3 -> {
@@ -1768,6 +1821,11 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
                 if (provider == ProviderId.JINHAK) {
+                    if (JinhakDedicatedAuthPolicy.isLoginSurface(url)) {
+                        jinhakV0180CollectorLoginRouteLoads += 1
+                        startV0180DedicatedJinhakAuth("collector-page-finished-login")
+                        return
+                    }
                     val visible = webView.url.orEmpty()
                     if (JinhakUserSessionPolicy.shouldIgnoreStaleLoginCallback(url, visible)) {
                         jinhakV0173StaleLoginCallbacksIgnored += 1
@@ -3086,17 +3144,6 @@ class MainActivity : Activity() {
     }
 
     private fun showCredentialDialog(which: ProviderId, continueAfterSave: Boolean) {
-        if (which == ProviderId.JINHAK) {
-            startupCredentialPromptedProvider = ProviderId.JINHAK
-            jinhakV0168LegacyNavigationSuppressions += 1
-            credentialVault.clear(ProviderId.JINHAK.wireName)
-            val current = webView.url.orEmpty()
-            if (JinhakHigh3AuthRoute.isMemberLoginSurface(current) || JinhakHigh3AuthRoute.isGenericProductLogin(current)) {
-                markJinhakDirectAuthWait("v0170-collector-credential-dialog-disabled", current)
-            }
-            status.text = "v0.17.0은 진학사 Collector 계정 입력·저장을 사용하지 않습니다. 사이트 자체 로그인/Samsung Pass만 사용하세요."
-            return
-        }
         if (credentialAutoLoginInFlight) return
         val existing = credentialVault.load(which.wireName)
         val container = LinearLayout(this).apply {
@@ -3139,7 +3186,7 @@ class MainActivity : Activity() {
                 credentialVault.clear(which.wireName)
                 status.text = "저장 계정을 사용하지 않습니다. 현재 공식 사이트에서 직접 로그인하세요."
                 if (!continueAfterSave) {
-                    if (which == ProviderId.JINHAK) openJinhakV0174StrictEntry("credential-dialog-direct-login")
+                    if (which == ProviderId.JINHAK) startV0180DedicatedJinhakAuth("credential-dialog-direct-login", forceManual = true)
                     else loadMainUrl(providerLoginUrl(which))
                 }
             }
@@ -3332,18 +3379,15 @@ class MainActivity : Activity() {
     }
     private fun attemptSavedCredentialLoginV0912Baseline(reason: String) {
         if (provider != ProviderId.JINHAK) return
-        enterJinhakUserSessionGate("saved-credential-login-disabled:$reason")
+        startV0180DedicatedJinhakAuth("legacy-entry:$reason")
     }
     private fun attemptSavedCredentialLogin(which: ProviderId, reason: String) {
         if (which == ProviderId.JINHAK) {
-            if (provider == ProviderId.JINHAK) enterJinhakUserSessionGate("saved-credential-login-disabled:$reason")
+            provider = ProviderId.JINHAK
+            startV0180DedicatedJinhakAuth("saved-credential:$reason")
             return
         }
         if (provider != which) return
-        if (which == ProviderId.JINHAK) {
-            attemptSavedCredentialLoginV0912Baseline(reason)
-            return
-        }
         val now = System.currentTimeMillis()
         if (credentialAutoLoginInFlight) {
             credentialAutoLoginSuppressedInFlight += 1
@@ -3442,6 +3486,355 @@ class MainActivity : Activity() {
         }
     }
 
+    @Suppress("SetJavaScriptEnabled")
+    private fun configureDedicatedJinhakAuthWebView() {
+        if (!::authWebView.isInitialized) return
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(authWebView, true)
+        }
+        authWebView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            cacheMode = WebSettings.LOAD_DEFAULT
+            javaScriptCanOpenWindowsAutomatically = false
+            setSupportMultipleWindows(false)
+            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            userAgentString = userAgentString + " AdmissionHubAuth/$VERSION"
+        }
+        authWebView.webChromeClient = WebChromeClient()
+        authWebView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                val target = request.url?.toString().orEmpty()
+                if (JinhakGradeRouteFence.isBlockedLowerGrade(target)) {
+                    handler.post {
+                        jinhakV0180LowerGradeBlocks += 1
+                        persistJinhakAuthDiagnostics("v0180-auth-lower-grade-request-block")
+                    }
+                    return jinhakV0174BlockedResponse("v0180-lower-grade-auth")
+                }
+                if (request.isForMainFrame && !JinhakDedicatedAuthPolicy.allowsAuthMainFrame(target)) {
+                    return jinhakV0174BlockedResponse("v0180-auth-mainframe-policy")
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
+
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val target = request.url?.toString().orEmpty()
+                if (!request.isForMainFrame) return false
+                val route = JinhakDedicatedAuthPolicy.classify(target)
+                if (route == JinhakDedicatedAuthPolicy.Route.BLOCK_LOWER_GRADE) {
+                    jinhakV0180LowerGradeBlocks += 1
+                    persistJinhakAuthDiagnostics("v0180-auth-lower-grade-mainframe-block")
+                    return true
+                }
+                return !JinhakDedicatedAuthPolicy.allowsAuthMainFrame(target)
+            }
+
+            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                jinhakV0180AuthLastSafePath = runtimeSafePath(url)
+                when (JinhakDedicatedAuthPolicy.classify(url)) {
+                    JinhakDedicatedAuthPolicy.Route.LOGIN_FORM,
+                    JinhakDedicatedAuthPolicy.Route.MEMBER_LOGIN -> jinhakV0180AuthState = "FORM_LOADING"
+                    JinhakDedicatedAuthPolicy.Route.HIGH3_SUCCESS -> jinhakV0180AuthState = "HIGH3_RETURN_LOADING"
+                    JinhakDedicatedAuthPolicy.Route.BLOCK_LOWER_GRADE -> {
+                        jinhakV0180LowerGradeBlocks += 1
+                        runCatching { view.stopLoading() }
+                    }
+                    else -> Unit
+                }
+                persistJinhakAuthDiagnostics("v0180-auth-page-started")
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                CookieManager.getInstance().flush()
+                jinhakV0180AuthLastSafePath = runtimeSafePath(url)
+                when (JinhakDedicatedAuthPolicy.classify(url)) {
+                    JinhakDedicatedAuthPolicy.Route.HIGH3_SUCCESS -> {
+                        completeV0180DedicatedJinhakAuth(url)
+                        return
+                    }
+                    JinhakDedicatedAuthPolicy.Route.LOGIN_FORM,
+                    JinhakDedicatedAuthPolicy.Route.MEMBER_LOGIN -> {
+                        jinhakV0180AuthState = "FORM_READY"
+                        attemptV0180JinhakAuthAutofill(jinhakV0180AuthGeneration, 0)
+                    }
+                    JinhakDedicatedAuthPolicy.Route.JINHAK_SUPPORT -> {
+                        // Some login implementations hand off through a same-site support/root page.
+                        // After a submitted form, probe high3 exactly once; no recurring auth poll exists.
+                        if (jinhakV0180AuthSubmitGeneration == jinhakV0180AuthGeneration &&
+                            jinhakV0180AuthHigh3ProbeGeneration != jinhakV0180AuthGeneration) {
+                            jinhakV0180AuthHigh3ProbeGeneration = jinhakV0180AuthGeneration
+                            handler.postDelayed({
+                                if (jinhakV0180AuthGeneration == jinhakV0180AuthHigh3ProbeGeneration &&
+                                    ::authHost.isInitialized && authHost.visibility == View.VISIBLE) {
+                                    authWebView.loadUrl(JinhakStrictHigh3Sandbox.strictEntryUrl())
+                                }
+                            }, 350L)
+                        }
+                    }
+                    JinhakDedicatedAuthPolicy.Route.BLOCK_LOWER_GRADE -> {
+                        jinhakV0180LowerGradeBlocks += 1
+                        runCatching { view.stopLoading() }
+                    }
+                    else -> Unit
+                }
+                persistJinhakAuthDiagnostics("v0180-auth-page-finished")
+            }
+
+            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                jinhakV0180AuthRendererRestarts += 1
+                jinhakV0180AuthFailures += 1
+                val activeGeneration = jinhakV0180AuthGeneration
+                recordRuntimeEvent(
+                    "jinhak-v0180-auth-renderer-gone",
+                    JSONObject()
+                        .put("didCrash", detail?.didCrash() ?: false)
+                        .put("generation", activeGeneration)
+                        .put("restart", jinhakV0180AuthRendererRestarts),
+                    synchronous = true
+                )
+                if (jinhakV0180AuthRendererRestarts > V0180_AUTH_RENDERER_RESTART_LIMIT) {
+                    jinhakV0180AuthState = "AUTH_RENDERER_FAILED"
+                    status.text = "진학사 로그인 렌더러가 반복 종료되었습니다. 로그인 화면을 그대로 열어 수동 완료할 수 있습니다."
+                    return true
+                }
+                handler.postDelayed({ recreateV0180AuthWebView(activeGeneration) }, 1_200L)
+                return true
+            }
+        }
+    }
+
+    private fun startV0180DedicatedJinhakAuth(reason: String, forceManual: Boolean = false) {
+        provider = ProviderId.JINHAK
+        jinhakV0180AuthLastReason = reason.take(100)
+        if (::authHost.isInitialized && authHost.visibility == View.VISIBLE &&
+            jinhakV0180AuthState !in setOf("IDLE", "SUCCESS", "AUTH_RENDERER_FAILED")) {
+            persistJinhakAuthDiagnostics("v0180-auth-duplicate-start-suppressed")
+            return
+        }
+
+        val credential = credentialVault.load(ProviderId.JINHAK.wireName)
+        if (credential == null && !forceManual) {
+            jinhakV0180AuthState = "CREDENTIALS_REQUIRED"
+            batchPausedForLogin = batchRunning
+            sessionState.text = "○ 진학사 자동 로그인 계정 1회 설정 필요"
+            status.text = "기기에 저장된 진학사 계정이 없습니다. 한 번 저장하면 이후 수집부터 자동 로그인합니다."
+            if (startupCredentialPromptedProvider != ProviderId.JINHAK) {
+                startupCredentialPromptedProvider = ProviderId.JINHAK
+                handler.post { showCredentialDialog(ProviderId.JINHAK, continueAfterSave = true) }
+            }
+            persistJinhakAuthDiagnostics("v0180-credentials-required")
+            return
+        }
+
+        jinhakV0180AuthGeneration += 1
+        jinhakV0180AuthSubmitGeneration = -1
+        jinhakV0180AuthFillAttempt = 0
+        jinhakV0180AuthHigh3ProbeGeneration = -1
+        jinhakV0180AuthRendererRestarts = 0
+        jinhakV0180AuthState = if (credential == null) "MANUAL_LOGIN" else "AUTH_WEBVIEW_LOADING"
+        batchPausedForLogin = batchRunning
+        if (::batchCover.isInitialized) batchCover.visibility = View.GONE
+        if (::authHost.isInitialized) authHost.visibility = View.VISIBLE
+        if (::authWebView.isInitialized) {
+            authWebView.visibility = View.VISIBLE
+            runCatching { authWebView.stopLoading() }
+            runCatching { authWebView.clearHistory() }
+            authWebView.loadUrl(JinhakDedicatedAuthPolicy.LOGIN_URL)
+        }
+        sessionState.text = if (credential == null) "○ 진학사 로그인 화면" else "● 진학사 자동 로그인 실행 중"
+        status.text = if (credential == null) {
+            "진학사 로그인 화면을 열었습니다. 로그인 완료 후 고3 화면으로 이동하면 자동으로 수집을 재개합니다."
+        } else {
+            "진학사 전용 로그인 WebView에서 저장 계정을 자동 입력합니다. 수집 WebView는 로그인 페이지를 열지 않습니다."
+        }
+        persistJinhakAuthDiagnostics("v0180-auth-start")
+    }
+
+    private fun attemptV0180JinhakAuthAutofill(generation: Int, attempt: Int) {
+        if (provider != ProviderId.JINHAK || generation != jinhakV0180AuthGeneration) return
+        if (!::authHost.isInitialized || authHost.visibility != View.VISIBLE) return
+        if (jinhakV0180AuthSubmitGeneration == generation) return
+        val credential = credentialVault.load(ProviderId.JINHAK.wireName) ?: run {
+            jinhakV0180AuthState = "WAITING_USER_LOGIN"
+            return
+        }
+        if (attempt >= V0180_AUTH_MAX_FILL_ATTEMPTS) {
+            jinhakV0180AuthFailures += 1
+            jinhakV0180AuthState = "FORM_NOT_AUTOMATABLE"
+            status.text = "자동 입력 폼을 찾지 못했습니다. 현재 로그인 화면에서 직접 로그인하면 고3 복귀 후 자동 재개합니다."
+            persistJinhakAuthDiagnostics("v0180-auth-form-not-found")
+            return
+        }
+
+        jinhakV0180AuthFillAttempt = attempt + 1
+        jinhakV0180AuthSubmitAttempts += 1
+        credentialAutoLoginAttempts += 1
+        credentialAutoLoginLastProvider = ProviderId.JINHAK.wireName
+        credentialAutoLoginLastAtMs = System.currentTimeMillis()
+        val userJson = JSONObject.quote(credential.username)
+        val passJson = JSONObject.quote(credential.password)
+        val js = """
+            (function(){
+              try{
+                function visible(el){if(!el)return false;var s=getComputedStyle(el);if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0')return false;var r=el.getBoundingClientRect();return r.width>0&&r.height>0;}
+                function setValue(el,v){
+                  try{var proto=Object.getPrototypeOf(el);var d=Object.getOwnPropertyDescriptor(proto,'value')||Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');if(d&&d.set)d.set.call(el,v);else el.value=v;}catch(e){el.value=v;}
+                  try{el.focus();el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:v}));}catch(e){try{el.dispatchEvent(new Event('input',{bubbles:true}));}catch(x){}}
+                  try{el.dispatchEvent(new Event('change',{bubbles:true}));el.blur();}catch(e){}
+                }
+                var roots=[document];
+                try{Array.from(document.querySelectorAll('*')).forEach(function(el){if(el.shadowRoot)roots.push(el.shadowRoot);});}catch(e){}
+                for(var r=0;r<roots.length;r++){
+                  var root=roots[r];
+                  var passList=[];try{passList=Array.from(root.querySelectorAll('input[type=password]')).filter(visible);}catch(e){}
+                  for(var p=0;p<passList.length;p++){
+                    var pass=passList[p],form=pass.form||pass.closest('form'),base=form||root;
+                    var users=[];try{users=Array.from(base.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);}catch(e){}
+                    if(!users.length)continue;
+                    function score(el){var m=((el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')+' '+(el.autocomplete||'')).toLowerCase();var n=0;if(/아이디|user|login|member|email|account/.test(m))n+=80;if((el.autocomplete||'').toLowerCase()==='username')n+=120;if(/search|검색/.test(m))n-=300;if(form&&el.form===form)n+=100;return n;}
+                    users.sort(function(a,b){return score(b)-score(a);});
+                    var user=users[0];if(!user)continue;
+                    setValue(user,$userJson);setValue(pass,$passJson);
+                    var controls=[];try{controls=Array.from(base.querySelectorAll('button,input[type=submit],input[type=button],[role=button]')).filter(visible);}catch(e){}
+                    function label(el){return ((el.innerText||el.value||el.textContent||el.getAttribute('aria-label')||'')+'').replace(/\s+/g,' ').trim();}
+                    var submit=controls.find(function(el){return /^(로그인|로그인하기|log\s*in|sign\s*in)$/i.test(label(el));})||controls.find(function(el){return (el.type||'').toLowerCase()==='submit';})||null;
+                    if(submit){submit.click();return JSON.stringify({submitted:true,method:'button'});}
+                    if(form){if(form.requestSubmit)form.requestSubmit();else form.submit();return JSON.stringify({submitted:true,method:'form'});}
+                    return JSON.stringify({submitted:false,reason:'submit-control-missing'});
+                  }
+                }
+                return JSON.stringify({submitted:false,reason:'visible-login-fields-missing'});
+              }catch(e){return JSON.stringify({submitted:false,reason:'script-error'});}
+            })();
+        """.trimIndent()
+
+        authWebView.evaluateJavascript(js) { raw ->
+            if (generation != jinhakV0180AuthGeneration) return@evaluateJavascript
+            val decoded = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
+            val result = runCatching { JSONObject(decoded) }.getOrDefault(JSONObject())
+            if (result.optBoolean("submitted", false)) {
+                jinhakV0180AuthSubmitGeneration = generation
+                jinhakV0180AuthSubmissions += 1
+                credentialAutoLoginSubmissions += 1
+                credentialAutoLoginLastResult = "v0180-submitted-${result.optString("method", "unknown")}"
+                jinhakV0180AuthState = "SUBMITTED"
+                status.text = "진학사 자동 로그인 제출 완료 · 서버의 고3 복귀를 기다립니다."
+                handler.postDelayed({ inspectV0180SubmittedLogin(generation) }, 5_000L)
+            } else {
+                credentialAutoLoginLastResult = "v0180-not-submitted-${result.optString("reason", "unknown")}"
+                val next = attempt + 1
+                if (next < V0180_AUTH_MAX_FILL_ATTEMPTS) {
+                    val delay = when (next) { 1 -> 350L; else -> 900L }
+                    handler.postDelayed({ attemptV0180JinhakAuthAutofill(generation, next) }, delay)
+                } else {
+                    jinhakV0180AuthFailures += 1
+                    credentialAutoLoginFailures += 1
+                    jinhakV0180AuthState = "FORM_NOT_AUTOMATABLE"
+                    status.text = "진학사 로그인 폼 자동 입력에 실패했습니다. 현재 화면에서 직접 로그인하면 수집은 자동 재개됩니다."
+                }
+            }
+            persistJinhakAuthDiagnostics("v0180-auth-autofill-result")
+        }
+    }
+
+    private fun inspectV0180SubmittedLogin(generation: Int) {
+        if (generation != jinhakV0180AuthGeneration || !::authHost.isInitialized || authHost.visibility != View.VISIBLE) return
+        val current = authWebView.url.orEmpty()
+        if (JinhakDedicatedAuthPolicy.isHigh3Success(current)) {
+            completeV0180DedicatedJinhakAuth(current)
+            return
+        }
+        if (!JinhakDedicatedAuthPolicy.isLoginSurface(current)) return
+        val js = """
+            (function(){
+              try{
+                var t=(document.body&&document.body.innerText?document.body.innerText:'').slice(0,30000);
+                var bad=/(아이디|비밀번호).*(확인|일치하지|잘못|오류|실패)|로그인.*실패/i.test(t);
+                return JSON.stringify({credentialError:bad});
+              }catch(e){return JSON.stringify({credentialError:false});}
+            })();
+        """.trimIndent()
+        authWebView.evaluateJavascript(js) { raw ->
+            if (generation != jinhakV0180AuthGeneration) return@evaluateJavascript
+            val decoded = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
+            val result = runCatching { JSONObject(decoded) }.getOrDefault(JSONObject())
+            if (result.optBoolean("credentialError", false)) {
+                jinhakV0180AuthFailures += 1
+                credentialAutoLoginFailures += 1
+                credentialAutoLoginLastResult = "v0180-credential-rejected"
+                jinhakV0180AuthState = "CREDENTIAL_REJECTED"
+                status.text = "진학사에서 로그인 정보 확인 오류를 반환했습니다. 저장 계정을 다시 입력하면 즉시 재시도합니다."
+                startupCredentialPromptedProvider = null
+                showCredentialDialog(ProviderId.JINHAK, continueAfterSave = true)
+            }
+            persistJinhakAuthDiagnostics("v0180-auth-submit-inspection")
+        }
+    }
+
+    private fun completeV0180DedicatedJinhakAuth(successUrl: String) {
+        if (provider != ProviderId.JINHAK) return
+        jinhakV0180AuthState = "SUCCESS"
+        jinhakV0180AuthSuccesses += 1
+        if (jinhakV0180AuthSubmitGeneration == jinhakV0180AuthGeneration) {
+            credentialAutoLoginSuccesses += 1
+            credentialAutoLoginLastResult = "v0180-success-high3-return"
+        }
+        jinhakUserSessionConfirmed = true
+        jinhakAuthVerifiedForBatch = true
+        batchPausedForLogin = false
+        jinhakTransitionAuthGateActive = false
+        jinhakRealAuthResumeGatePending = false
+        jinhakCoreBootstrapState = "v0180-dedicated-auth-high3"
+        jinhakLastAuthEvidence = "v0180-server-high3-return"
+        jinhakLastCoreVerifiedAtMs = System.currentTimeMillis()
+        CookieManager.getInstance().flush()
+        if (::authWebView.isInitialized) {
+            runCatching { authWebView.stopLoading() }
+            runCatching { authWebView.clearHistory() }
+        }
+        if (::authHost.isInitialized) authHost.visibility = View.GONE
+        if (::webView.isInitialized) webView.visibility = View.VISIBLE
+        sessionState.text = "● 진학사 자동 로그인 완료 · 고3 세션"
+        status.text = "진학사 로그인 완료 · 고3 전용 수집 WebView에서 자동 재개합니다."
+        recordRuntimeEvent(
+            "jinhak-v0180-auth-success",
+            JSONObject()
+                .put("generation", jinhakV0180AuthGeneration)
+                .put("successSafePath", runtimeSafePath(successUrl))
+                .put("batchRunning", batchRunning)
+                .put("unifiedRunning", unifiedRunning),
+            synchronous = true
+        )
+        persistJinhakAuthDiagnostics("v0180-auth-success")
+
+        val target = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(currentBatchTarget)
+            ?: JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(successUrl)
+            ?: JinhakStrictHigh3Sandbox.strictEntryUrl()
+        currentBatchTarget = target
+        loadJinhakV0174High3Only(target, "v0180-auth-success-handoff")
+    }
+
+    private fun recreateV0180AuthWebView(generation: Int) {
+        if (generation != jinhakV0180AuthGeneration || !::authHost.isInitialized) return
+        val old = if (::authWebView.isInitialized) authWebView else null
+        runCatching { old?.stopLoading() }
+        runCatching { authHost.removeAllViews() }
+        runCatching { old?.destroy() }
+        authWebView = WebView(this)
+        authHost.addView(authWebView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+        configureDedicatedJinhakAuthWebView()
+        authHost.visibility = View.VISIBLE
+        jinhakV0180AuthState = "AUTH_WEBVIEW_RECREATED"
+        authWebView.loadUrl(JinhakDedicatedAuthPolicy.LOGIN_URL)
+        persistJinhakAuthDiagnostics("v0180-auth-renderer-recreated")
+    }
+
     private fun isFreshJinhakRealAuthProbe(): Boolean = false
 
     private fun classifyJinhakRealAuthRoute(rawUrl: String): String {
@@ -3492,17 +3885,11 @@ class MainActivity : Activity() {
     }
 
     private fun startJinhakRealAuthProbe(autoContinue: Boolean, trigger: String) {
-        if (batchRunning) {
-            Toast.makeText(this, "진행 중인 진학사 수집이 있습니다. 현재 화면에서 세션을 관리하세요.", Toast.LENGTH_LONG).show()
-            return
-        }
         provider = ProviderId.JINHAK
         jinhakRealAuthProbeActive = false
-        jinhakRealAuthProbeAutoContinue = false
-        jinhakRealAuthProbeResult = "disabled-strict-high3-sandbox-v0174"
-        enterJinhakUserSessionGate("v0174-manual-strict-entry:$trigger")
-        openJinhakV0174StrictEntry("manual-button:$trigger")
-        status.text = "진학사 인증 진단 대신 고3 전용 진입점만 엽니다. 로그인 후 고3 화면을 직접 확인하고 탐색 시작 버튼을 누르세요."
+        jinhakRealAuthProbeAutoContinue = autoContinue
+        jinhakRealAuthProbeResult = "delegated-v0180-dedicated-auth"
+        startV0180DedicatedJinhakAuth("real-auth-entry:$trigger")
     }
     private fun scheduleJinhakRealAuthProbePoll(generation: Int, delayMs: Long = 0L) {
         if (jinhakRealAuthProbeActive && generation == jinhakRealAuthProbeGeneration) {
@@ -4144,12 +4531,27 @@ class MainActivity : Activity() {
                     .put("v0173High3StabilityRejects", jinhakV0173High3StabilityRejects)
                     .put("v0173ActualLoginReturns", jinhakV0173ActualLoginReturns)
                     .put("v0173AutoBootstrapNavigations", 0)
-                    .put("jinhakAuthModel", "user-owned-session-explicit-high3-runtime-stable-v0175")
+                    .put("jinhakAuthModel", "dedicated-auth-webview-autologin-v0180")
                     .put("v0174StrictHigh3Sandbox", true)
                     .put("v0175BlockedRoutesPreserveUserSession", true)
                     .put("v0175SpaHistoryBlankNeutralization", false)
                     .put("v0175SnapshotOverlapRetryMs", JINHAK_SNAPSHOT_OVERLAP_RETRY_MS)
                     .put("v0175RendererCrashCooldownMs", JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS)
+                    .put("v0180DedicatedAuthWebView", true)
+                    .put("v0180CredentialVaultAutoLogin", true)
+                    .put("v0180AuthState", jinhakV0180AuthState)
+                    .put("v0180AuthGeneration", jinhakV0180AuthGeneration)
+                    .put("v0180AuthSubmitAttempts", jinhakV0180AuthSubmitAttempts)
+                    .put("v0180AuthSubmissions", jinhakV0180AuthSubmissions)
+                    .put("v0180AuthSuccesses", jinhakV0180AuthSuccesses)
+                    .put("v0180AuthFailures", jinhakV0180AuthFailures)
+                    .put("v0180AuthRendererRestarts", jinhakV0180AuthRendererRestarts)
+                    .put("v0180CollectorLoginRouteLoads", jinhakV0180CollectorLoginRouteLoads)
+                    .put("v0180LowerGradeBlocks", jinhakV0180LowerGradeBlocks)
+                    .put("v0180RecursiveAuthPolling", false)
+                    .put("v0180CollectorOwnsLogin", false)
+                    .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
+                    .put("v0180AuthLastSafePath", jinhakV0180AuthLastSafePath)
                     .put("v0174StrictMainFrameBlocks", jinhakV0174StrictMainFrameBlocks)
                     .put("v0174LowerGradeAnyRequestBlocks", jinhakV0174LowerGradeAnyRequestBlocks)
                     .put("v0174ServiceWorkerLowerGradeBlocks", jinhakV0174ServiceWorkerLowerGradeBlocks)
@@ -4420,12 +4822,27 @@ class MainActivity : Activity() {
                     .put("v0173High3StabilityRejects", jinhakV0173High3StabilityRejects)
                     .put("v0173ActualLoginReturns", jinhakV0173ActualLoginReturns)
                     .put("v0173AutoBootstrapNavigations", 0)
-                    .put("jinhakAuthModel", "user-owned-session-explicit-high3-runtime-stable-v0175")
+                    .put("jinhakAuthModel", "dedicated-auth-webview-autologin-v0180")
                     .put("v0174StrictHigh3Sandbox", true)
                     .put("v0175BlockedRoutesPreserveUserSession", true)
                     .put("v0175SpaHistoryBlankNeutralization", false)
                     .put("v0175SnapshotOverlapRetryMs", JINHAK_SNAPSHOT_OVERLAP_RETRY_MS)
                     .put("v0175RendererCrashCooldownMs", JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS)
+                    .put("v0180DedicatedAuthWebView", true)
+                    .put("v0180CredentialVaultAutoLogin", true)
+                    .put("v0180AuthState", jinhakV0180AuthState)
+                    .put("v0180AuthGeneration", jinhakV0180AuthGeneration)
+                    .put("v0180AuthSubmitAttempts", jinhakV0180AuthSubmitAttempts)
+                    .put("v0180AuthSubmissions", jinhakV0180AuthSubmissions)
+                    .put("v0180AuthSuccesses", jinhakV0180AuthSuccesses)
+                    .put("v0180AuthFailures", jinhakV0180AuthFailures)
+                    .put("v0180AuthRendererRestarts", jinhakV0180AuthRendererRestarts)
+                    .put("v0180CollectorLoginRouteLoads", jinhakV0180CollectorLoginRouteLoads)
+                    .put("v0180LowerGradeBlocks", jinhakV0180LowerGradeBlocks)
+                    .put("v0180RecursiveAuthPolling", false)
+                    .put("v0180CollectorOwnsLogin", false)
+                    .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
+                    .put("v0180AuthLastSafePath", jinhakV0180AuthLastSafePath)
                     .put("v0174StrictMainFrameBlocks", jinhakV0174StrictMainFrameBlocks)
                     .put("v0174LowerGradeAnyRequestBlocks", jinhakV0174LowerGradeAnyRequestBlocks)
                     .put("v0174ServiceWorkerLowerGradeBlocks", jinhakV0174ServiceWorkerLowerGradeBlocks)
