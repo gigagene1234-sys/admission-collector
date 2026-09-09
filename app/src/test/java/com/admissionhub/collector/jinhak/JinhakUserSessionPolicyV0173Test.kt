@@ -6,10 +6,17 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class JinhakUserSessionPolicyV0173Test {
+    private val high3ReturnLogin =
+        "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx?ReturnURL=https%3A%2F%2Fwww.jinhak.com%2Fjh%2Fhigh3%2Fearly%2Ffour-year-university%2Fsearch"
+
     @Test
-    fun exactMemberLoginOnlyArmsUserOwnedLogin() {
+    fun exactMemberLoginOnlyArmsWhenBoundToHigh3Return() {
         assertEquals(
             JinhakUserSessionPolicy.ConfirmationDecision.ARM_AFTER_SITE_LOGIN,
+            JinhakUserSessionPolicy.confirmationDecision(high3ReturnLogin)
+        )
+        assertEquals(
+            JinhakUserSessionPolicy.ConfirmationDecision.WAIT_FOR_HIGH3,
             JinhakUserSessionPolicy.confirmationDecision("https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx")
         )
     }
@@ -31,18 +38,15 @@ class JinhakUserSessionPolicyV0173Test {
     }
 
     @Test
-    fun lateExactMemberLoginCallbackIsIgnoredWhenHigh3IsAlreadyVisible() {
+    fun lateHigh3BoundMemberLoginCallbackIsIgnoredWhenHigh3IsAlreadyVisible() {
         assertTrue(
             JinhakUserSessionPolicy.shouldIgnoreStaleLoginCallback(
-                "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx",
+                high3ReturnLogin,
                 "https://www.jinhak.com/jh/high3/early/four-year-university/search"
             )
         )
         assertFalse(
-            JinhakUserSessionPolicy.shouldIgnoreStaleLoginCallback(
-                "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx",
-                "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx"
-            )
+            JinhakUserSessionPolicy.shouldIgnoreStaleLoginCallback(high3ReturnLogin, high3ReturnLogin)
         )
     }
 
