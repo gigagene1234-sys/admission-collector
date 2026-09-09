@@ -8,8 +8,8 @@ import java.net.URI
  * Main-frame policy is fail-closed. Inside the Admission Hub Jinhak WebView the only Jinhak
  * destinations that may become the visible top-level page are:
  *   1) HTTPS www.jinhak.com/jh/high3[/...]
- *   2) the exact HTTPS member.jinhak.com .../MemberLogIn.aspx surface that Jinhak itself may
- *      redirect to while the user owns the login session
+ *   2) the exact HTTPS member.jinhak.com .../MemberLogIn.aspx surface only when its ReturnURL
+ *      resolves back to a strict high3 route
  *   3) about:blank used as a neutral renderer placeholder
  *
  * Shared root/product routers, generic login routers, high1/high2/high12, other Jinhak product
@@ -17,7 +17,7 @@ import java.net.URI
  * as forbidden when nested in encoded query/fragment/ReturnURL material by JinhakGradeRouteFence.
  */
 object JinhakStrictHigh3Sandbox {
-    const val SCHEMA_VERSION = 1
+    const val SCHEMA_VERSION = 2
 
     enum class MainFrameDecision {
         ALLOW_HIGH3,
@@ -26,6 +26,7 @@ object JinhakStrictHigh3Sandbox {
         BLOCK_LOWER_GRADE,
         BLOCK_SHARED_ROOT,
         BLOCK_GENERIC_LOGIN,
+        BLOCK_MEMBER_LOGIN_WITHOUT_HIGH3_RETURN,
         BLOCK_OTHER_JINHAK,
         BLOCK_EXTERNAL,
         BLOCK_INVALID
@@ -46,10 +47,12 @@ object JinhakStrictHigh3Sandbox {
         if (scheme != "https") return MainFrameDecision.BLOCK_EXTERNAL
 
         if (host == "member.jinhak.com") {
-            return if (JinhakHigh3AuthRoute.isMemberLoginSurface(url)) {
+            if (!JinhakHigh3AuthRoute.isMemberLoginSurface(url)) return MainFrameDecision.BLOCK_OTHER_JINHAK
+            val returnTarget = JinhakHigh3AuthRoute.returnUrl(url)
+            return if (!returnTarget.isNullOrBlank() && JinhakHigh3AuthRoute.isAllowedHigh3Target(returnTarget)) {
                 MainFrameDecision.ALLOW_MEMBER_LOGIN
             } else {
-                MainFrameDecision.BLOCK_OTHER_JINHAK
+                MainFrameDecision.BLOCK_MEMBER_LOGIN_WITHOUT_HIGH3_RETURN
             }
         }
 
@@ -83,11 +86,12 @@ object JinhakStrictHigh3Sandbox {
 
     fun reason(decision: MainFrameDecision): String = when (decision) {
         MainFrameDecision.ALLOW_HIGH3 -> "allow-high3"
-        MainFrameDecision.ALLOW_MEMBER_LOGIN -> "allow-member-login"
+        MainFrameDecision.ALLOW_MEMBER_LOGIN -> "allow-member-login-high3-return"
         MainFrameDecision.ALLOW_BLANK -> "allow-blank"
         MainFrameDecision.BLOCK_LOWER_GRADE -> "block-lower-grade"
         MainFrameDecision.BLOCK_SHARED_ROOT -> "block-shared-root"
         MainFrameDecision.BLOCK_GENERIC_LOGIN -> "block-generic-login"
+        MainFrameDecision.BLOCK_MEMBER_LOGIN_WITHOUT_HIGH3_RETURN -> "block-member-login-without-high3-return"
         MainFrameDecision.BLOCK_OTHER_JINHAK -> "block-other-jinhak"
         MainFrameDecision.BLOCK_EXTERNAL -> "block-external"
         MainFrameDecision.BLOCK_INVALID -> "block-invalid"
