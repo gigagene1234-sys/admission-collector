@@ -7,6 +7,7 @@ import com.admissionhub.collector.jinhak.JinhakStrategyAnalyzer
 import com.admissionhub.collector.jinhak.JinhakApplicationMission
 import com.admissionhub.collector.jinhak.JinhakReportYearGuard
 import com.admissionhub.collector.jinhak.JinhakStrictHigh3Sandbox
+import com.admissionhub.collector.jinhak.JinhakStorageCompetitionPolicy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -37,10 +38,11 @@ object JinhakAdapter : ProviderAdapter {
         } catch (_: Exception) { false }
     }
 
-    override fun seedUrls(): List<String> = JinhakSiteTopology.missionSeeds()
+    override fun seedUrls(): List<String> = listOf(JinhakSiteTopology.protectedCoreProbeUrl())
 
     override fun isBatchNavigable(url: String): Boolean {
         if (!accepts(url) || !JinhakStrictHigh3Sandbox.allowsCollectorNavigation(url)) return false
+        if (JinhakStorageCompetitionPolicy.ENABLED && !JinhakStorageCompetitionPolicy.isStorageUrl(url)) return false
         return try {
             val uri = URI(url)
             val path = (uri.path ?: "/").lowercase()
@@ -184,6 +186,13 @@ object JinhakAdapter : ProviderAdapter {
                 val departmentContextSource = cardObj?.optString("departmentSource")
                     ?.takeIf { it.isNotBlank() && it != "missing" }
                 val cardMetrics = predictionMetrics(evidence)
+                val competitionReading = if (pageType == "jinhak-early-storage") JinhakStorageCompetitionPolicy.readCompetition(evidence) else null
+                competitionReading?.displayedCompetition?.let { cardMetrics.put("displayedCompetition", it) }
+                competitionReading?.currentApplicationCompetition?.let { cardMetrics.put("currentApplicationCompetition", it) }
+                competitionReading?.let {
+                    cardMetrics.put("currentCompetitionSemanticsVerified", it.currentSemanticsVerified)
+                    it.evidenceLabel?.let { label -> cardMetrics.put("competitionEvidenceLabel", label) }
+                }
                 mission?.capacity?.let { if (!cardMetrics.has("capacity")) cardMetrics.put("capacity", it) }
                 mission?.admissionCategory?.let { cardMetrics.put("admissionCategory", it) }
                 mission?.campus?.let { cardMetrics.put("campus", it) }
@@ -196,7 +205,8 @@ object JinhakAdapter : ProviderAdapter {
                 val summaryOnly = metricKeys.size == 1 && metricKeys.firstOrNull() == "stabilityBars"
                 if (hasRicherPredictionCards && summaryOnly) continue
                 val hasPrimaryPrediction = listOf(
-                    "stabilityBars", "predictionProbability", "predictionLabel", "myRank", "predictedCut"
+                    "stabilityBars", "predictionProbability", "predictionLabel", "myRank", "predictedCut",
+                    "displayedCompetition", "currentApplicationCompetition"
                 ).any { cardMetrics.has(it) && !cardMetrics.isNull(it) }
                 if (!hasPrimaryPrediction) continue
 
@@ -265,6 +275,31 @@ object JinhakAdapter : ProviderAdapter {
                     .put("rawEvidence", evidence)
                 record.put("sourceRowFingerprint", fingerprint(record, observedAt, preserveSnapshot = true))
                 result.put(record)
+                if (pageType == "jinhak-early-storage" && mission?.identityKey != null && competitionReading?.displayedCompetition != null) {
+                    val competitionMetrics = JSONObject()
+                        .put("displayedCompetition", competitionReading.displayedCompetition)
+                        .put("currentApplicationCompetition", competitionReading.currentApplicationCompetition ?: JSONObject.NULL)
+                        .put("currentCompetitionSemanticsVerified", competitionReading.currentSemanticsVerified)
+                        .put("evidenceLabel", competitionReading.evidenceLabel ?: JSONObject.NULL)
+                        .put("sourceClass", "jinhak-user-viewed-derived")
+                    val competitionRecord = JSONObject()
+                        .put("recordType", "jinhak-saved-application-competition-watch")
+                        .put("providerPageType", pageType)
+                        .put("dataScope", "current-application-competition-observation")
+                        .put("year", local.year ?: TARGET_YEAR)
+                        .put("university", university ?: JSONObject.NULL)
+                        .put("department", department ?: JSONObject.NULL)
+                        .put("admission", admission ?: JSONObject.NULL)
+                        .put("applicationIdentityKey", mission.identityKey)
+                        .put("metrics", competitionMetrics)
+                        .put("observedAt", observedAt)
+                        .put("cardIndex", i)
+                        .put("confidence", if (competitionReading.currentSemanticsVerified) "high" else "raw")
+                        .put("sourcePage", safePath(snapshot.optString("url")))
+                        .put("rawEvidence", competitionReading.evidenceLabel ?: evidence.take(500))
+                    competitionRecord.put("sourceRowFingerprint", fingerprint(competitionRecord, observedAt, preserveSnapshot = true))
+                    result.put(competitionRecord)
+                }
                 if (mission?.identityKey != null) {
                     result.put(JinhakApplicationMission.missionEvidence(mission, pageType, observedAt, safePath(snapshot.optString("url"))))
                 }

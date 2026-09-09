@@ -62,6 +62,7 @@ import com.admissionhub.collector.jinhak.JinhakStrictHigh3Sandbox
 import com.admissionhub.collector.jinhak.JinhakDedicatedAuthPolicy
 import com.admissionhub.collector.jinhak.JinhakFocusedSixPolicy
 import com.admissionhub.collector.jinhak.JinhakProtectedSessionPolicy
+import com.admissionhub.collector.jinhak.JinhakStorageCompetitionPolicy
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -463,6 +464,12 @@ class MainActivity : Activity() {
     private var jinhakV0182CredentialSubmitVerifiedSuccesses = 0
     private var jinhakV0182ManualHigh3Returns = 0
     private var jinhakV0182RecoveryScopePreparations = 0
+    private var jinhakV0183StorageSnapshots = 0
+    private var jinhakV0183CompetitionRecords = 0
+    private var jinhakV0183CurrentCompetitionVerifiedRecords = 0
+    private var jinhakV0183StorageRefreshes = 0
+    private var jinhakV0183StorageWatchGeneration = 0
+    private var jinhakV0183NextRefreshAtMs = 0L
     private var jinhakV0174StrictEntryRequests = 0
     private var jinhakV0174ForbiddenPageStartsStopped = 0
     private var jinhakV0174ForbiddenPageFinishesObserved = 0
@@ -605,8 +612,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.18.2"
-        private const val BUILD_CODE = 118200
+        private const val VERSION = "0.18.3"
+        private const val BUILD_CODE = 118300
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -4662,6 +4669,13 @@ class MainActivity : Activity() {
                     .put("v0182CredentialSubmitVerifiedSuccesses", jinhakV0182CredentialSubmitVerifiedSuccesses)
                     .put("v0182ManualHigh3Returns", jinhakV0182ManualHigh3Returns)
                     .put("v0182RecoveryScopePreparations", jinhakV0182RecoveryScopePreparations)
+                    .put("v0183StorageOnlyMode", JinhakStorageCompetitionPolicy.ENABLED)
+                    .put("v0183StorageRefreshIntervalMs", JinhakStorageCompetitionPolicy.REFRESH_INTERVAL_MS)
+                    .put("v0183StorageSnapshots", jinhakV0183StorageSnapshots)
+                    .put("v0183CompetitionRecords", jinhakV0183CompetitionRecords)
+                    .put("v0183CurrentCompetitionVerifiedRecords", jinhakV0183CurrentCompetitionVerifiedRecords)
+                    .put("v0183StorageRefreshes", jinhakV0183StorageRefreshes)
+                    .put("v0183NextRefreshAtMs", jinhakV0183NextRefreshAtMs)
                     .put("v0180RecursiveAuthPolling", false)
                     .put("v0180CollectorOwnsLogin", false)
                     .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
@@ -4776,6 +4790,12 @@ class MainActivity : Activity() {
         jinhakV0182CredentialSubmitVerifiedSuccesses = 0
         jinhakV0182ManualHigh3Returns = 0
         jinhakV0182RecoveryScopePreparations = 0
+        jinhakV0183StorageSnapshots = 0
+        jinhakV0183CompetitionRecords = 0
+        jinhakV0183CurrentCompetitionVerifiedRecords = 0
+        jinhakV0183StorageRefreshes = 0
+        jinhakV0183StorageWatchGeneration += 1
+        jinhakV0183NextRefreshAtMs = 0L
         jinhakNormalizedMissionSeedContexts.clear()
         jinhakNormalizedIdentitySeedKeys.clear()
         jinhakNormalizedCandidateBindingKeys.clear()
@@ -4978,6 +4998,13 @@ class MainActivity : Activity() {
                     .put("v0182CredentialSubmitVerifiedSuccesses", jinhakV0182CredentialSubmitVerifiedSuccesses)
                     .put("v0182ManualHigh3Returns", jinhakV0182ManualHigh3Returns)
                     .put("v0182RecoveryScopePreparations", jinhakV0182RecoveryScopePreparations)
+                    .put("v0183StorageOnlyMode", JinhakStorageCompetitionPolicy.ENABLED)
+                    .put("v0183StorageRefreshIntervalMs", JinhakStorageCompetitionPolicy.REFRESH_INTERVAL_MS)
+                    .put("v0183StorageSnapshots", jinhakV0183StorageSnapshots)
+                    .put("v0183CompetitionRecords", jinhakV0183CompetitionRecords)
+                    .put("v0183CurrentCompetitionVerifiedRecords", jinhakV0183CurrentCompetitionVerifiedRecords)
+                    .put("v0183StorageRefreshes", jinhakV0183StorageRefreshes)
+                    .put("v0183NextRefreshAtMs", jinhakV0183NextRefreshAtMs)
                     .put("v0180RecursiveAuthPolling", false)
                     .put("v0180CollectorOwnsLogin", false)
                     .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
@@ -7784,6 +7811,18 @@ class MainActivity : Activity() {
             if (provider == ProviderId.JINHAK) {
                 jinhakConsecutiveStalls = 0
                 val pageTypeNow = snapshot.optString("providerPageType")
+                if (JinhakStorageCompetitionPolicy.ENABLED && pageTypeNow == "jinhak-early-storage") {
+                    jinhakV0183StorageSnapshots += 1
+                    for (ri in 0 until pageRecords.length()) {
+                        val observed = pageRecords.optJSONObject(ri) ?: continue
+                        if (observed.optString("recordType") == "jinhak-saved-application-competition-watch") {
+                            jinhakV0183CompetitionRecords += 1
+                            if (observed.optJSONObject("metrics")?.optBoolean("currentCompetitionSemanticsVerified", false) == true) {
+                                jinhakV0183CurrentCompetitionVerifiedRecords += 1
+                            }
+                        }
+                    }
+                }
                 if (pageTypeNow == "jinhak-early-storage" && jinhakFirstPopulatedStorageAtMs == 0L) {
                     var populated = false
                     for (ri in 0 until pageRecords.length()) {
@@ -7818,7 +7857,7 @@ class MainActivity : Activity() {
                         jinhakMissionAnchorStructuredKeys.add(key)
                     }
                 }
-                val rawMissionCandidates = JinhakAgentNavigator.candidates(snapshot)
+                val rawMissionCandidates = if (JinhakStorageCompetitionPolicy.ENABLED) emptyList() else JinhakAgentNavigator.candidates(snapshot)
                 val normalizedMissionSeeds = jinhakMissionContextsFromNormalizedRecords(pageRecords)
                 normalizedMissionSeeds.forEach { context ->
                     val identity = context.identityKey ?: return@forEach
@@ -7877,8 +7916,10 @@ class MainActivity : Activity() {
                 }
             }
             var jinhakExpansionStateKey: String? = null
-            var jinhakExpandOutgoingLinks = true
-            var jinhakAllowAgentAction = true
+            val jinhakStorageOnlySnapshot = provider == ProviderId.JINHAK && JinhakStorageCompetitionPolicy.ENABLED &&
+                snapshot.optString("providerPageType") == "jinhak-early-storage"
+            var jinhakExpandOutgoingLinks = !jinhakStorageOnlySnapshot
+            var jinhakAllowAgentAction = !jinhakStorageOnlySnapshot
             if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
                 val sessionId = unifiedSessionId
                 val runId = localRunId ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION).also { localRunId = it }
@@ -8449,8 +8490,29 @@ class MainActivity : Activity() {
         }, 180L)
         return true
     }
+    private fun scheduleV0183StorageCompetitionRefresh() {
+        if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK || !JinhakStorageCompetitionPolicy.ENABLED) return
+        val generation = ++jinhakV0183StorageWatchGeneration
+        jinhakV0183NextRefreshAtMs = System.currentTimeMillis() + JinhakStorageCompetitionPolicy.REFRESH_INTERVAL_MS
+        status.text = "진학사 수시저장소만 추적 중 · 다음 경쟁률 확인 약 15분 후"
+        persistLiveJinhakDiagnostics("v0183-storage-watch-scheduled", force = true)
+        handler.postDelayed({
+            if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK || generation != jinhakV0183StorageWatchGeneration) return@postDelayed
+            jinhakV0183StorageRefreshes += 1
+            val storage = JinhakSiteTopology.protectedCoreProbeUrl()
+            currentBatchTarget = storage
+            status.text = "진학사 수시저장소 경쟁률 새로 확인 중…"
+            loadJinhakV0174High3Only(storage, "v0183-periodic-storage-refresh")
+        }, JinhakStorageCompetitionPolicy.REFRESH_INTERVAL_MS)
+    }
+
     private fun loadNextBatchPage() {
         if (!batchRunning || batchPausedForLogin) return
+        if (provider == ProviderId.JINHAK && JinhakStorageCompetitionPolicy.ENABLED &&
+            jinhakV0182ProtectedSessionVerified && batchSnapshots.length() > 0) {
+            scheduleV0183StorageCompetitionRefresh()
+            return
+        }
         if (batchCloudPlansPending > 0) {
             status.text = "Cloud resume 계획 확인 중: ${batchCloudPlansPending}개 목록"
             handler.postDelayed({ loadNextBatchPage() }, 180)

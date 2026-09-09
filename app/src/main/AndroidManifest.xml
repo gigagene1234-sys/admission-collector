@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.18.2 Protected Session Bootstrap"
+        android:label="Admission Hub v0.18.3 Storage Competition Watch"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
