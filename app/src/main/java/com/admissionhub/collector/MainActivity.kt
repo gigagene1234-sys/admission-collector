@@ -523,9 +523,9 @@ class MainActivity : Activity() {
         private const val JINHAK_HARD_STALL_MS = 24_000L
         private const val JINHAK_SLOW_ESCALATION_MS = 35_000L
         private const val JINHAK_SINGLE_WEBVIEW_STABILITY_MODE = true
-        private const val JINHAK_SNAPSHOT_OVERLAP_RETRY_MS = 400L
+        private const val JINHAK_SNAPSHOT_OVERLAP_RETRY_MS = 800L
         private const val JINHAK_TRANSIENT_POPUP_TIMEOUT_MS = 5_000L
-        private const val JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS = 2_000L
+        private const val JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS = 5_000L
         private const val JINHAK_LOGIN_RECOVERY_TIMEOUT_MS = 60_000L
         private const val MAX_JINHAK_LOGIN_RECOVERY_POLLS = 40
         private const val MAX_JINHAK_REAUTH_CYCLES = 3
@@ -1498,19 +1498,22 @@ class MainActivity : Activity() {
     private fun blockJinhakV0174MainFrame(source: String, target: String, decision: JinhakStrictHigh3Sandbox.MainFrameDecision) {
         if (provider != ProviderId.JINHAK) return
         noteJinhakV0174Decision(source, target, decision)
-        jinhakUserSessionConfirmed = false
-        jinhakAuthVerifiedForBatch = false
-        if (batchRunning) batchPausedForLogin = true
+
+        // v0.17.5: strict route rejection and authentication are independent state machines.
+        // Dropping high1/high2/shared/generic/external routes must not manufacture a logout,
+        // erase an explicitly confirmed high3 session, or pause an otherwise healthy batch.
         currentBatchTarget = currentBatchTarget?.takeIf { JinhakStrictHigh3Sandbox.allowsCollectorNavigation(it) }
-        if (::batchCover.isInitialized) batchCover.visibility = View.GONE
-        if (::slowLaneHost.isInitialized) slowLaneHost.visibility = View.GONE
-        if (::jinhakSessionConfirmButton.isInitialized) {
-            jinhakSessionConfirmButton.isEnabled = true
-            jinhakSessionConfirmButton.text = "진학사 고3 전용 화면 다시 열기"
+        if (::sessionState.isInitialized) {
+            sessionState.text = if (jinhakUserSessionConfirmed || jinhakAuthVerifiedForBatch) {
+                "● 고3 세션 유지 · 비허용 이동만 차단"
+            } else {
+                "○ 고3 전용 샌드박스 · 비허용 이동 차단"
+            }
         }
-        if (::sessionState.isInitialized) sessionState.text = "○ 고3 전용 샌드박스가 비허용 경로를 차단함"
-        if (::status.isInitialized) status.text = "진학사 고3·정확한 회원 로그인 화면 외의 최상위 이동을 차단했습니다. 버튼을 눌러 고3 전용 진입점만 다시 여세요."
-        persistJinhakAuthDiagnostics("v0174-strict-block:$source")
+        if (::status.isInitialized) {
+            status.text = "비허용 경로만 차단했습니다. 이 차단만으로 로그인 상태를 변경하거나 실행을 멈추지 않습니다."
+        }
+        persistJinhakAuthDiagnostics("v0175-session-preserving-block:$source")
     }
 
     private fun loadMainUrl(target: String, source: String = "app-load"): Boolean {
@@ -1701,6 +1704,18 @@ class MainActivity : Activity() {
             override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
                 super.doUpdateVisitedHistory(view, url, isReload)
                 if (provider != ProviderId.JINHAK) return
+                if (jinhakUserSessionConfirmed && JinhakStrictHigh3Sandbox.isBenignSameDocumentHistoryAlias(url)) {
+                    recordRuntimeEvent(
+                        "jinhak-v0175-benign-spa-history-alias",
+                        JSONObject()
+                            .put("safePath", runtimeSafePath(url))
+                            .put("batchRunning", batchRunning)
+                            .put("batchPausedForLogin", batchPausedForLogin),
+                        synchronous = false
+                    )
+                    persistJinhakAuthDiagnostics("v0175-benign-spa-history-alias")
+                    return
+                }
                 val decision = JinhakStrictHigh3Sandbox.decision(url)
                 val allowed = decision == JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3 ||
                     decision == JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN ||
@@ -1709,9 +1724,8 @@ class MainActivity : Activity() {
                 jinhakV0174HistoryBlocks += 1
                 runCatching { view.stopLoading() }
                 blockJinhakV0174MainFrame("spa-history", url, decision)
-                handler.post {
-                    if (::webView.isInitialized && webView === view) loadMainUrl("about:blank", "spa-history-neutralize")
-                }
+                // Deliberately do not navigate to about:blank. A blocked history mutation is not
+                // allowed to tear down the already loaded high3 document or fabricate auth loss.
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
@@ -4130,8 +4144,12 @@ class MainActivity : Activity() {
                     .put("v0173High3StabilityRejects", jinhakV0173High3StabilityRejects)
                     .put("v0173ActualLoginReturns", jinhakV0173ActualLoginReturns)
                     .put("v0173AutoBootstrapNavigations", 0)
-                    .put("jinhakAuthModel", "user-owned-session-explicit-high3-strict-sandbox-v0174")
+                    .put("jinhakAuthModel", "user-owned-session-explicit-high3-runtime-stable-v0175")
                     .put("v0174StrictHigh3Sandbox", true)
+                    .put("v0175BlockedRoutesPreserveUserSession", true)
+                    .put("v0175SpaHistoryBlankNeutralization", false)
+                    .put("v0175SnapshotOverlapRetryMs", JINHAK_SNAPSHOT_OVERLAP_RETRY_MS)
+                    .put("v0175RendererCrashCooldownMs", JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS)
                     .put("v0174StrictMainFrameBlocks", jinhakV0174StrictMainFrameBlocks)
                     .put("v0174LowerGradeAnyRequestBlocks", jinhakV0174LowerGradeAnyRequestBlocks)
                     .put("v0174ServiceWorkerLowerGradeBlocks", jinhakV0174ServiceWorkerLowerGradeBlocks)
@@ -4402,8 +4420,12 @@ class MainActivity : Activity() {
                     .put("v0173High3StabilityRejects", jinhakV0173High3StabilityRejects)
                     .put("v0173ActualLoginReturns", jinhakV0173ActualLoginReturns)
                     .put("v0173AutoBootstrapNavigations", 0)
-                    .put("jinhakAuthModel", "user-owned-session-explicit-high3-strict-sandbox-v0174")
+                    .put("jinhakAuthModel", "user-owned-session-explicit-high3-runtime-stable-v0175")
                     .put("v0174StrictHigh3Sandbox", true)
+                    .put("v0175BlockedRoutesPreserveUserSession", true)
+                    .put("v0175SpaHistoryBlankNeutralization", false)
+                    .put("v0175SnapshotOverlapRetryMs", JINHAK_SNAPSHOT_OVERLAP_RETRY_MS)
+                    .put("v0175RendererCrashCooldownMs", JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS)
                     .put("v0174StrictMainFrameBlocks", jinhakV0174StrictMainFrameBlocks)
                     .put("v0174LowerGradeAnyRequestBlocks", jinhakV0174LowerGradeAnyRequestBlocks)
                     .put("v0174ServiceWorkerLowerGradeBlocks", jinhakV0174ServiceWorkerLowerGradeBlocks)
