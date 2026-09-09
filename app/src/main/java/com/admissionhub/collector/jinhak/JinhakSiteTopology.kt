@@ -17,23 +17,21 @@ enum class JinhakMissionLane(val wireName: String, val basePriority: Int) {
     UNKNOWN("unknown", 5)
 }
 
-/** Route-first map of the authenticated Jinhak admissions product. */
+/**
+ * v0.19.0 route map. Jinhak network collection is deliberately limited to the protected
+ * early-admission saved-application library. Lane classification is retained for imported legacy
+ * observations, but it no longer expands the live crawler beyond the library.
+ */
 object JinhakSiteTopology {
     private const val ROOT = "https://www.jinhak.com"
 
-    fun userSessionBootstrapUrl(): String = "$ROOT/jh/high3/early/four-year-university/search"
+    fun userSessionBootstrapUrl(): String = JinhakStorageOnlyPolicy.LIBRARY_URL
 
-    fun protectedCoreProbeUrl(): String = "$ROOT/jh/high3/early/four-year-university/library"
+    fun protectedCoreProbeUrl(): String = JinhakStorageOnlyPolicy.LIBRARY_URL
 
-    fun isUserSessionBootstrapUrl(url: String): Boolean {
-        val path = runCatching { URI(url).path?.lowercase().orEmpty() }.getOrDefault("")
-        return path.trimEnd('/') == "/jh/high3/early/four-year-university/search"
-    }
+    fun isUserSessionBootstrapUrl(url: String): Boolean = JinhakStorageOnlyPolicy.isLibrary(url)
 
-    fun missionSeeds(): List<String> = listOf(
-        protectedCoreProbeUrl(),
-        "$ROOT/jh/high3/early/four-year-university/university-major-predict"
-    )
+    fun missionSeeds(): List<String> = listOf(JinhakStorageOnlyPolicy.LIBRARY_URL)
 
     fun lane(url: String, label: String = ""): JinhakMissionLane {
         val lower = url.lowercase()
@@ -59,44 +57,15 @@ object JinhakSiteTopology {
     }
 
     fun priority(url: String, label: String = ""): Int {
-        val lane = lane(url, label)
-        var score = lane.basePriority
-        if (isUserSessionBootstrapUrl(url)) score = maxOf(score, 86)
-        val text = "$url $label"
-        if (Regex("(2027|수시|학생부교과|학생부종합|지역인재|면접)").containsMatchIn(text)) score += 4
-        if (Regex("(실제합격자|과거\\s*3개년|입시결과|합격예측\\s*리포트|모의지원\\s*리포트)").containsMatchIn(text)) score += 8
-        if (lane == JinhakMissionLane.MEDIA) score -= 6
-        return score.coerceIn(0, 120)
+        if (JinhakStorageOnlyPolicy.isLibrary(url)) return 120
+        return lane(url, label).basePriority.coerceIn(0, 120)
     }
 
-    fun isCoreMissionRoute(url: String, label: String = ""): Boolean = priority(url, label) >= 80
+    fun isCoreMissionRoute(url: String, label: String = ""): Boolean =
+        JinhakStorageOnlyPolicy.isLibrary(url)
 
-    /**
-     * v0.14.2 no longer blocks read-only strategy/knowledge pages from the default Susi traversal.
-     * Media and recommendation discovery remain outside the integrated crawl.
-     */
-    fun isDefaultSusiCoreTraversalUrl(url: String, label: String = ""): Boolean {
-        if (isUserSessionBootstrapUrl(url)) return true
-        return when (lane(url, label)) {
-        JinhakMissionLane.SAVED_APPLICATIONS,
-        JinhakMissionLane.CURRENT_PREDICTION,
-        JinhakMissionLane.MOCK_SUPPORT,
-        JinhakMissionLane.ACTUAL_ADMIT,
-        JinhakMissionLane.UNIVERSITY_RESULT,
-        JinhakMissionLane.SCORE_ANALYSIS -> true
-        JinhakMissionLane.STRATEGY,
-        JinhakMissionLane.ADMISSION_KNOWLEDGE,
-        JinhakMissionLane.REFERENCE,
-        JinhakMissionLane.RECOMMENDATION,
-        JinhakMissionLane.MEDIA,
-        JinhakMissionLane.UNKNOWN -> false
-        }
-    }
+    fun isDefaultSusiCoreTraversalUrl(url: String, label: String = ""): Boolean =
+        JinhakStorageOnlyPolicy.isLibrary(url)
 
-    fun shouldExpandEditorial(url: String, label: String = ""): Boolean = when (lane(url, label)) {
-        JinhakMissionLane.UNIVERSITY_RESULT,
-        JinhakMissionLane.STRATEGY,
-        JinhakMissionLane.ADMISSION_KNOWLEDGE -> true
-        else -> false
-    }
+    fun shouldExpandEditorial(url: String, label: String = ""): Boolean = false
 }
