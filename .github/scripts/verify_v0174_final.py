@@ -4,11 +4,16 @@ import re
 ROOT = Path(__file__).resolve().parents[2]
 BASE = Path(__file__).with_name("verify_v0174.py")
 
-# Preserve every first-pass v0.17.4 invariant while accepting the hardened schema.
+# Preserve every first-pass v0.17.4 invariant while accepting the hardened schema
+# and the final centralized foreground-load primitive.
 source = BASE.read_text()
 source = source.replace(
     '"sandboxSchema": "const val SCHEMA_VERSION = 1" in sandbox,',
     '"sandboxSchema": "const val SCHEMA_VERSION = 2" in sandbox,'
+)
+source = source.replace(
+    'assert "webView.loadUrl(safe)" in load',
+    'assert "loadMainUrl(safe)" in load',
 )
 namespace = {"__name__": "__main__", "__file__": str(BASE.resolve())}
 exec(compile(source, str(BASE), "exec"), namespace, namespace)
