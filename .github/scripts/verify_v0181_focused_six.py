@@ -43,10 +43,10 @@ seed_block = topology[seed_start:seed_end]
 if 'ipsi-strategy' in seed_block or 'ipsi-knowledge' in seed_block or 'univ-info/univ-search' in seed_block:
     raise SystemExit('open-world seed regressed into v0.18.1 missionSeeds')
 
-# Product sources must continue to use the on-device vault rather than release-time account literals.
+# Product sources must continue to use the on-device vault and keep credential/session values out of exports.
 if 'credentialVault.load(ProviderId.JINHAK.wireName)' not in main:
     raise SystemExit('Jinhak device-vault credential path missing')
-if 'credentialsExported' not in main or 'sessionSecretExported' not in main:
+if 'credentialExported' not in main or 'sessionSecretExported' not in main:
     raise SystemExit('credential/session export diagnostics missing')
 
 print('v0.18.1 source contracts verified')
