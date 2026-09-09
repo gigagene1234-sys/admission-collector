@@ -3,21 +3,15 @@ package com.admissionhub.collector.jinhak
 import java.net.URI
 
 /**
- * v0.17.4 strict high3-only browser sandbox.
+ * Strict high3-only browser sandbox.
  *
- * Main-frame policy is fail-closed. Inside the Admission Hub Jinhak WebView the only Jinhak
- * destinations that may become the visible top-level page are:
- *   1) HTTPS www.jinhak.com/jh/high3[/...]
- *   2) the exact HTTPS member.jinhak.com .../MemberLogIn.aspx surface only when its ReturnURL
- *      resolves back to a strict high3 route
- *   3) about:blank used as a neutral renderer placeholder
- *
- * Shared root/product routers, generic login routers, high1/high2/high12, other Jinhak product
- * routes and external main-frame destinations are blocked. Lower-grade markers are also treated
- * as forbidden when nested in encoded query/fragment/ReturnURL material by JinhakGradeRouteFence.
+ * Main-frame policy remains fail-closed. v0.17.5 additionally separates route rejection from
+ * authentication state: rejecting a navigation is not evidence that the user was logged out.
+ * A narrow same-document SPA alias may be observed without being promoted to an allowed
+ * collector/main-frame destination.
  */
 object JinhakStrictHigh3Sandbox {
-    const val SCHEMA_VERSION = 2
+    const val SCHEMA_VERSION = 3
 
     enum class MainFrameDecision {
         ALLOW_HIGH3,
@@ -78,6 +72,23 @@ object JinhakStrictHigh3Sandbox {
     fun allowsUserLoginSurface(url: String): Boolean = decision(url) == MainFrameDecision.ALLOW_MEMBER_LOGIN
 
     fun shouldBlockAnyRequest(url: String): Boolean = JinhakGradeRouteFence.isBlockedLowerGrade(url)
+
+    /**
+     * Jinhak can rewrite only the browser history to /jh/search while the already loaded high3
+     * document stays on screen. This is not an allowed network/main-frame destination; it is only
+     * a benign same-document history alias. The caller must already hold an explicitly confirmed
+     * high3 user session before using this exception.
+     */
+    fun isBenignSameDocumentHistoryAlias(url: String): Boolean {
+        if (url.isBlank() || JinhakGradeRouteFence.isBlockedLowerGrade(url)) return false
+        val uri = runCatching { URI(url) }.getOrNull() ?: return false
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        val host = uri.host?.lowercase().orEmpty()
+        val path = uri.path.orEmpty().lowercase().replace('\\', '/').trimEnd('/')
+        return scheme == "https" &&
+            (host == "www.jinhak.com" || host == "jinhak.com") &&
+            path == "/jh/search"
+    }
 
     fun sanitizedHigh3OrNull(url: String?): String? {
         val candidate = url.orEmpty().trim()
