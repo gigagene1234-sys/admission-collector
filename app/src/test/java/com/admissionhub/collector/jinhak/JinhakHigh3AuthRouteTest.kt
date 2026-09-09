@@ -29,23 +29,51 @@ class JinhakHigh3AuthRouteTest {
     }
 
     @Test
-    fun genericProductLoginIsAllowedForSiteOwnedAuthentication() {
+    fun genericProductLoginIsRecognizedButNeverCanonicalAuth() {
         val generic = "https://www.jinhak.com/jh/member/login"
         assertTrue(JinhakHigh3AuthRoute.isGenericProductLogin(generic))
         assertEquals(
-            JinhakHigh3AuthRoute.MainFrameDecision.ALLOW_CANONICAL_AUTH,
+            JinhakHigh3AuthRoute.MainFrameDecision.ALLOW_OTHER_JINHAK,
             JinhakHigh3AuthRoute.decision(generic)
         )
+        assertEquals(
+            JinhakStrictHigh3Sandbox.MainFrameDecision.BLOCK_GENERIC_LOGIN,
+            JinhakStrictHigh3Sandbox.decision(generic)
+        )
+        assertFalse(JinhakStrictHigh3Sandbox.allowsVisibleMainFrame(generic))
     }
 
     @Test
-    fun memberLoginWithoutCollectorReturnUrlIsAllowedAsSiteSurface() {
+    fun memberLoginWithoutHigh3ReturnIsOnlyAHostPathMatchAndIsStrictlyBlocked() {
         val member = "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx"
         assertTrue(JinhakHigh3AuthRoute.isMemberLoginSurface(member))
+        assertFalse(JinhakHigh3AuthRoute.isCanonicalMemberLogin(member))
+        assertEquals(
+            JinhakHigh3AuthRoute.MainFrameDecision.ALLOW_OTHER_JINHAK,
+            JinhakHigh3AuthRoute.decision(member)
+        )
+        assertEquals(
+            JinhakStrictHigh3Sandbox.MainFrameDecision.BLOCK_MEMBER_LOGIN_WITHOUT_HIGH3_RETURN,
+            JinhakStrictHigh3Sandbox.decision(member)
+        )
+        assertFalse(JinhakStrictHigh3Sandbox.allowsUserLoginSurface(member))
+    }
+
+    @Test
+    fun exactMemberLoginWithHigh3ReturnIsCanonicalUserLoginSurfaceOnly() {
+        val member = "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx?ReturnURL=https%3A%2F%2Fwww.jinhak.com%2Fjh%2Fhigh3%2Fearly%2Ffour-year-university%2Flibrary"
+        assertTrue(JinhakHigh3AuthRoute.isMemberLoginSurface(member))
+        assertTrue(JinhakHigh3AuthRoute.isCanonicalMemberLogin(member))
         assertEquals(
             JinhakHigh3AuthRoute.MainFrameDecision.ALLOW_CANONICAL_AUTH,
             JinhakHigh3AuthRoute.decision(member)
         )
+        assertEquals(
+            JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN,
+            JinhakStrictHigh3Sandbox.decision(member)
+        )
+        assertTrue(JinhakStrictHigh3Sandbox.allowsUserLoginSurface(member))
+        assertFalse(JinhakStrictHigh3Sandbox.allowsCollectorNavigation(member))
     }
 
     @Test
