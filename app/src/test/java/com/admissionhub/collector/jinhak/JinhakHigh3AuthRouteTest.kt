@@ -8,36 +8,43 @@ import java.net.URI
 
 class JinhakHigh3AuthRouteTest {
     @Test
-    fun canonicalLoginUsesMemberHostAndExplicitHigh3ReturnUrl() {
+    fun legacyCanonicalLoginShimNeverCreatesMemberLoginUrl() {
         val target = "https://www.jinhak.com/jh/high3/early/four-year-university/library"
-        val login = JinhakHigh3AuthRoute.canonicalLoginUrl(target)
-        val uri = URI(login)
+        val result = JinhakHigh3AuthRoute.canonicalLoginUrl(target)
+        val uri = URI(result)
 
-        assertEquals("member.jinhak.com", uri.host)
-        assertTrue(uri.path.endsWith("/MemberLogIn.aspx"))
-        assertEquals(target, JinhakHigh3AuthRoute.returnUrl(login))
-        assertTrue(JinhakHigh3AuthRoute.isCanonicalMemberLogin(login))
-        assertFalse(JinhakGradeRouteFence.isBlockedLowerGrade(login))
+        assertEquals("www.jinhak.com", uri.host)
+        assertTrue(uri.path.startsWith("/jh/high3/"))
+        assertFalse(result.contains("member.jinhak.com", ignoreCase = true))
     }
 
     @Test
-    fun lowerGradeReturnTargetCanNeverBecomeAuthDestination() {
+    fun lowerGradeRequestedTargetFallsBackToProtectedHigh3() {
         val requested = "https://www.jinhak.com/jh/high2/early"
-        val login = JinhakHigh3AuthRoute.canonicalLoginUrl(requested)
-        val actualReturn = JinhakHigh3AuthRoute.returnUrl(login)
+        val result = JinhakHigh3AuthRoute.canonicalLoginUrl(requested)
 
-        assertEquals(JinhakGradeRouteFence.protectedHigh3Core(), actualReturn)
-        assertTrue(actualReturn?.contains("/jh/high3/") == true)
-        assertFalse(actualReturn?.contains("/jh/high2/") == true)
+        assertEquals(JinhakGradeRouteFence.protectedHigh3Core(), result)
+        assertTrue(result.contains("/jh/high3/"))
+        assertFalse(result.contains("/jh/high2/"))
     }
 
     @Test
-    fun genericProductLoginIsRewriteOnlyNotCollectorAuthEntry() {
+    fun genericProductLoginIsAllowedForSiteOwnedAuthentication() {
         val generic = "https://www.jinhak.com/jh/member/login"
         assertTrue(JinhakHigh3AuthRoute.isGenericProductLogin(generic))
         assertEquals(
-            JinhakHigh3AuthRoute.MainFrameDecision.REWRITE_GENERIC_LOGIN,
+            JinhakHigh3AuthRoute.MainFrameDecision.ALLOW_CANONICAL_AUTH,
             JinhakHigh3AuthRoute.decision(generic)
+        )
+    }
+
+    @Test
+    fun memberLoginWithoutCollectorReturnUrlIsAllowedAsSiteSurface() {
+        val member = "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx"
+        assertTrue(JinhakHigh3AuthRoute.isMemberLoginSurface(member))
+        assertEquals(
+            JinhakHigh3AuthRoute.MainFrameDecision.ALLOW_CANONICAL_AUTH,
+            JinhakHigh3AuthRoute.decision(member)
         )
     }
 
