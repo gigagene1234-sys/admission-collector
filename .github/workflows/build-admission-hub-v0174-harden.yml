@@ -1,0 +1,207 @@
+name: Build Admission Hub v0.17.4 Strict High3 Sandbox Hardened
+
+on:
+  push:
+    branches: [codex/v0174-strict-high3-sandbox]
+    paths:
+      - ".github/workflows/build-admission-hub-v0174-harden.yml"
+      - ".github/scripts/patch_v0174_harden.py"
+      - ".github/scripts/verify_v0174_harden.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0174-strict-high3-sandbox-hardened
+  cancel-in-progress: true
+
+jobs:
+  build-test-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.17.4-Strict-High3-Sandbox.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/v0174-strict-high3-sandbox
+
+      - name: Apply second-pass strict sandbox hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch_v0174_harden.py
+          git diff --check
+
+      - name: Verify exhaustive hardened source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_v0174_harden.py
+
+      - name: Commit exact hardened v0.17.4 product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/jinhak/JinhakSlowLanePool.kt
+          if ! git diff --cached --quiet; then
+            git commit -m 'Admission Hub v0.17.4 harden every Jinhak navigation lane'
+            git push origin HEAD:codex/v0174-strict-high3-sandbox
+          fi
+          echo "PRODUCT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify exact committed hardened source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_v0174_harden.py
+          git diff --check
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore proven stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35 and expose build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' >/dev/null
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+          cache-read-only: true
+
+      - name: Test all application and regression contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace testDebugUnitTest
+          python3 - <<'PY'
+          import pathlib, xml.etree.ElementTree as ET
+          files=list(pathlib.Path('app/build/test-results/testDebugUnitTest').glob('TEST-*.xml'))
+          if not files: raise SystemExit('no unit test reports')
+          tests=failures=errors=skipped=0
+          for p in files:
+              r=ET.parse(p).getroot()
+              tests+=int(r.attrib.get('tests',0)); failures+=int(r.attrib.get('failures',0)); errors+=int(r.attrib.get('errors',0)); skipped+=int(r.attrib.get('skipped',0))
+          print({'tests':tests,'failures':failures,'errors':errors,'skipped':skipped})
+          if failures or errors or skipped: raise SystemExit('unit tests not clean')
+          if tests < 110: raise SystemExit(f'unexpectedly low test count: {tests}')
+          PY
+
+      - name: Compile signed product
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK metadata and stable signer
+        run: bash .github/scripts/verify_apk_v0174.sh
+
+      - name: Clean rebuild and retest exact committed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PRODUCT_COMMIT"
+          git diff --exit-code
+          git diff --cached --exit-code
+          gradle --no-daemon clean testDebugUnitTest assembleDebug
+          python3 .github/scripts/verify_v0174_harden.py
+          bash .github/scripts/verify_apk_v0174.sh
+          git diff --exit-code
+
+      - name: Package APK and hardened verification report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-v0174
+          cp app/build/outputs/apk/debug/app-debug.apk "release-v0174/$APK_NAME"
+          sha256sum "release-v0174/$APK_NAME" | tee "release-v0174/$APK_NAME.sha256"
+          SIGNER="$(apksigner verify --print-certs app/build/outputs/apk/debug/app-debug.apk | awk -F': ' '/Signer #1 certificate SHA-256 digest:/ {print tolower($2); exit}')"
+          test "$SIGNER" = "db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995"
+          TESTS="$(python3 - <<'PY'
+          import pathlib, xml.etree.ElementTree as ET
+          n=0
+          for p in pathlib.Path('app/build/test-results/testDebugUnitTest').glob('TEST-*.xml'):
+              n += int(ET.parse(p).getroot().attrib.get('tests',0))
+          print(n)
+          PY
+          )"
+          cat > release-v0174/verification-v0.17.4.json <<EOF
+          {
+            "versionName": "0.17.4",
+            "versionCode": 117400,
+            "sourceCommit": "$PRODUCT_COMMIT",
+            "tests": $TESTS,
+            "signerSha256": "$SIGNER",
+            "exactCommittedSourceRebuild": true,
+            "stableEncryptedKeystoreRestored": true,
+            "jinhakAuthModel": "user-owned-session-explicit-high3-strict-sandbox-v0174",
+            "jinhakSessionAuthority": "user",
+            "strictHigh3VisibleMainFrame": true,
+            "memberLoginRequiresHigh3ReturnUrl": true,
+            "sharedRootAllowed": false,
+            "genericProductLoginRouterAllowed": false,
+            "lowerGradeMainFrameAllowed": false,
+            "lowerGradeAnyRequestAllowed": false,
+            "lowerGradeServiceWorkerAllowed": false,
+            "otherJinhakProductMainFrameAllowed": false,
+            "externalMainFrameAllowed": false,
+            "popupEscapeAllowed": false,
+            "historyEscapeAllowed": false,
+            "foregroundRetryEscapeAllowed": false,
+            "hiddenSlowLaneEscapeAllowed": false,
+            "rendererUnsafeResumeAllowed": false,
+            "persistedUnsafeTargetAllowed": false,
+            "collectorAutoHigh3Resume": false,
+            "collectorAutoLoginRecovery": false,
+            "collectorVerifiesJinhakLogin": false,
+            "collectorRestoresJinhakAuthLease": false,
+            "collectorCapturesJinhakAuthLease": false,
+            "collectorExtendsJinhakSession": false,
+            "collectorReadsOrSubmitsJinhakCredentials": false,
+            "explicitVisibleHigh3ApprovalRequired": true,
+            "credentialsExported": false,
+            "cookiesExported": false,
+            "sessionSecretsExported": false,
+            "jinhakPromotedToOfficial": false,
+            "probabilityInferredByRelease": false,
+            "deviceAcceptance": "DEVICE_STRICT_SANDBOX_UNVERIFIED"
+          }
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.17.4-strict-high3-sandbox-hardened
+          path: release-v0174/*
+
+      - name: Publish hardened v0.17.4 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view v0.17.4 >/dev/null 2>&1 && gh release delete v0.17.4 --yes --cleanup-tag || true
+          gh release create v0.17.4 release-v0174/* \
+            --target "$PRODUCT_COMMIT" \
+            --title 'Admission Hub v0.17.4 — Strict High3 Sandbox' \
+            --notes-file docs/releases/v0.17.4.md
