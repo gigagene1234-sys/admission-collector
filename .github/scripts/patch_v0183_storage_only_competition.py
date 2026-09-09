@@ -10,6 +10,15 @@ def replace_once(path: str, old: str, new: str) -> None:
     p.write_text(text.replace(old, new, 1))
 
 
+def replace_all_checked(path: str, old: str, new: str, expected: int) -> None:
+    p = Path(path)
+    text = p.read_text()
+    count = text.count(old)
+    if count != expected:
+        raise SystemExit(f"{path}: expected exactly {expected} matches, got {count}: {old[:180]!r}")
+    p.write_text(text.replace(old, new))
+
+
 # Version/label.
 replace_once(
     "app/build.gradle.kts",
@@ -238,8 +247,8 @@ replace_once(
 '''
 )
 
-# Add v0.18.3 diagnostics to the existing Jinhak auth diagnostic payload.
-replace_once(
+# Both auth/live diagnostic payloads should expose the same storage-watch state.
+replace_all_checked(
     "app/src/main/java/com/admissionhub/collector/MainActivity.kt",
     '''                    .put("v0182RecoveryScopePreparations", jinhakV0182RecoveryScopePreparations)
 ''',
@@ -251,7 +260,8 @@ replace_once(
                     .put("v0183CurrentCompetitionVerifiedRecords", jinhakV0183CurrentCompetitionVerifiedRecords)
                     .put("v0183StorageRefreshes", jinhakV0183StorageRefreshes)
                     .put("v0183NextRefreshAtMs", jinhakV0183NextRefreshAtMs)
-'''
+''',
+    expected=2
 )
 
 print("v0.18.3 storage-only competition watch patch applied")
