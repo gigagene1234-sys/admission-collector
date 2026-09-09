@@ -103,9 +103,19 @@ replace_once(
 )
 replace_once(
     "app/src/main/java/com/admissionhub/collector/MainActivity.kt",
-    '''        if (provider == ProviderId.JINHAK) {
+    '''    private fun startBatch() {
+        if (provider == ProviderId.JINHAK && !jinhakUserSessionConfirmed) {
+            enterJinhakUserSessionGate("start-batch")
+            return
+        }
+        if (provider == ProviderId.JINHAK) {
 ''',
-    '''        if (provider == ProviderId.JINHAK) {
+    '''    private fun startBatch() {
+        if (provider == ProviderId.JINHAK && !jinhakUserSessionConfirmed) {
+            enterJinhakUserSessionGate("start-batch")
+            return
+        }
+        if (provider == ProviderId.JINHAK) {
             activateV0181PinnedSixFocus("start-batch")
 '''
 )
