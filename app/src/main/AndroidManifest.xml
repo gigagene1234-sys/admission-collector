@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.17.2 Bootstrap-Safe Jinhak Session"
+        android:label="Admission Hub v0.17.3 Natural High3 Handoff"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
