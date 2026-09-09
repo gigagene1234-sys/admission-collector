@@ -60,6 +60,7 @@ import com.admissionhub.collector.jinhak.JinhakAuthEventState
 import com.admissionhub.collector.jinhak.JinhakUserSessionPolicy
 import com.admissionhub.collector.jinhak.JinhakStrictHigh3Sandbox
 import com.admissionhub.collector.jinhak.JinhakDedicatedAuthPolicy
+import com.admissionhub.collector.jinhak.JinhakFocusedSixPolicy
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -444,6 +445,12 @@ class MainActivity : Activity() {
     private var jinhakV0180LowerGradeBlocks = 0
     private var jinhakV0180AuthLastReason = ""
     private var jinhakV0180AuthLastSafePath = ""
+    private var jinhakV0181FocusedSixMode = false
+    private val jinhakV0181PinnedIdentityKeys = linkedSetOf<String>()
+    private var jinhakV0181PinnedIdentitySeeds = 0
+    private var jinhakV0181GenericRoutesSuppressed = 0
+    private var jinhakV0181GenericActionsSuppressed = 0
+    private var jinhakV0181ProtectedCoreStarts = 0
     private var jinhakV0174StrictEntryRequests = 0
     private var jinhakV0174ForbiddenPageStartsStopped = 0
     private var jinhakV0174ForbiddenPageFinishesObserved = 0
@@ -546,7 +553,7 @@ class MainActivity : Activity() {
         private const val JINHAK_LOGIN_RECOVERY_TIMEOUT_MS = 60_000L
         private const val MAX_JINHAK_LOGIN_RECOVERY_POLLS = 40
         private const val MAX_JINHAK_REAUTH_CYCLES = 3
-        private const val V0180_AUTH_MAX_FILL_ATTEMPTS = 3
+        private const val V0180_AUTH_MAX_FILL_ATTEMPTS = 12
         private const val V0180_AUTH_RENDERER_RESTART_LIMIT = 2
         private const val MAX_JINHAK_LOWER_GRADE_HIGH3_RECOVERIES = 2
         private const val JINHAK_LOWER_GRADE_RECOVERY_DELAY_MS = 450L
@@ -584,8 +591,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.18.0"
-        private const val BUILD_CODE = 118000
+        private const val VERSION = "0.18.1"
+        private const val BUILD_CODE = 118100
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -2707,6 +2714,7 @@ class MainActivity : Activity() {
     }
 
     private fun currentExpectedJinhakMissionIdentities(): Set<String> = when {
+        jinhakV0181FocusedSixMode && jinhakV0181PinnedIdentityKeys.isNotEmpty() -> jinhakV0181PinnedIdentityKeys.toSet()
         selectedSixRecoveryMode && selectedSixRecoveryIdentityKeys.isNotEmpty() -> selectedSixRecoveryIdentityKeys.toSet()
         jinhakNormalizedIdentitySeedKeys.isNotEmpty() -> jinhakNormalizedIdentitySeedKeys.toSet()
         jinhakMissionCoverage.isNotEmpty() -> jinhakMissionCoverage.keys.toSet()
@@ -3727,7 +3735,7 @@ class MainActivity : Activity() {
                 credentialAutoLoginLastResult = "v0180-not-submitted-${result.optString("reason", "unknown")}"
                 val next = attempt + 1
                 if (next < V0180_AUTH_MAX_FILL_ATTEMPTS) {
-                    val delay = when (next) { 1 -> 350L; else -> 900L }
+                    val delay = when { next <= 2 -> 350L; next <= 5 -> 700L; else -> 1_200L }
                     handler.postDelayed({ attemptV0180JinhakAuthAutofill(generation, next) }, delay)
                 } else {
                     jinhakV0180AuthFailures += 1
@@ -3810,11 +3818,10 @@ class MainActivity : Activity() {
         )
         persistJinhakAuthDiagnostics("v0180-auth-success")
 
-        val target = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(currentBatchTarget)
-            ?: JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(successUrl)
-            ?: JinhakStrictHigh3Sandbox.strictEntryUrl()
+        val target = JinhakSiteTopology.protectedCoreProbeUrl()
+        jinhakV0181ProtectedCoreStarts += 1
         currentBatchTarget = target
-        loadJinhakV0174High3Only(target, "v0180-auth-success-handoff")
+        loadJinhakV0174High3Only(target, "v0181-auth-success-protected-core")
     }
 
     private fun recreateV0180AuthWebView(generation: Int) {
@@ -4548,6 +4555,11 @@ class MainActivity : Activity() {
                     .put("v0180AuthRendererRestarts", jinhakV0180AuthRendererRestarts)
                     .put("v0180CollectorLoginRouteLoads", jinhakV0180CollectorLoginRouteLoads)
                     .put("v0180LowerGradeBlocks", jinhakV0180LowerGradeBlocks)
+                    .put("v0181FocusedSixMode", jinhakV0181FocusedSixMode)
+                    .put("v0181PinnedIdentitySeeds", jinhakV0181PinnedIdentitySeeds)
+                    .put("v0181GenericRoutesSuppressed", jinhakV0181GenericRoutesSuppressed)
+                    .put("v0181GenericActionsSuppressed", jinhakV0181GenericActionsSuppressed)
+                    .put("v0181ProtectedCoreStarts", jinhakV0181ProtectedCoreStarts)
                     .put("v0180RecursiveAuthPolling", false)
                     .put("v0180CollectorOwnsLogin", false)
                     .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
@@ -4839,6 +4851,11 @@ class MainActivity : Activity() {
                     .put("v0180AuthRendererRestarts", jinhakV0180AuthRendererRestarts)
                     .put("v0180CollectorLoginRouteLoads", jinhakV0180CollectorLoginRouteLoads)
                     .put("v0180LowerGradeBlocks", jinhakV0180LowerGradeBlocks)
+                    .put("v0181FocusedSixMode", jinhakV0181FocusedSixMode)
+                    .put("v0181PinnedIdentitySeeds", jinhakV0181PinnedIdentitySeeds)
+                    .put("v0181GenericRoutesSuppressed", jinhakV0181GenericRoutesSuppressed)
+                    .put("v0181GenericActionsSuppressed", jinhakV0181GenericActionsSuppressed)
+                    .put("v0181ProtectedCoreStarts", jinhakV0181ProtectedCoreStarts)
                     .put("v0180RecursiveAuthPolling", false)
                     .put("v0180CollectorOwnsLogin", false)
                     .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
@@ -5418,12 +5435,36 @@ class MainActivity : Activity() {
             }
         }
     }
+    private fun activateV0181PinnedSixFocus(trigger: String): Boolean {
+        if (provider != ProviderId.JINHAK) return false
+        val slots = localStore.loadHubApplicationSlots()
+        val rows = mutableListOf<Pair<Boolean, String>>()
+        for (i in 0 until slots.length()) {
+            val row = slots.optJSONObject(i) ?: continue
+            rows += row.optBoolean("occupied", false) to row.optString("applicationIdentityKey")
+        }
+        val keys = JinhakFocusedSixPolicy.pinnedIdentityKeys(rows)
+        jinhakV0181PinnedIdentityKeys.clear()
+        jinhakV0181PinnedIdentityKeys.addAll(keys)
+        jinhakV0181FocusedSixMode = keys.size == JinhakFocusedSixPolicy.REQUIRED_PINNED_APPLICATIONS
+        if (jinhakV0181FocusedSixMode) {
+            jinhakV0181PinnedIdentitySeeds = keys.size
+            keys.forEach { identity -> jinhakMissionCoverage.getOrPut(identity) { linkedSetOf() } }
+            recordRuntimeEvent("jinhak-v0181-focused-six-activated", JSONObject()
+                .put("trigger", trigger.take(80))
+                .put("pinnedIdentityCount", keys.size)
+                .put("genericNavigationAllowed", false))
+        }
+        return jinhakV0181FocusedSixMode
+    }
+
     private fun startBatch() {
         if (provider == ProviderId.JINHAK && !jinhakUserSessionConfirmed) {
             enterJinhakUserSessionGate("start-batch")
             return
         }
         if (provider == ProviderId.JINHAK) {
+            activateV0181PinnedSixFocus("start-batch")
             val visibleHigh3 = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(webView.url)
             if (!jinhakUserSessionConfirmed || visibleHigh3 == null) {
                 jinhakV0174PersistedTargetBlocks += 1
@@ -8034,8 +8075,13 @@ class MainActivity : Activity() {
                     // generic read-only navigation resume; application-bound live anchors are not
                     // re-selected outside the persistent ledger.
                     val genericPool = candidates.filter { it.applicationContext?.identityKey == null }
-                    val generic = JinhakMissionLaneSequencer.choose(genericPool, null, emptySet(), false)
-                    JinhakMissionLaneSequencer.Selection(generic.candidate, true, generic.requestedLane)
+                    if (jinhakV0181FocusedSixMode) {
+                        jinhakV0181GenericActionsSuppressed += genericPool.size
+                        JinhakMissionLaneSequencer.Selection(null, true, "reference")
+                    } else {
+                        val generic = JinhakMissionLaneSequencer.choose(genericPool, null, emptySet(), false)
+                        JinhakMissionLaneSequencer.Selection(generic.candidate, true, generic.requestedLane)
+                    }
                 }
             }
             currentMissionKey == null && !JinhakAuthDomainPolicy.allowGenericNavigation(jinhakMissionTargetLedger.outstandingCount()) ->
@@ -9261,10 +9307,15 @@ class MainActivity : Activity() {
             recordJinhakCoreScopeBlock(url)
             return false
         }
-        val lane = JinhakSiteTopology.lane(url)
-        val allowed = JinhakSiteTopology.isDefaultSusiCoreTraversalUrl(url) ||
-            (JinhakGradeRouteFence.isHigh3(url) && lane == com.admissionhub.collector.jinhak.JinhakMissionLane.UNKNOWN)
-        if (!allowed) recordJinhakCoreScopeBlock(url)
+        val allowed = if (jinhakV0181FocusedSixMode) {
+            JinhakFocusedSixPolicy.isFocusedCoreUrl(url)
+        } else {
+            JinhakSiteTopology.isDefaultSusiCoreTraversalUrl(url)
+        }
+        if (!allowed) {
+            jinhakV0181GenericRoutesSuppressed += 1
+            recordJinhakCoreScopeBlock(url)
+        }
         return allowed
     }
 
@@ -9298,6 +9349,10 @@ class MainActivity : Activity() {
     private fun enqueueDiscoveredUrl(url: String) {
         if (url.isBlank() || !isBatchNavigableProviderUrl(url)) return
         if (provider == ProviderId.JINHAK && !JinhakStrictHigh3Sandbox.allowsCollectorNavigation(url)) return
+        if (provider == ProviderId.JINHAK && jinhakV0181FocusedSixMode && !JinhakFocusedSixPolicy.isFocusedCoreUrl(url)) {
+            jinhakV0181GenericRoutesSuppressed += 1
+            return
+        }
         if (provider == ProviderId.JINHAK && !JinhakSiteTopology.isDefaultSusiCoreTraversalUrl(url)) return
         if (provider == ProviderId.JINHAK && batchQueued.size + batchVisited.size >= MAX_JINHAK_AUTONAV_PAGES) return
         if (batchVisited.contains(url)) return

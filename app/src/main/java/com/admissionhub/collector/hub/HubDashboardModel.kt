@@ -92,7 +92,7 @@ object HubDashboardModel {
                 .put("title", "$slot. ${slotRow?.optString("displayLabel", "연결 확인 필요")}")
                 .put("qualityState", "stale").put("qualityLabel", "canonical 연결 복구 필요")
                 .put("coverageCount", 0).put("coverageComplete", false)
-                .put("scoreDecision", JSONObject().put("decisionLabel", "종합: 판정 보류"))
+                .put("scoreDecision", enrichScoreForDisplay(score).put("decisionLabel", "종합: 판정 보류 · canonical 연결 복구 필요"))
         }
 
         val coverage = candidate.optJSONObject("coverage") ?: JSONObject()

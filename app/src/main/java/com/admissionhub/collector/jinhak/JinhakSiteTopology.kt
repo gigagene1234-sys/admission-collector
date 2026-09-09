@@ -31,11 +31,8 @@ object JinhakSiteTopology {
     }
 
     fun missionSeeds(): List<String> = listOf(
-        userSessionBootstrapUrl(),
         protectedCoreProbeUrl(),
-        "$ROOT/jh/high3/early/four-year-university/university-major-predict",
-        "$ROOT/jh/high3/univ-major/univ-info/univ-search",
-        "$ROOT/jh/high3/ipsi-analysis/ipsi-strategy"
+        "$ROOT/jh/high3/early/four-year-university/university-major-predict"
     )
 
     fun lane(url: String, label: String = ""): JinhakMissionLane {
@@ -86,9 +83,9 @@ object JinhakSiteTopology {
         JinhakMissionLane.MOCK_SUPPORT,
         JinhakMissionLane.ACTUAL_ADMIT,
         JinhakMissionLane.UNIVERSITY_RESULT,
-        JinhakMissionLane.SCORE_ANALYSIS,
+        JinhakMissionLane.SCORE_ANALYSIS -> true
         JinhakMissionLane.STRATEGY,
-        JinhakMissionLane.ADMISSION_KNOWLEDGE -> true
+        JinhakMissionLane.ADMISSION_KNOWLEDGE,
         JinhakMissionLane.REFERENCE,
         JinhakMissionLane.RECOMMENDATION,
         JinhakMissionLane.MEDIA,
