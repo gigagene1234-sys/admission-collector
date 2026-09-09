@@ -2,25 +2,28 @@ package com.admissionhub.collector.jinhak
 
 import java.net.URI
 import java.net.URLDecoder
-import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
 /**
- * Canonical authentication entry for the high3/N수 collector.
+ * Jinhak high3 route policy for the v0.17.0 server-owned authentication model.
  *
- * The collector must never use a product-selector/login wrapper as an auth bootstrap. A protected
- * high3 URL currently redirects to member.jinhak.com with an explicit high3 ReturnURL; this helper
- * models that transport contract and rejects every lower-grade destination before navigation.
+ * Authentication is not initiated or proven by the Collector. The Collector opens only real
+ * protected high3 mission routes. If Jinhak decides that authentication is required, the site's
+ * own redirect to a login surface is allowed to render unchanged. A natural return to high3 is
+ * treated as a browser/navigation event, not as a DOM authentication verdict.
  *
- * This class is deliberately UI-agnostic: it never hides DOM nodes, changes WebView visibility,
- * clicks grade selectors, or performs navigation by itself.
+ * Lower-grade routes remain transport-level blocked. No method in this object creates a member
+ * login URL or rewrites a generic login URL into another login route.
  */
 object JinhakHigh3AuthRoute {
-    const val SCHEMA_VERSION = 2
-    private const val MEMBER_LOGIN_ROOT = "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx"
+    const val SCHEMA_VERSION = 3
     private const val WWW_HOST = "www.jinhak.com"
     private const val MEMBER_HOST = "member.jinhak.com"
 
+    /**
+     * Legacy enum names are retained so older call sites compile while the v0.17.0 migration is
+     * completed. REWRITE_GENERIC_LOGIN is intentionally unreachable from [decision].
+     */
     enum class MainFrameDecision {
         ALLOW_HIGH3,
         ALLOW_CANONICAL_AUTH,
@@ -29,11 +32,13 @@ object JinhakHigh3AuthRoute {
         ALLOW_OTHER_JINHAK
     }
 
-    fun canonicalLoginUrl(requestedReturnTarget: String?): String {
-        val target = sanitizeReturnTarget(requestedReturnTarget)
-        val encoded = URLEncoder.encode(target, StandardCharsets.UTF_8.name())
-        return "$MEMBER_LOGIN_ROOT?ReturnURL=$encoded"
-    }
+    /**
+     * Compatibility shim only. v0.17.0 never constructs a member-login URL. If an old call site
+     * accidentally invokes this method it is fail-safe: it returns the protected high3 target,
+     * letting Jinhak's server decide whether a login redirect is necessary.
+     */
+    @Deprecated("v0.17.0 uses server-owned authentication and never constructs login URLs")
+    fun canonicalLoginUrl(requestedReturnTarget: String?): String = sanitizeReturnTarget(requestedReturnTarget)
 
     fun sanitizeReturnTarget(requested: String?): String {
         val candidate = requested.orEmpty().trim()
@@ -100,8 +105,7 @@ object JinhakHigh3AuthRoute {
     fun decision(url: String): MainFrameDecision {
         if (JinhakGradeRouteFence.isBlockedLowerGrade(url)) return MainFrameDecision.BLOCK_LOWER_GRADE
         if (isAllowedHigh3Target(url)) return MainFrameDecision.ALLOW_HIGH3
-        if (isCanonicalMemberLogin(url)) return MainFrameDecision.ALLOW_CANONICAL_AUTH
-        if (isGenericProductLogin(url)) return MainFrameDecision.REWRITE_GENERIC_LOGIN
+        if (isMemberLoginSurface(url) || isGenericProductLogin(url)) return MainFrameDecision.ALLOW_CANONICAL_AUTH
         return MainFrameDecision.ALLOW_OTHER_JINHAK
     }
 
