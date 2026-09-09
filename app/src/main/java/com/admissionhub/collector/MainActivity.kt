@@ -61,6 +61,7 @@ import com.admissionhub.collector.jinhak.JinhakUserSessionPolicy
 import com.admissionhub.collector.jinhak.JinhakStrictHigh3Sandbox
 import com.admissionhub.collector.jinhak.JinhakDedicatedAuthPolicy
 import com.admissionhub.collector.jinhak.JinhakFocusedSixPolicy
+import com.admissionhub.collector.jinhak.JinhakProtectedSessionPolicy
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -451,6 +452,17 @@ class MainActivity : Activity() {
     private var jinhakV0181GenericRoutesSuppressed = 0
     private var jinhakV0181GenericActionsSuppressed = 0
     private var jinhakV0181ProtectedCoreStarts = 0
+    private var jinhakV0182ProtectedSessionVerified = false
+    private var jinhakV0182ProtectedSessionVerifications = 0
+    private var jinhakV0182ProtectedBootstrapAttempts = 0
+    private var jinhakV0182ProtectedBootstrapFailures = 0
+    private var jinhakV0182ProtectedBootstrapGeneration = 0
+    private var jinhakV0182High3ReturnsAwaitingProof = 0
+    private var jinhakV0182AutofillChainGeneration = -1
+    private var jinhakV0182AutofillAttemptsThisGeneration = 0
+    private var jinhakV0182CredentialSubmitVerifiedSuccesses = 0
+    private var jinhakV0182ManualHigh3Returns = 0
+    private var jinhakV0182RecoveryScopePreparations = 0
     private var jinhakV0174StrictEntryRequests = 0
     private var jinhakV0174ForbiddenPageStartsStopped = 0
     private var jinhakV0174ForbiddenPageFinishesObserved = 0
@@ -555,6 +567,8 @@ class MainActivity : Activity() {
         private const val MAX_JINHAK_REAUTH_CYCLES = 3
         private const val V0180_AUTH_MAX_FILL_ATTEMPTS = 12
         private const val V0180_AUTH_RENDERER_RESTART_LIMIT = 2
+        private const val V0182_PROTECTED_BOOTSTRAP_TIMEOUT_MS = 12_000L
+        private const val V0182_MAX_PROTECTED_BOOTSTRAP_ATTEMPTS = 3
         private const val MAX_JINHAK_LOWER_GRADE_HIGH3_RECOVERIES = 2
         private const val JINHAK_LOWER_GRADE_RECOVERY_DELAY_MS = 450L
         private const val MAX_JINHAK_INCOMPLETE_COVERAGE_RECOVERY_ATTEMPTS = 2
@@ -591,8 +605,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.18.1"
-        private const val BUILD_CODE = 118100
+        private const val VERSION = "0.18.2"
+        private const val BUILD_CODE = 118200
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -1785,7 +1799,7 @@ class MainActivity : Activity() {
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 runtimeLastSafePath = runtimeSafePath(url)
                 if (provider == ProviderId.JINHAK) {
-                    if (JinhakDedicatedAuthPolicy.isLoginSurface(url)) {
+                    if (JinhakDedicatedAuthPolicy.isLoginSurface(url) == true) {
                         jinhakV0180CollectorLoginRouteLoads += 1
                         runCatching { view.stopLoading() }
                         startV0180DedicatedJinhakAuth("collector-page-started-login")
@@ -1828,6 +1842,9 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
                 if (provider == ProviderId.JINHAK) {
+                    if (JinhakProtectedSessionPolicy.isProtectedProofUrl(url)) {
+                        markV0182ProtectedSessionVerified(url, "collector-page-finished-protected")
+                    }
                     if (JinhakDedicatedAuthPolicy.isLoginSurface(url)) {
                         jinhakV0180CollectorLoginRouteLoads += 1
                         startV0180DedicatedJinhakAuth("collector-page-finished-login")
@@ -3642,6 +3659,10 @@ class MainActivity : Activity() {
         jinhakV0180AuthFillAttempt = 0
         jinhakV0180AuthHigh3ProbeGeneration = -1
         jinhakV0180AuthRendererRestarts = 0
+        jinhakV0182AutofillChainGeneration = -1
+        jinhakV0182AutofillAttemptsThisGeneration = 0
+        jinhakV0182ProtectedSessionVerified = false
+        jinhakAuthVerifiedForBatch = false
         jinhakV0180AuthState = if (credential == null) "MANUAL_LOGIN" else "AUTH_WEBVIEW_LOADING"
         batchPausedForLogin = batchRunning
         if (::batchCover.isInitialized) batchCover.visibility = View.GONE
@@ -3665,6 +3686,13 @@ class MainActivity : Activity() {
         if (provider != ProviderId.JINHAK || generation != jinhakV0180AuthGeneration) return
         if (!::authHost.isInitialized || authHost.visibility != View.VISIBLE) return
         if (jinhakV0180AuthSubmitGeneration == generation) return
+        if (attempt == 0) {
+            if (jinhakV0182AutofillChainGeneration == generation) return
+            jinhakV0182AutofillChainGeneration = generation
+            jinhakV0182AutofillAttemptsThisGeneration = 0
+        }
+        if (jinhakV0182AutofillAttemptsThisGeneration >= V0180_AUTH_MAX_FILL_ATTEMPTS) return
+        jinhakV0182AutofillAttemptsThisGeneration += 1
         val credential = credentialVault.load(ProviderId.JINHAK.wireName) ?: run {
             jinhakV0180AuthState = "WAITING_USER_LOGIN"
             return
@@ -3784,20 +3812,22 @@ class MainActivity : Activity() {
 
     private fun completeV0180DedicatedJinhakAuth(successUrl: String) {
         if (provider != ProviderId.JINHAK) return
-        jinhakV0180AuthState = "SUCCESS"
-        jinhakV0180AuthSuccesses += 1
+        jinhakV0180AuthState = "HIGH3_RETURN_PENDING_PROTECTED"
+        jinhakV0182High3ReturnsAwaitingProof += 1
         if (jinhakV0180AuthSubmitGeneration == jinhakV0180AuthGeneration) {
-            credentialAutoLoginSuccesses += 1
-            credentialAutoLoginLastResult = "v0180-success-high3-return"
+            credentialAutoLoginLastResult = "v0182-high3-return-awaiting-protected-proof"
+        } else {
+            jinhakV0182ManualHigh3Returns += 1
         }
         jinhakUserSessionConfirmed = true
-        jinhakAuthVerifiedForBatch = true
+        jinhakAuthVerifiedForBatch = false
+        jinhakV0182ProtectedSessionVerified = false
         batchPausedForLogin = false
         jinhakTransitionAuthGateActive = false
         jinhakRealAuthResumeGatePending = false
-        jinhakCoreBootstrapState = "v0180-dedicated-auth-high3"
-        jinhakLastAuthEvidence = "v0180-server-high3-return"
-        jinhakLastCoreVerifiedAtMs = System.currentTimeMillis()
+        jinhakCoreBootstrapState = "v0182-high3-return-awaiting-protected-proof"
+        jinhakLastAuthEvidence = "v0182-public-high3-return-not-auth-proof"
+        jinhakLastCoreVerifiedAtMs = 0L
         CookieManager.getInstance().flush()
         if (::authWebView.isInitialized) {
             runCatching { authWebView.stopLoading() }
@@ -3805,8 +3835,8 @@ class MainActivity : Activity() {
         }
         if (::authHost.isInitialized) authHost.visibility = View.GONE
         if (::webView.isInitialized) webView.visibility = View.VISIBLE
-        sessionState.text = "● 진학사 자동 로그인 완료 · 고3 세션"
-        status.text = "진학사 로그인 완료 · 고3 전용 수집 WebView에서 자동 재개합니다."
+        sessionState.text = "● 고3 복귀 확인 · 보호영역 세션 검증 중"
+        status.text = "공개 고3 화면은 로그인 증거로 사용하지 않습니다. 저장지원 보호영역 접근을 확인한 뒤 수집을 시작합니다."
         recordRuntimeEvent(
             "jinhak-v0180-auth-success",
             JSONObject()
@@ -3818,10 +3848,70 @@ class MainActivity : Activity() {
         )
         persistJinhakAuthDiagnostics("v0180-auth-success")
 
-        val target = JinhakSiteTopology.protectedCoreProbeUrl()
+        requestV0182ProtectedSessionProbe("auth-high3-return")
+    }
+
+    private fun requestV0182ProtectedSessionProbe(trigger: String) {
+        if (provider != ProviderId.JINHAK || jinhakV0182ProtectedSessionVerified) return
+        if (jinhakV0182ProtectedBootstrapAttempts >= V0182_MAX_PROTECTED_BOOTSTRAP_ATTEMPTS) {
+            jinhakV0182ProtectedBootstrapFailures += 1
+            jinhakAuthVerifiedForBatch = false
+            jinhakCoreBootstrapState = "v0182-protected-session-unverified"
+            jinhakLastAuthEvidence = "protected-core-proof-missing"
+            recordRuntimeEvent("jinhak-v0182-protected-bootstrap-failed", JSONObject()
+                .put("trigger", trigger.take(80))
+                .put("attempts", jinhakV0182ProtectedBootstrapAttempts)
+                .put("safePath", runtimeSafePath(webView.url.orEmpty())))
+            startV0180DedicatedJinhakAuth("v0182-protected-proof-required")
+            return
+        }
+        jinhakV0182ProtectedBootstrapAttempts += 1
         jinhakV0181ProtectedCoreStarts += 1
+        val generation = ++jinhakV0182ProtectedBootstrapGeneration
+        val target = JinhakSiteTopology.protectedCoreProbeUrl()
         currentBatchTarget = target
-        loadJinhakV0174High3Only(target, "v0181-auth-success-protected-core")
+        jinhakCoreBootstrapState = "v0182-protected-core-probing"
+        loadJinhakV0174High3Only(target, "v0182-protected-core-probe")
+        handler.postDelayed({
+            if (provider != ProviderId.JINHAK || generation != jinhakV0182ProtectedBootstrapGeneration || jinhakV0182ProtectedSessionVerified) return@postDelayed
+            val current = webView.url.orEmpty()
+            when {
+                JinhakProtectedSessionPolicy.isProtectedProofUrl(current) -> markV0182ProtectedSessionVerified(current, "probe-timeout-current-protected")
+                JinhakDedicatedAuthPolicy.isLoginSurface(current) -> startV0180DedicatedJinhakAuth("v0182-protected-probe-login")
+                else -> requestV0182ProtectedSessionProbe("probe-timeout-retry")
+            }
+        }, V0182_PROTECTED_BOOTSTRAP_TIMEOUT_MS)
+    }
+
+    private fun markV0182ProtectedSessionVerified(url: String, trigger: String) {
+        if (provider != ProviderId.JINHAK || !JinhakProtectedSessionPolicy.isProtectedProofUrl(url)) return
+        if (!jinhakV0182ProtectedSessionVerified) {
+            jinhakV0182ProtectedSessionVerifications += 1
+            if (jinhakV0180AuthSubmitGeneration == jinhakV0180AuthGeneration) {
+                jinhakV0182CredentialSubmitVerifiedSuccesses += 1
+                credentialAutoLoginSuccesses += 1
+                credentialAutoLoginLastResult = "v0182-success-protected-core-verified"
+            }
+        }
+        jinhakV0182ProtectedSessionVerified = true
+        jinhakAuthVerifiedForBatch = true
+        jinhakV0180AuthState = "PROTECTED_SESSION_VERIFIED"
+        jinhakLastCoreVerifiedAtMs = System.currentTimeMillis()
+        jinhakCoreBootstrapState = "v0182-protected-session-verified"
+        jinhakLastAuthEvidence = "protected-core-finished-in-collector"
+        jinhakV0180AuthSuccesses = jinhakV0182ProtectedSessionVerifications
+        batchPausedForLogin = false
+        ++jinhakV0182ProtectedBootstrapGeneration
+        unifiedSessionId?.takeIf { unifiedRunning }?.let { sessionId ->
+            localStore.prepareSelectedSixRecovery(sessionId)
+            jinhakV0182RecoveryScopePreparations += 1
+        }
+        recordRuntimeEvent("jinhak-v0182-protected-session-verified", JSONObject()
+            .put("trigger", trigger.take(80))
+            .put("safePath", runtimeSafePath(url))
+            .put("pinnedIdentities", jinhakV0181PinnedIdentityKeys.size))
+        persistJinhakAuthDiagnostics("v0182-protected-session-verified")
+        if (!batchRunning) handler.post { startBatch() }
     }
 
     private fun recreateV0180AuthWebView(generation: Int) {
@@ -4350,9 +4440,12 @@ class MainActivity : Activity() {
         if (expectedProvider == ProviderId.ADIGA) {
             startupLoginAdigaAuthenticated = true
         } else {
-            startupLoginJinhakAuthenticated = true
-            jinhakAuthVerifiedForBatch = true
-            if (jinhakLastAuthEvidence == "none") jinhakLastAuthEvidence = "rendered-authenticated-control"
+            startupLoginJinhakAuthenticated = JinhakProtectedSessionPolicy.isProtectedProofUrl(webView.url.orEmpty())
+            jinhakAuthVerifiedForBatch = startupLoginJinhakAuthenticated
+            if (startupLoginJinhakAuthenticated) {
+                jinhakV0182ProtectedSessionVerified = true
+                if (jinhakLastAuthEvidence == "none") jinhakLastAuthEvidence = "protected-route-rendered"
+            }
             if (jinhakLastCoreVerifiedAtMs == 0L && canonicalizeBatchUrl(webView.url.orEmpty()) == canonicalizeBatchUrl(JinhakSiteTopology.protectedCoreProbeUrl())) {
                 jinhakLastCoreVerifiedAtMs = System.currentTimeMillis()
                 jinhakLastAuthEvidence = "protected-core-stable"
@@ -4560,6 +4653,15 @@ class MainActivity : Activity() {
                     .put("v0181GenericRoutesSuppressed", jinhakV0181GenericRoutesSuppressed)
                     .put("v0181GenericActionsSuppressed", jinhakV0181GenericActionsSuppressed)
                     .put("v0181ProtectedCoreStarts", jinhakV0181ProtectedCoreStarts)
+                    .put("v0182ProtectedSessionVerified", jinhakV0182ProtectedSessionVerified)
+                    .put("v0182ProtectedSessionVerifications", jinhakV0182ProtectedSessionVerifications)
+                    .put("v0182ProtectedBootstrapAttempts", jinhakV0182ProtectedBootstrapAttempts)
+                    .put("v0182ProtectedBootstrapFailures", jinhakV0182ProtectedBootstrapFailures)
+                    .put("v0182High3ReturnsAwaitingProof", jinhakV0182High3ReturnsAwaitingProof)
+                    .put("v0182AutofillAttemptsThisGeneration", jinhakV0182AutofillAttemptsThisGeneration)
+                    .put("v0182CredentialSubmitVerifiedSuccesses", jinhakV0182CredentialSubmitVerifiedSuccesses)
+                    .put("v0182ManualHigh3Returns", jinhakV0182ManualHigh3Returns)
+                    .put("v0182RecoveryScopePreparations", jinhakV0182RecoveryScopePreparations)
                     .put("v0180RecursiveAuthPolling", false)
                     .put("v0180CollectorOwnsLogin", false)
                     .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
@@ -4663,6 +4765,17 @@ class MainActivity : Activity() {
         unifiedAutoCaptureScheduled = false
         unifiedJinhakCapturedPages.clear()
         jinhakBatchStartCount = 0
+        jinhakV0182ProtectedSessionVerified = false
+        jinhakV0182ProtectedSessionVerifications = 0
+        jinhakV0182ProtectedBootstrapAttempts = 0
+        jinhakV0182ProtectedBootstrapFailures = 0
+        jinhakV0182ProtectedBootstrapGeneration = 0
+        jinhakV0182High3ReturnsAwaitingProof = 0
+        jinhakV0182AutofillChainGeneration = -1
+        jinhakV0182AutofillAttemptsThisGeneration = 0
+        jinhakV0182CredentialSubmitVerifiedSuccesses = 0
+        jinhakV0182ManualHigh3Returns = 0
+        jinhakV0182RecoveryScopePreparations = 0
         jinhakNormalizedMissionSeedContexts.clear()
         jinhakNormalizedIdentitySeedKeys.clear()
         jinhakNormalizedCandidateBindingKeys.clear()
@@ -4856,6 +4969,15 @@ class MainActivity : Activity() {
                     .put("v0181GenericRoutesSuppressed", jinhakV0181GenericRoutesSuppressed)
                     .put("v0181GenericActionsSuppressed", jinhakV0181GenericActionsSuppressed)
                     .put("v0181ProtectedCoreStarts", jinhakV0181ProtectedCoreStarts)
+                    .put("v0182ProtectedSessionVerified", jinhakV0182ProtectedSessionVerified)
+                    .put("v0182ProtectedSessionVerifications", jinhakV0182ProtectedSessionVerifications)
+                    .put("v0182ProtectedBootstrapAttempts", jinhakV0182ProtectedBootstrapAttempts)
+                    .put("v0182ProtectedBootstrapFailures", jinhakV0182ProtectedBootstrapFailures)
+                    .put("v0182High3ReturnsAwaitingProof", jinhakV0182High3ReturnsAwaitingProof)
+                    .put("v0182AutofillAttemptsThisGeneration", jinhakV0182AutofillAttemptsThisGeneration)
+                    .put("v0182CredentialSubmitVerifiedSuccesses", jinhakV0182CredentialSubmitVerifiedSuccesses)
+                    .put("v0182ManualHigh3Returns", jinhakV0182ManualHigh3Returns)
+                    .put("v0182RecoveryScopePreparations", jinhakV0182RecoveryScopePreparations)
                     .put("v0180RecursiveAuthPolling", false)
                     .put("v0180CollectorOwnsLogin", false)
                     .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
@@ -5385,7 +5507,7 @@ class MainActivity : Activity() {
             JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3 -> {
                 jinhakUserSessionConfirmed = true
                 jinhakUserSessionConfirmations += 1
-                jinhakAuthVerifiedForBatch = true // compatibility flag == explicit user approval on visible high3 only
+                jinhakAuthVerifiedForBatch = false // v0.18.2: public high3/user approval is not protected-session proof
                 jinhakV0174ExplicitHigh3Confirmations += 1
                 jinhakV0173ResumeArmed = false
                 batchPausedForLogin = false
@@ -5450,6 +5572,10 @@ class MainActivity : Activity() {
         if (jinhakV0181FocusedSixMode) {
             jinhakV0181PinnedIdentitySeeds = keys.size
             keys.forEach { identity -> jinhakMissionCoverage.getOrPut(identity) { linkedSetOf() } }
+            unifiedSessionId?.takeIf { unifiedRunning }?.let { sessionId ->
+                localStore.prepareSelectedSixRecovery(sessionId)
+                jinhakV0182RecoveryScopePreparations += 1
+            }
             recordRuntimeEvent("jinhak-v0181-focused-six-activated", JSONObject()
                 .put("trigger", trigger.take(80))
                 .put("pinnedIdentityCount", keys.size)
@@ -5459,12 +5585,17 @@ class MainActivity : Activity() {
     }
 
     private fun startBatch() {
-        if (provider == ProviderId.JINHAK && !jinhakUserSessionConfirmed) {
-            enterJinhakUserSessionGate("start-batch")
-            return
-        }
         if (provider == ProviderId.JINHAK) {
             activateV0181PinnedSixFocus("start-batch")
+            if (!jinhakUserSessionConfirmed) {
+                enterJinhakUserSessionGate("start-batch")
+                return
+            }
+            if (!jinhakV0182ProtectedSessionVerified) {
+                jinhakAuthVerifiedForBatch = false
+                requestV0182ProtectedSessionProbe("start-batch")
+                return
+            }
             val visibleHigh3 = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(webView.url)
             if (!jinhakUserSessionConfirmed || visibleHigh3 == null) {
                 jinhakV0174PersistedTargetBlocks += 1
@@ -5472,9 +5603,9 @@ class MainActivity : Activity() {
                 return
             }
             currentBatchTarget = canonicalizeBatchUrl(visibleHigh3)
-            jinhakAuthVerifiedForBatch = true
-            jinhakCoreBootstrapState = "v0174-explicit-visible-high3-confirmed"
-            jinhakLastAuthEvidence = "user-explicitly-approved-current-visible-high3"
+            jinhakAuthVerifiedForBatch = false
+            jinhakCoreBootstrapState = "v0182-user-approved-high3-awaiting-protected-proof"
+            jinhakLastAuthEvidence = "user-approved-public-high3-not-auth-proof"
             jinhakLastCoreVerifiedAtMs = 0L
         }
         if (startupLoginPreflightActive) {
@@ -6189,7 +6320,9 @@ class MainActivity : Activity() {
                 if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK || generation != jinhakProgressFenceGeneration) return
                 val now = System.currentTimeMillis()
                 val elapsed = now - jinhakLastMeaningfulProgressAtMs
-                if (elapsed >= JINHAK_NO_PROGRESS_FENCE_MS) {
+                val missionTargetCount = jinhakMissionTargetLedger.summary().optInt("targets", 0)
+                if (elapsed >= JINHAK_NO_PROGRESS_FENCE_MS &&
+                    JinhakProtectedSessionPolicy.shouldRunMissionStallFence(jinhakV0182ProtectedSessionVerified, missionTargetCount)) {
                     val slowWork = ::slowLanePool.isInitialized && slowLanePool.hasWork()
                     val ledgerOutstanding = jinhakMissionTargetLedger.outstandingCount()
                     val cellExpiry = jinhakMissionCells.expireStaleOwnership(now)
