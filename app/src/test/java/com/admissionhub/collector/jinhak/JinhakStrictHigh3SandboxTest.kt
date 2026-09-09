@@ -7,6 +7,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class JinhakStrictHigh3SandboxTest {
+    private val high3ReturnLogin =
+        "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx?ReturnURL=https%3A%2F%2Fwww.jinhak.com%2Fjh%2Fhigh3%2Fearly%2Ffour-year-university%2Fsearch"
+
     @Test
     fun high3RoutesAreTheOnlyCollectorNavigableJinhakPages() {
         val urls = listOf(
@@ -38,11 +41,33 @@ class JinhakStrictHigh3SandboxTest {
     }
 
     @Test
-    fun exactMemberLoginSurfaceIsAllowedOnlyForUserLogin() {
+    fun exactMemberLoginSurfaceIsAllowedOnlyWhenReturnUrlIsHigh3() {
+        assertEquals(JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN, JinhakStrictHigh3Sandbox.decision(high3ReturnLogin))
+        assertTrue(JinhakStrictHigh3Sandbox.allowsUserLoginSurface(high3ReturnLogin))
+        assertFalse(JinhakStrictHigh3Sandbox.allowsCollectorNavigation(high3ReturnLogin))
+    }
+
+    @Test
+    fun memberLoginWithoutReturnUrlIsBlocked() {
         val login = "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx"
-        assertEquals(JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN, JinhakStrictHigh3Sandbox.decision(login))
-        assertTrue(JinhakStrictHigh3Sandbox.allowsUserLoginSurface(login))
-        assertFalse(JinhakStrictHigh3Sandbox.allowsCollectorNavigation(login))
+        assertEquals(
+            JinhakStrictHigh3Sandbox.MainFrameDecision.BLOCK_MEMBER_LOGIN_WITHOUT_HIGH3_RETURN,
+            JinhakStrictHigh3Sandbox.decision(login)
+        )
+        assertFalse(JinhakStrictHigh3Sandbox.allowsUserLoginSurface(login))
+    }
+
+    @Test
+    fun memberLoginWithSharedRootOrExternalReturnIsBlocked() {
+        val shared = "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx?ReturnURL=https%3A%2F%2Fwww.jinhak.com%2F"
+        val external = "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx?ReturnURL=https%3A%2F%2Fexample.com%2F"
+        listOf(shared, external).forEach { login ->
+            assertEquals(
+                JinhakStrictHigh3Sandbox.MainFrameDecision.BLOCK_MEMBER_LOGIN_WITHOUT_HIGH3_RETURN,
+                JinhakStrictHigh3Sandbox.decision(login)
+            )
+            assertFalse(JinhakStrictHigh3Sandbox.allowsUserLoginSurface(login))
+        }
     }
 
     @Test
@@ -105,5 +130,6 @@ class JinhakStrictHigh3SandboxTest {
         assertNull(JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull("https://www.jinhak.com/"))
         assertNull(JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull("https://www.jinhak.com/jh/high2/"))
         assertNull(JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull("https://www.jinhak.com/jh/member/login"))
+        assertNull(JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(high3ReturnLogin))
     }
 }
