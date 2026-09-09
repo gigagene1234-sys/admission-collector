@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.17.3 Natural High3 Handoff"
+        android:label="Admission Hub v0.17.4 Strict High3 Sandbox"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
