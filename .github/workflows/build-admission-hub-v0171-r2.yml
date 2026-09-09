@@ -1,4 +1,4 @@
-name: Build Admission Hub v0.17.1 User-Owned Jinhak Session R2
+name: Build Admission Hub v0.17.1 User-Owned Jinhak Session R3
 
 on:
   push:
@@ -6,13 +6,14 @@ on:
     paths:
       - ".github/workflows/build-admission-hub-v0171-r2.yml"
       - ".github/scripts/patch_v0171_post.py"
+      - ".github/scripts/verify_v0171.py"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: admission-hub-v0171-user-owned-jinhak-session-r2
+  group: admission-hub-v0171-user-owned-jinhak-session-r3
   cancel-in-progress: true
 
 jobs:
