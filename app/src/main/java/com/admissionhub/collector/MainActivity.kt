@@ -397,6 +397,10 @@ class MainActivity : Activity() {
     private var jinhakUserSessionGateEntries = 0
     private var jinhakUserSessionConfirmations = 0
     private var jinhakUserSessionPauses = 0
+    private var jinhakV0172BootstrapStarts = 0
+    private var jinhakV0172ProtectedRetryDeferrals = 0
+    private var jinhakV0172LoginRedirectLoopBreaks = 0
+    private val jinhakV0172DeferredProtectedTargets = linkedSetOf<String>()
     private var jinhakCoreBootstrapState = "idle"
     private var startupJinhakProtectedProbeAttempted = false
     private var startupAuthIndeterminatePolls = 0
@@ -532,8 +536,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.17.1"
-        private const val BUILD_CODE = 117100
+        private const val VERSION = "0.17.2"
+        private const val BUILD_CODE = 117200
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -1312,7 +1316,7 @@ class MainActivity : Activity() {
         enterJinhakUserSessionGate("selected-six-recovery-user-session")
         if (!isProviderUrl(webView.url.orEmpty())) webView.loadUrl(ProviderId.JINHAK.homeUrl)
         return
-        val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
+        val coreProbe = JinhakSiteTopology.protectedCoreProbeUrl()
         if (coreProbe.isBlank()) {
             unifiedRunning = false
             selectedSixRecoveryMode = false
@@ -1720,7 +1724,7 @@ class MainActivity : Activity() {
                                 jinhakRendererFirstCrashCooldowns += 1
                                 val missionOrigin = jinhakMissionOriginRoute.takeIf { it.isNotBlank() }
                                 val safeResume = missionOrigin
-                                    ?: JinhakSiteTopology.missionSeeds().firstOrNull()?.takeIf { it.isNotBlank() }
+                                    ?: JinhakSiteTopology.protectedCoreProbeUrl().takeIf { it.isNotBlank() }
                                     ?: resumeUrl
                                 currentBatchTarget = safeResume
                                 replacement.loadUrl("about:blank")
@@ -1795,7 +1799,7 @@ class MainActivity : Activity() {
                             batchCollecting = false
                             val missionOrigin = jinhakMissionOriginRoute.takeIf { it.isNotBlank() }
                             val safeResume = missionOrigin
-                                ?: JinhakSiteTopology.missionSeeds().firstOrNull()?.takeIf { it.isNotBlank() }
+                                ?: JinhakSiteTopology.protectedCoreProbeUrl().takeIf { it.isNotBlank() }
                                 ?: resumeUrl
                             currentBatchTarget = currentBatchTarget?.takeIf { it.isNotBlank() } ?: safeResume
                             recordRuntimeEvent(
@@ -2782,7 +2786,7 @@ class MainActivity : Activity() {
             restoreSelectedSixRecoveryScope(sessionId)
             val restoredMissionTargets = restoreJinhakMissionPersistence(sessionId, "activity-resume")
             val lease: SecureSessionVault.SessionLeaseSummary? = null
-            val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
+            val coreProbe = JinhakSiteTopology.protectedCoreProbeUrl()
             if (hasFreshJinhakProtectedCoreProof() && coreProbe.isNotBlank()) {
                 jinhakAuthVerifiedForBatch = false
                 jinhakCoreBootstrapState = "resume-core-revalidate"
@@ -3209,7 +3213,7 @@ class MainActivity : Activity() {
 
     private fun classifyJinhakRealAuthRoute(rawUrl: String): String {
         val canonical = canonicalizeBatchUrl(rawUrl)
-        val core = canonicalizeBatchUrl(JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty())
+        val core = canonicalizeBatchUrl(JinhakSiteTopology.protectedCoreProbeUrl())
         return when {
             isProviderLoginUrl(ProviderId.JINHAK, rawUrl) -> "login"
             core.isNotBlank() && canonical == core -> "protected-core"
@@ -3647,7 +3651,7 @@ class MainActivity : Activity() {
                         return@probeLoginSurface
                     }
 
-                    val coreProbe = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
+                    val coreProbe = JinhakSiteTopology.protectedCoreProbeUrl()
                     val currentCanonical = canonicalizeBatchUrl(currentUrl)
                     val probeCanonical = canonicalizeBatchUrl(coreProbe)
                     if (startupJinhakProtectedProbeAttempted && probeCanonical.isNotBlank() && currentCanonical == probeCanonical && !needsLogin && !isProviderLoginUrl(expectedProvider, currentUrl)) {
@@ -3723,7 +3727,7 @@ class MainActivity : Activity() {
             startupLoginJinhakAuthenticated = true
             jinhakAuthVerifiedForBatch = true
             if (jinhakLastAuthEvidence == "none") jinhakLastAuthEvidence = "rendered-authenticated-control"
-            if (jinhakLastCoreVerifiedAtMs == 0L && canonicalizeBatchUrl(webView.url.orEmpty()) == canonicalizeBatchUrl(JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty())) {
+            if (jinhakLastCoreVerifiedAtMs == 0L && canonicalizeBatchUrl(webView.url.orEmpty()) == canonicalizeBatchUrl(JinhakSiteTopology.protectedCoreProbeUrl())) {
                 jinhakLastCoreVerifiedAtMs = System.currentTimeMillis()
                 jinhakLastAuthEvidence = "protected-core-stable"
             }
@@ -3892,12 +3896,16 @@ class MainActivity : Activity() {
                     .put("jinhakLastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
                     .put("jinhakLoginRecoveryPolls", jinhakLoginRecoveryPolls)
                     .put("jinhakReauthCycles", jinhakReauthCycles)
-                    .put("jinhakAuthModel", "user-owned-session-login-assumed-v0171")
+                    .put("jinhakAuthModel", "user-owned-session-login-assumed-v0172-bootstrap-safe")
                     .put("jinhakSessionAuthority", "user")
                     .put("userSessionConfirmed", jinhakUserSessionConfirmed)
                     .put("userSessionGateEntries", jinhakUserSessionGateEntries)
                     .put("userSessionConfirmations", jinhakUserSessionConfirmations)
                     .put("userSessionPauses", jinhakUserSessionPauses)
+                    .put("v0172BootstrapStarts", jinhakV0172BootstrapStarts)
+                    .put("v0172ProtectedRetryDeferrals", jinhakV0172ProtectedRetryDeferrals)
+                    .put("v0172LoginRedirectLoopBreaks", jinhakV0172LoginRedirectLoopBreaks)
+                    .put("v0172DeferredProtectedTargets", jinhakV0172DeferredProtectedTargets.size)
                     .put("collectorVerifiesLogin", false)
                     .put("collectorRestoresJinhakAuthLease", false)
                     .put("collectorCapturesJinhakAuthLease", false)
@@ -4010,7 +4018,11 @@ class MainActivity : Activity() {
         batchButton.text = "진학사 탐색 · 사용자 로그인 확인 대기"
         diagnosticButton.text = "진학사 전체 분석 전송"
         unifiedButton.text = "통합 수집 종료"
-        currentBatchTarget = canonicalizeBatchUrl(JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty())
+        currentBatchTarget = canonicalizeBatchUrl(JinhakSiteTopology.userSessionBootstrapUrl())
+        jinhakV0172DeferredProtectedTargets.clear()
+        jinhakV0172BootstrapStarts = 0
+        jinhakV0172ProtectedRetryDeferrals = 0
+        jinhakV0172LoginRedirectLoopBreaks = 0
         enterJinhakUserSessionGate("unified-transition")
         val current = webView.url.orEmpty()
         if (!isProviderUrl(current)) {
@@ -4021,7 +4033,7 @@ class MainActivity : Activity() {
     private fun jinhakTargetAuthRedirectKey(rawTarget: String?): String? {
         val target = canonicalizeBatchUrl(rawTarget.orEmpty())
         if (target.isBlank() || isProviderLoginUrl(ProviderId.JINHAK, target)) return null
-        val core = canonicalizeBatchUrl(JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty())
+        val core = canonicalizeBatchUrl(JinhakSiteTopology.protectedCoreProbeUrl())
         if (core.isNotBlank() && target == core) return null
         return RecordUtils.sha256(target)
     }
@@ -4120,12 +4132,16 @@ class MainActivity : Activity() {
                     .put("targetAuthRedirectMaxCycles", jinhakTargetAuthRedirectCounts.values.maxOrNull() ?: 0)
                     .put("targetAuthRedirectThreshold", MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES)
                     .put("lastTargetAuthRedirectSafePath", jinhakLastTargetAuthRedirectSafePath.take(300))
-                    .put("jinhakAuthModel", "user-owned-session-login-assumed-v0171")
+                    .put("jinhakAuthModel", "user-owned-session-login-assumed-v0172-bootstrap-safe")
                     .put("jinhakSessionAuthority", "user")
                     .put("userSessionConfirmed", jinhakUserSessionConfirmed)
                     .put("userSessionGateEntries", jinhakUserSessionGateEntries)
                     .put("userSessionConfirmations", jinhakUserSessionConfirmations)
                     .put("userSessionPauses", jinhakUserSessionPauses)
+                    .put("v0172BootstrapStarts", jinhakV0172BootstrapStarts)
+                    .put("v0172ProtectedRetryDeferrals", jinhakV0172ProtectedRetryDeferrals)
+                    .put("v0172LoginRedirectLoopBreaks", jinhakV0172LoginRedirectLoopBreaks)
+                    .put("v0172DeferredProtectedTargets", jinhakV0172DeferredProtectedTargets.size)
                     .put("collectorVerifiesLogin", false)
                     .put("collectorRestoresJinhakAuthLease", false)
                     .put("collectorCapturesJinhakAuthLease", false)
@@ -4506,8 +4522,60 @@ class MainActivity : Activity() {
         }, 220L)
     }
 
+    private fun breakJinhakLoginRedirectLoopAfterUserConfirmation(reason: String): Boolean {
+        if (provider != ProviderId.JINHAK || !jinhakUserSessionConfirmed) return false
+        val visibleUrl = webView.url.orEmpty()
+        val loginSurface = isProviderLoginUrl(ProviderId.JINHAK, visibleUrl) ||
+            JinhakHigh3AuthRoute.isMemberLoginSurface(visibleUrl) ||
+            JinhakHigh3AuthRoute.isGenericProductLogin(visibleUrl)
+        if (!loginSurface) return false
+
+        val deferred = currentBatchTarget
+            ?.takeIf { it.isNotBlank() && isProviderUrl(it) && !isProviderLoginUrl(ProviderId.JINHAK, it) }
+            ?.let { canonicalizeBatchUrl(it) }
+            ?.takeIf { it.isNotBlank() && !JinhakSiteTopology.isUserSessionBootstrapUrl(it) }
+        if (deferred != null) {
+            if (jinhakV0172DeferredProtectedTargets.add(deferred)) {
+                jinhakV0172ProtectedRetryDeferrals += 1
+            }
+            // The queue had already dispatched this target. Treat this immediate cycle as
+            // consumed so discovery cannot immediately put the same redirecting route back.
+            batchVisited.add(deferred)
+            batchQueued.remove(deferred)
+        }
+        currentBatchTarget = null
+        batchPausedForLogin = false
+        jinhakAuthVerifiedForBatch = true // compatibility flag == user assertion only
+        jinhakV0172LoginRedirectLoopBreaks += 1
+        jinhakCoreBootstrapState = "v0172-user-confirmed-bootstrap-recovery"
+        jinhakLastAuthEvidence = "user-confirmed-session-authority-preserved-after-site-login-redirect"
+        if (::batchCover.isInitialized) batchCover.visibility = View.GONE
+        if (::slowLaneHost.isInitialized) slowLaneHost.visibility = View.GONE
+        webView.visibility = View.VISIBLE
+        status.text = "진학사가 보호경로를 로그인 화면으로 돌려보냈지만 사용자 로그인 확인은 취소하지 않았습니다. 같은 보호경로를 즉시 재생하지 않고 공개 고3 시작점에서 탐색을 이어갑니다."
+        recordRuntimeEvent(
+            "jinhak-v0172-login-redirect-loop-break",
+            JSONObject()
+                .put("reason", reason.take(100))
+                .put("visibleSafePath", runtimeSafePath(visibleUrl))
+                .put("deferredTargetSafePath", runtimeSafePath(deferred))
+                .put("sessionAuthority", "user")
+                .put("userConfirmationPreserved", true)
+                .put("collectorVerifiedLogin", false)
+                .put("protectedTargetImmediatelyReplayed", false)
+        )
+        persistJinhakAuthDiagnostics("v0172-login-redirect-loop-break:$reason")
+        handler.postDelayed({
+            if (!batchRunning || provider != ProviderId.JINHAK || !jinhakUserSessionConfirmed) return@postDelayed
+            jinhakV0172BootstrapStarts += 1
+            webView.loadUrl(JinhakSiteTopology.userSessionBootstrapUrl())
+        }, 140L)
+        return true
+    }
+
     private fun enterJinhakUserSessionGate(reason: String) {
         if (provider != ProviderId.JINHAK) provider = ProviderId.JINHAK
+        if (breakJinhakLoginRedirectLoopAfterUserConfirmation(reason)) return
         jinhakUserSessionGateEntries += 1
         if (batchRunning) {
             batchPausedForLogin = true
@@ -4531,7 +4599,7 @@ class MainActivity : Activity() {
         }
         if (::sessionState.isInitialized) sessionState.text = "○ 진학사 로그인·세션은 사용자 관리"
         if (::status.isInitialized) {
-            status.text = "아래 진학사 화면에서 직접 로그인 상태를 확인하세요. 앱은 ID/PW·쿠키·로그인 여부·세션 연장을 건드리지 않습니다. 로그인 완료 후 버튼을 누르면 로그인 완료 상태라고 가정하고 탐색합니다."
+            status.text = "아래 진학사 화면에서 직접 로그인 상태를 확인하세요. 앱은 ID/PW·쿠키·로그인 여부·세션 연장을 건드리지 않습니다. 로그인 완료 후 버튼을 누르면 공개 고3 시작점에서 탐색하며 보호경로를 즉시 재생하지 않습니다."
         }
         recordRuntimeEvent(
             "jinhak-v0171-user-session-gate",
@@ -4558,7 +4626,7 @@ class MainActivity : Activity() {
         // Compatibility-only flag: this is a USER ASSERTION, not Collector authentication proof.
         jinhakAuthVerifiedForBatch = true
         jinhakTransitionAuthGateActive = false
-        jinhakCoreBootstrapState = "v0171-user-confirmed-login-assumed"
+        jinhakCoreBootstrapState = "v0172-user-confirmed-login-assumed"
         jinhakLastAuthEvidence = "user-confirmed-login-assumed-no-app-verification"
         jinhakLastCoreVerifiedAtMs = 0L
         jinhakReauthCycles = 0
@@ -4571,9 +4639,9 @@ class MainActivity : Activity() {
         webView.visibility = View.VISIBLE
         jinhakSessionConfirmButton.text = "진학사 로그인 완료 확인됨 · 다시 확인/재개"
         sessionState.text = "● 사용자 확인 완료 · 진학사 로그인 완료 상태로 탐색"
-        status.text = "사용자가 로그인 완료를 확인했습니다. Collector는 별도 인증 검사 없이 현재 WebView 세션을 그대로 사용해 진학사 탐색을 실행합니다."
+        status.text = "사용자가 로그인 완료를 확인했습니다. Collector는 별도 인증 검사 없이 현재 WebView 세션을 사용하며, 보호경로를 즉시 재생하지 않고 공개 고3 서비스 시작점에서 탐색을 시작합니다."
         recordRuntimeEvent(
-            "jinhak-v0171-user-session-confirmed",
+            "jinhak-v0172-user-session-confirmed",
             JSONObject()
                 .put("reason", reason.take(100))
                 .put("safePath", runtimeSafePath(webView.url))
@@ -4583,7 +4651,7 @@ class MainActivity : Activity() {
                 .put("collectorSessionExtension", false)
                 .put("collectorCredentialRead", false)
         )
-        persistJinhakAuthDiagnostics("v0171-user-session-confirmed:$reason")
+        persistJinhakAuthDiagnostics("v0172-user-session-confirmed:$reason")
 
         when {
             startupLoginPreflightActive -> {
@@ -4605,14 +4673,22 @@ class MainActivity : Activity() {
                 }, 120L)
             }
             wasPaused && batchRunning -> {
-                val retry = currentBatchTarget
+                val redirectedTarget = currentBatchTarget
+                    ?.takeIf { it.isNotBlank() && isProviderUrl(it) && !isProviderLoginUrl(ProviderId.JINHAK, it) }
+                    ?.let { canonicalizeBatchUrl(it) }
+                    ?.takeIf { it.isNotBlank() && !JinhakSiteTopology.isUserSessionBootstrapUrl(it) }
+                if (redirectedTarget != null) {
+                    if (jinhakV0172DeferredProtectedTargets.add(redirectedTarget)) {
+                        jinhakV0172ProtectedRetryDeferrals += 1
+                    }
+                    batchVisited.add(redirectedTarget)
+                    batchQueued.remove(redirectedTarget)
+                }
+                currentBatchTarget = null
                 handler.postDelayed({
                     if (!batchRunning || batchPausedForLogin || provider != ProviderId.JINHAK || !jinhakUserSessionConfirmed) return@postDelayed
-                    if (!retry.isNullOrBlank() && isProviderUrl(retry) && !JinhakGradeRouteFence.isBlockedLowerGrade(retry)) {
-                        webView.loadUrl(retry)
-                    } else {
-                        loadNextBatchPage()
-                    }
+                    jinhakV0172BootstrapStarts += 1
+                    webView.loadUrl(JinhakSiteTopology.userSessionBootstrapUrl())
                 }, 120L)
             }
             !batchRunning -> startBatch()
@@ -4626,7 +4702,7 @@ class MainActivity : Activity() {
         }
         if (provider == ProviderId.JINHAK) {
             jinhakAuthVerifiedForBatch = true
-            jinhakCoreBootstrapState = "v0171-user-confirmed-login-assumed"
+            jinhakCoreBootstrapState = "v0172-user-confirmed-login-assumed"
             jinhakLastAuthEvidence = "user-confirmed-login-assumed-no-app-verification"
             jinhakLastCoreVerifiedAtMs = 0L
         }

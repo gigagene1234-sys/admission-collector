@@ -21,10 +21,19 @@ enum class JinhakMissionLane(val wireName: String, val basePriority: Int) {
 object JinhakSiteTopology {
     private const val ROOT = "https://www.jinhak.com"
 
+    fun userSessionBootstrapUrl(): String = "$ROOT/jh/high3/early/four-year-university/search"
+
+    fun protectedCoreProbeUrl(): String = "$ROOT/jh/high3/early/four-year-university/library"
+
+    fun isUserSessionBootstrapUrl(url: String): Boolean {
+        val path = runCatching { URI(url).path?.lowercase().orEmpty() }.getOrDefault("")
+        return path.trimEnd('/') == "/jh/high3/early/four-year-university/search"
+    }
+
     fun missionSeeds(): List<String> = listOf(
-        "$ROOT/jh/high3/early/four-year-university/library",
+        userSessionBootstrapUrl(),
+        protectedCoreProbeUrl(),
         "$ROOT/jh/high3/early/four-year-university/university-major-predict",
-        "$ROOT/jh/high3/early/four-year-university/search",
         "$ROOT/jh/high3/univ-major/univ-info/univ-search",
         "$ROOT/jh/high3/ipsi-analysis/ipsi-strategy"
     )
@@ -55,6 +64,7 @@ object JinhakSiteTopology {
     fun priority(url: String, label: String = ""): Int {
         val lane = lane(url, label)
         var score = lane.basePriority
+        if (isUserSessionBootstrapUrl(url)) score = maxOf(score, 86)
         val text = "$url $label"
         if (Regex("(2027|수시|학생부교과|학생부종합|지역인재|면접)").containsMatchIn(text)) score += 4
         if (Regex("(실제합격자|과거\\s*3개년|입시결과|합격예측\\s*리포트|모의지원\\s*리포트)").containsMatchIn(text)) score += 8
@@ -68,7 +78,9 @@ object JinhakSiteTopology {
      * v0.14.2 no longer blocks read-only strategy/knowledge pages from the default Susi traversal.
      * Media and recommendation discovery remain outside the integrated crawl.
      */
-    fun isDefaultSusiCoreTraversalUrl(url: String, label: String = ""): Boolean = when (lane(url, label)) {
+    fun isDefaultSusiCoreTraversalUrl(url: String, label: String = ""): Boolean {
+        if (isUserSessionBootstrapUrl(url)) return true
+        return when (lane(url, label)) {
         JinhakMissionLane.SAVED_APPLICATIONS,
         JinhakMissionLane.CURRENT_PREDICTION,
         JinhakMissionLane.MOCK_SUPPORT,
@@ -81,6 +93,7 @@ object JinhakSiteTopology {
         JinhakMissionLane.RECOMMENDATION,
         JinhakMissionLane.MEDIA,
         JinhakMissionLane.UNKNOWN -> false
+        }
     }
 
     fun shouldExpandEditorial(url: String, label: String = ""): Boolean = when (lane(url, label)) {
