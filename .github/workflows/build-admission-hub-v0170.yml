@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-hub-v0170.yml"
       - ".github/scripts/patch_v0170.py"
+      - ".github/scripts/patch_v0170_post.py"
       - ".github/scripts/verify_v0170.py"
       - ".github/scripts/verify_apk_v0170.sh"
       - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakHigh3AuthRoute.kt"
@@ -40,8 +41,14 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/patch_v0170.py
-          python3 .github/scripts/verify_v0170.py
+          python3 .github/scripts/patch_v0170_post.py
           git diff --check
+
+      - name: Verify v0.17.0 server-owned auth source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_v0170.py
 
       - name: Commit exact v0.17.0 product source
         shell: bash
