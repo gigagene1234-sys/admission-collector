@@ -14,24 +14,30 @@ class JinhakStrictHigh3IntegrationPolicyTest {
     }
 
     @Test
-    fun adapterNeverQueuesSharedRootGenericLoginOrLowerGrades() {
+    fun adapterQueuesOnlyProtectedSusiStorageInV0183() {
         val forbidden = listOf(
             "https://www.jinhak.com/",
             "https://www.jinhak.com/jh/member/login",
             "https://www.jinhak.com/jh/high1/",
             "https://www.jinhak.com/jh/high2/",
             "https://www.jinhak.com/jh/high12/",
-            "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx"
+            "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx",
+            JinhakSiteTopology.userSessionBootstrapUrl(),
+            "https://www.jinhak.com/jh/high3/early/four-year-university/search",
+            "https://www.jinhak.com/jh/high3/early/four-year-university/report/pass-predict"
         )
-        forbidden.forEach { url -> assertFalse("must not queue $url", JinhakAdapter.isBatchNavigable(url)) }
-        assertTrue(JinhakAdapter.isBatchNavigable(JinhakSiteTopology.userSessionBootstrapUrl()))
+        forbidden.forEach { url -> assertFalse("v0.18.3 storage-only mode must not queue $url", JinhakAdapter.isBatchNavigable(url)) }
         assertTrue(JinhakAdapter.isBatchNavigable(JinhakSiteTopology.protectedCoreProbeUrl()))
     }
 
     @Test
-    fun everyDeclaredMissionSeedIsStrictHigh3() {
-        val seeds = JinhakSiteTopology.missionSeeds()
-        assertTrue(seeds.isNotEmpty())
-        seeds.forEach { seed -> assertTrue("seed must be strict high3: $seed", JinhakStrictHigh3Sandbox.allowsCollectorNavigation(seed)) }
+    fun everyDeclaredMissionSeedRemainsStrictHigh3ButAdapterUsesStorageOnlySeed() {
+        val declared = JinhakSiteTopology.missionSeeds()
+        assertTrue(declared.isNotEmpty())
+        declared.forEach { seed -> assertTrue("seed must be strict high3: $seed", JinhakStrictHigh3Sandbox.allowsCollectorNavigation(seed)) }
+
+        val adapterSeeds = JinhakAdapter.seedUrls()
+        assertTrue(adapterSeeds.size == 1)
+        assertTrue(adapterSeeds.single() == JinhakSiteTopology.protectedCoreProbeUrl())
     }
 }
