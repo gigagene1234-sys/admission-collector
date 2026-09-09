@@ -8,6 +8,8 @@ on:
       - ".github/scripts/patch_v0174_final.py"
       - ".github/scripts/verify_v0174_final.py"
       - "app/src/test/java/com/admissionhub/collector/jinhak/JinhakStrictHigh3SandboxFinalTest.kt"
+      - "app/src/test/java/com/admissionhub/collector/jinhak/JinhakAuthEventStateTest.kt"
+      - "app/src/test/java/com/admissionhub/collector/jinhak/JinhakHigh3AuthRouteTest.kt"
   workflow_dispatch:
 
 permissions:
