@@ -1783,13 +1783,15 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                 .put("updatedAt", c.getString(4))
         }
 
+        val processedScoreIdentities = linkedSetOf<String>()
         db.rawQuery(
-            "SELECT application_identity_key,quality_state,academic_year FROM canonical_applications WHERE session_id=? ORDER BY application_identity_key",
+            "SELECT application_identity_key,quality_state,academic_year FROM canonical_applications " +
+                "ORDER BY CASE WHEN session_id=? THEN 0 ELSE 1 END, updated_at DESC, application_identity_key",
             arrayOf(sessionId)
         ).use { apps ->
             while (apps.moveToNext()) {
                 val identity = apps.getString(0)
-                if (identity !in selected) continue
+                if (identity !in selected || !processedScoreIdentities.add(identity)) continue
                 val canonicalQuality = apps.getString(1)
                 val academicYear = apps.getInt(2)
                 val conversion = db.rawQuery(
