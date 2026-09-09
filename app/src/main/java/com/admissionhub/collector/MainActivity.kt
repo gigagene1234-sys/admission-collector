@@ -1513,6 +1513,45 @@ class MainActivity : Activity() {
         persistJinhakAuthDiagnostics("v0174-strict-block:$source")
     }
 
+    private fun loadMainUrl(target: String, source: String = "app-load"): Boolean {
+        if (provider != ProviderId.JINHAK) {
+            webView.loadUrl(target)
+            return true
+        }
+        val decision = JinhakStrictHigh3Sandbox.decision(target)
+        return when (decision) {
+            JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3 -> {
+                noteJinhakV0174Decision("central-$source", target, decision)
+                webView.loadUrl(target)
+                true
+            }
+            JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_BLANK -> {
+                webView.loadUrl("about:blank")
+                true
+            }
+            else -> {
+                jinhakV0174AppNavigationBlocks += 1
+                blockJinhakV0174MainFrame("central-$source", target, decision)
+                false
+            }
+        }
+    }
+
+    private fun loadJinhakV0174SiteMemberLogin(target: String, source: String): Boolean {
+        if (provider != ProviderId.JINHAK) return false
+        val decision = JinhakStrictHigh3Sandbox.decision(target)
+        if (decision != JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN) {
+            jinhakV0174AppNavigationBlocks += 1
+            blockJinhakV0174MainFrame("site-member-$source", target, decision)
+            return false
+        }
+        noteJinhakV0174Decision("site-member-$source", target, decision)
+        // This URL comes from a site popup/navigation event and has already passed the
+        // exact member host/path + high3 ReturnURL policy. The app never constructs it.
+        webView.loadUrl(target)
+        return true
+    }
+
     private fun loadJinhakV0174High3Only(target: String?, reason: String): Boolean {
         if (provider != ProviderId.JINHAK) return false
         val safe = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(target)
@@ -1528,7 +1567,7 @@ class MainActivity : Activity() {
             "jinhak-v0174-app-high3-navigation",
             JSONObject().put("reason", reason.take(80)).put("targetSafePath", runtimeSafePath(safe)).put("high3Only", true)
         )
-        webView.loadUrl(safe)
+        loadMainUrl(safe)
         return true
     }
 
@@ -1656,6 +1695,22 @@ class MainActivity : Activity() {
                         blockJinhakV0174MainFrame("navigation-main-block", target, decision)
                         true
                     }
+                }
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                if (provider != ProviderId.JINHAK) return
+                val decision = JinhakStrictHigh3Sandbox.decision(url)
+                val allowed = decision == JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3 ||
+                    decision == JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN ||
+                    decision == JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_BLANK
+                if (allowed) return
+                jinhakV0174HistoryBlocks += 1
+                runCatching { view.stopLoading() }
+                blockJinhakV0174MainFrame("spa-history", url, decision)
+                handler.post {
+                    if (::webView.isInitialized && webView === view) loadMainUrl("about:blank", "spa-history-neutralize")
                 }
             }
 
@@ -1882,7 +1937,11 @@ class MainActivity : Activity() {
                         parent.addView(replacement, childIndex, oldLayoutParams)
                         configureWebView()
                         batchCollecting = false
-                        currentBatchTarget = currentBatchTarget?.takeIf { it.isNotBlank() } ?: resumeUrl
+                        currentBatchTarget = if (provider == ProviderId.JINHAK) {
+                            JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(currentBatchTarget) ?: resumeUrl
+                        } else {
+                            currentBatchTarget?.takeIf { it.isNotBlank() } ?: resumeUrl
+                        }
                         runtimeRendererRecovering = false
 
                         if (!repeatedJinhakCrash) {
@@ -1969,9 +2028,9 @@ class MainActivity : Activity() {
                             batchRunning = wasBatchRunning
                             batchPausedForLogin = wasBatchPausedForLogin
                             batchCollecting = false
-                            val missionOrigin = jinhakMissionOriginRoute.takeIf { it.isNotBlank() }
+                            val missionOrigin = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(jinhakMissionOriginRoute)
                             val safeResume = missionOrigin
-                                ?: JinhakSiteTopology.protectedCoreProbeUrl().takeIf { it.isNotBlank() }
+                                ?: JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(JinhakSiteTopology.protectedCoreProbeUrl())
                                 ?: resumeUrl
                             currentBatchTarget = currentBatchTarget?.takeIf { it.isNotBlank() } ?: safeResume
                             recordRuntimeEvent(
@@ -2094,7 +2153,7 @@ class MainActivity : Activity() {
                             val decision = JinhakStrictHigh3Sandbox.decision(target)
                             when (decision) {
                                 JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3 -> loadJinhakV0174High3Only(target, "popup-handoff")
-                                JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN -> webView.loadUrl(target)
+                                JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN -> loadJinhakV0174SiteMemberLogin(target, "popup-handoff")
                                 else -> {
                                     jinhakV0174PopupBlocks += 1
                                     noteJinhakV0174Decision("popup-block", target, decision)
@@ -2103,7 +2162,7 @@ class MainActivity : Activity() {
                             handler.post { destroyTransientPopup("v0174-strict-popup") }
                             return true
                         }
-                        webView.loadUrl(target)
+                        loadMainUrl(target)
                         handler.post { destroyTransientPopup("main-handoff") }
                         return true
                     }
@@ -2205,7 +2264,7 @@ class MainActivity : Activity() {
             ProviderId.ADIGA -> "어디가 복구 보류"
         }
         diagnosticButton.text = if (which == ProviderId.JINHAK) "진학사 전체 분석 전송" else "어디가 진단 로그 전송"
-        if (which == ProviderId.JINHAK) loadJinhakV0174High3Only(which.homeUrl, "provider-home") else webView.loadUrl(which.homeUrl)
+        if (which == ProviderId.JINHAK) loadJinhakV0174High3Only(which.homeUrl, "provider-home") else loadMainUrl(which.homeUrl)
     }
 
     private fun refreshSessionOrOpenLogin() {
@@ -2949,7 +3008,7 @@ class MainActivity : Activity() {
             unifiedPendingJinhakStart = false
             status.text = "이전 튕김/중단 감지: 어디가 체크포인트에서 통합 수집을 자동 복구합니다."
             val seed = ProviderRegistry.adapter(ProviderId.ADIGA).seedUrls().firstOrNull() ?: ProviderId.ADIGA.homeUrl
-            webView.loadUrl(seed)
+            loadMainUrl(seed)
             true
         } else {
             provider = ProviderId.JINHAK
@@ -3067,7 +3126,7 @@ class MainActivity : Activity() {
                 status.text = "저장 계정을 사용하지 않습니다. 현재 공식 사이트에서 직접 로그인하세요."
                 if (!continueAfterSave) {
                     if (which == ProviderId.JINHAK) openJinhakV0174StrictEntry("credential-dialog-direct-login")
-                    else webView.loadUrl(providerLoginUrl(which))
+                    else loadMainUrl(providerLoginUrl(which))
                 }
             }
             .setNeutralButton("저장 계정 삭제") { _, _ ->
@@ -3659,7 +3718,7 @@ class MainActivity : Activity() {
             localRunId = localStore.latestResumableRun(which.wireName)
             CookieManager.getInstance().flush()
             enterJinhakUserSessionGate("startup-provider")
-            if (!isProviderUrl(webView.url.orEmpty())) if (which == ProviderId.JINHAK) loadJinhakV0174High3Only(which.homeUrl, "provider-home") else webView.loadUrl(which.homeUrl)
+            if (!isProviderUrl(webView.url.orEmpty())) if (which == ProviderId.JINHAK) loadJinhakV0174High3Only(which.homeUrl, "provider-home") else loadMainUrl(which.homeUrl)
             return
         }
         provider = which
@@ -3708,7 +3767,7 @@ class MainActivity : Activity() {
             val core = JinhakGradeRouteFence.protectedHigh3Core()
             if (core.isNotBlank()) loadJinhakV0174High3Only(core, "startup-core") else openJinhakV0174StrictEntry("startup-no-core")
         } else {
-            if (which == ProviderId.JINHAK) loadJinhakV0174High3Only(which.homeUrl, "provider-home") else webView.loadUrl(which.homeUrl)
+            if (which == ProviderId.JINHAK) loadJinhakV0174High3Only(which.homeUrl, "provider-home") else loadMainUrl(which.homeUrl)
         }
     }
 
@@ -4128,7 +4187,7 @@ class MainActivity : Activity() {
             finishUnifiedCollection("adiga-seed-missing")
             return
         }
-        webView.loadUrl(seed)
+        loadMainUrl(seed)
     }
 
     private fun materializeOfficialScoreAndOutcomeEvidence(sessionId: String, trigger: String): JSONObject {
@@ -5255,7 +5314,7 @@ class MainActivity : Activity() {
                 val startUrl = currentBatchTarget
                 if (!startUrl.isNullOrBlank() && provider == ProviderId.JINHAK) {
                     if (!loadJinhakV0174High3Only(startUrl, "legacy-begin-start")) loadNextBatchPage()
-                } else if (!startUrl.isNullOrBlank()) webView.loadUrl(startUrl)
+                } else if (!startUrl.isNullOrBlank()) loadMainUrl(startUrl)
                 else loadNextBatchPage()
             }
         }
@@ -6286,7 +6345,7 @@ class MainActivity : Activity() {
                         loadNextBatchPage()
                     }
                 } else if (!retry.isNullOrBlank() && isProviderUrl(retry)) {
-                    webView.loadUrl(retry)
+                    loadMainUrl(retry)
                 } else loadNextBatchPage()
             }, 250)
         }
@@ -7793,7 +7852,7 @@ class MainActivity : Activity() {
                         if (!batchCollecting && !jinhakAgentActionInFlight) scheduleBatchSnapshot()
                     } else {
                         if (provider == ProviderId.JINHAK) loadJinhakV0174High3Only(canonicalOrigin, "ledger-origin")
-                        else webView.loadUrl(canonicalOrigin)
+                        else loadMainUrl(canonicalOrigin)
                     }
                     return
                 }
@@ -7828,7 +7887,7 @@ class MainActivity : Activity() {
                     handler.postDelayed({ loadNextBatchPage() }, 80L)
                 }
             } else {
-                webView.loadUrl(action.baseUrl)
+                loadMainUrl(action.baseUrl)
             }
             return
         }
@@ -7853,7 +7912,7 @@ class MainActivity : Activity() {
                     continue
                 }
             } else {
-                webView.loadUrl(next)
+                loadMainUrl(next)
             }
             return
         }
@@ -8068,7 +8127,7 @@ class MainActivity : Activity() {
         status.text = pageActionStatus(retry, "재시도 대기 ($reason)")
         val delay = 1200L + (retry.retry * 1000L)
         handler.postDelayed({
-            if (batchRunning && !batchPausedForLogin) webView.loadUrl(retry.baseUrl)
+            if (batchRunning && !batchPausedForLogin) loadMainUrl(retry.baseUrl)
         }, delay)
     }
 
@@ -9102,7 +9161,11 @@ class MainActivity : Activity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        if (provider == ProviderId.JINHAK) {
+            if (webView.canGoBack()) safeJinhakV0174Back() else super.onBackPressed()
+        } else {
+            if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        }
     }
 
     override fun onDestroy() {

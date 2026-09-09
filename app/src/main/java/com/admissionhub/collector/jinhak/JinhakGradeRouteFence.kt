@@ -5,15 +5,17 @@ import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 
 /**
- * Keeps the admission collector inside the 고3·N수 product at the transport/navigation layer.
+ * v0.17.4 final lower-grade transport fence.
  *
- * High1/high2/high12 routes on the same host are forbidden collector destinations. The rule also
- * applies when a lower-grade destination is nested inside query, fragment, return, or redirect
- * parameters. UI hiding/click suppression is intentionally outside this policy and is not used as
- * a substitute for route isolation.
+ * high1/high2/high12 are forbidden collector destinations and forbidden request
+ * material even when buried inside repeatedly encoded query/fragment/ReturnURL
+ * values. The implementation is deliberately fail-closed for those markers and
+ * never relies on DOM/UI hiding.
  */
 object JinhakGradeRouteFence {
-    const val SCHEMA_VERSION = 4
+    const val SCHEMA_VERSION = 5
+    private const val MAX_DECODE_ROUNDS = 12
+    private const val MAX_SCAN_CHARS = 65_536
 
     private val lowerGradeRouteMarkers = listOf(
         "/jh/high1/",
@@ -29,38 +31,33 @@ object JinhakGradeRouteFence {
 
     fun isBlockedLowerGrade(url: String): Boolean {
         if (url.isBlank()) return false
-        val uri = runCatching { URI(url) }.getOrNull()
-        val path = uri?.path.orEmpty().lowercase()
-        if (containsLowerGradeRoute(path)) return true
-
-        var context = buildString {
-            append(uri?.rawQuery.orEmpty())
-            append('#')
-            append(uri?.rawFragment.orEmpty())
-        }.lowercase()
-        repeat(3) {
-            if (containsLowerGradeRoute(context)) return true
+        var candidate = normalize(url.take(MAX_SCAN_CHARS))
+        repeat(MAX_DECODE_ROUNDS + 1) {
+            if (containsLowerGradeRoute(candidate)) return true
             val decoded = runCatching {
-                URLDecoder.decode(context, StandardCharsets.UTF_8.name())
-            }.getOrDefault(context).lowercase()
-            if (decoded == context) return false
-            context = decoded
+                URLDecoder.decode(candidate, StandardCharsets.UTF_8.name())
+            }.getOrDefault(candidate)
+            val normalized = normalize(decoded.take(MAX_SCAN_CHARS))
+            if (normalized == candidate) return false
+            candidate = normalized
         }
-        return containsLowerGradeRoute(context)
+        return containsLowerGradeRoute(candidate)
     }
 
     fun isHigh3(url: String): Boolean {
-        if (url.isBlank()) return false
-        val uri = runCatching { URI(url) }.getOrNull()
-        val path = uri?.path.orEmpty().lowercase()
-        return path.contains("/jh/high3/") || path.endsWith("/jh/high3")
+        if (url.isBlank() || isBlockedLowerGrade(url)) return false
+        val uri = runCatching { URI(url) }.getOrNull() ?: return false
+        val path = normalize(uri.path.orEmpty())
+        return path == "/jh/high3" || path.startsWith("/jh/high3/")
     }
 
     fun protectedHigh3Core(): String = JinhakSiteTopology.missionSeeds().firstOrNull().orEmpty()
 
+    private fun normalize(value: String): String = value.lowercase().replace('\\', '/')
+
     private fun containsLowerGradeRoute(value: String): Boolean {
         if (value.isBlank()) return false
-        val normalized = value.lowercase()
+        val normalized = normalize(value)
         return lowerGradeRouteMarkers.any(normalized::contains) ||
             lowerGradeTerminalMarkers.any { marker ->
                 normalized == marker ||
@@ -68,7 +65,8 @@ object JinhakGradeRouteFence {
                     normalized.contains("$marker?") ||
                     normalized.contains("$marker#") ||
                     normalized.contains("$marker&") ||
-                    normalized.contains("$marker=")
+                    normalized.contains("$marker=") ||
+                    normalized.contains("$marker%")
             }
     }
 }

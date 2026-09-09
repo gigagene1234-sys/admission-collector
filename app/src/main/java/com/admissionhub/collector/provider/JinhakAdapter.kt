@@ -47,7 +47,7 @@ object JinhakAdapter : ProviderAdapter {
             val query = (uri.query ?: "").lowercase()
             val full = "$path?$query"
             if (Regex("(?:logout|signout|member|mypage|my-page|account|profile|userinfo|payment|billing|purchase|order|spassdata|coupon|refund|withdraw|customer|faq|qna|event|notice|privacy|terms)").containsMatchIn(full)) return false
-            if (Regex("\.(?:jpg|jpeg|png|gif|webp|svg|ico|css|js|map|woff2?|ttf|eot|zip|hwp|hwpx|pdf)$", RegexOption.IGNORE_CASE).containsMatchIn(path)) return false
+            if (Regex("""\.(?:jpg|jpeg|png|gif|webp|svg|ico|css|js|map|woff2?|ttf|eot|zip|hwp|hwpx|pdf)$""", RegexOption.IGNORE_CASE).containsMatchIn(path)) return false
             true
         } catch (_: Exception) { false }
     }
