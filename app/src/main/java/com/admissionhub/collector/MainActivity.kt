@@ -3094,20 +3094,14 @@ class MainActivity : Activity() {
     }
 
     private fun attemptSavedCredentialLoginV0912Baseline(reason: String) {
-        if (which == ProviderId.JINHAK) {
-            enterJinhakUserSessionGate("saved-credential-login-disabled:$reason")
-            return
-        }
         if (provider != ProviderId.JINHAK) return
-        credentialAutoLoginSuppressedNoCredential += 1
-        val current = webView.url.orEmpty()
-        if (JinhakHigh3AuthRoute.isMemberLoginSurface(current) || JinhakHigh3AuthRoute.isGenericProductLogin(current)) {
-            markJinhakDirectAuthWait("v0170-collector-credential-disabled:$reason", current)
-        }
-        status.text = "v0.17.0에서는 Collector가 진학사 ID/PW를 읽거나 입력하지 않습니다. 필요한 경우 사이트 자체 로그인/Samsung Pass만 사용합니다."
-        persistJinhakAuthDiagnostics("v0170-collector-credential-disabled")
+        enterJinhakUserSessionGate("saved-credential-login-disabled:$reason")
     }
     private fun attemptSavedCredentialLogin(which: ProviderId, reason: String) {
+        if (which == ProviderId.JINHAK) {
+            if (provider == ProviderId.JINHAK) enterJinhakUserSessionGate("saved-credential-login-disabled:$reason")
+            return
+        }
         if (provider != which) return
         if (which == ProviderId.JINHAK) {
             attemptSavedCredentialLoginV0912Baseline(reason)
