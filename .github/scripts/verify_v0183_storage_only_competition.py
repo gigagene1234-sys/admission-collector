@@ -13,7 +13,8 @@ checks = {
         '/jh/high3/early/four-year-university/library',
         'currentApplicationCompetition',
         'currentSemanticsVerified',
-        '모의\\s*지원',
+        '모의',
+        '전년도',
     ],
     "app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt": [
         'listOf(JinhakSiteTopology.protectedCoreProbeUrl())',
