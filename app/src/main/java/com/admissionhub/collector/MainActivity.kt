@@ -62,6 +62,7 @@ import com.admissionhub.collector.jinhak.JinhakStrictHigh3Sandbox
 import com.admissionhub.collector.jinhak.JinhakDedicatedAuthPolicy
 import com.admissionhub.collector.jinhak.JinhakFocusedSixPolicy
 import com.admissionhub.collector.jinhak.JinhakProtectedSessionPolicy
+import com.admissionhub.collector.jinhak.JinhakStorageOnlyPolicy
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -218,6 +219,19 @@ class MainActivity : Activity() {
     private val jinhakReferenceRouteCaptureCounts = linkedMapOf<String, Int>()
     private var jinhakReferenceRepeatSkips = 0
     private var jinhakNoProgressFences = 0
+    private var jinhakStorageMonitorActive = false
+    private var jinhakStorageMonitorGeneration = 0
+    private var jinhakStorageRefreshes = 0
+    private var jinhakStorageCompetitionSnapshots = 0
+    private var jinhakStorageCompetitionChanges = 0
+    private var jinhakStorageLoginPauses = 0
+    private var jinhakStorageNaturalResumes = 0
+    private var jinhakStorageNonLibraryNavigationsBlocked = 0
+    private var jinhakStorageLoginEpisodeOpen = false
+    private var jinhakStorageLastRefreshAtMs = 0L
+    private var jinhakStorageNextRefreshAtMs = 0L
+    private val jinhakStorageTrackedIdentityKeys = linkedSetOf<String>()
+    private val jinhakStorageLatestCompetition = linkedMapOf<String, Double>()
     private var jinhakLastMeaningfulProgressAtMs = 0L
     private var jinhakProgressFenceGeneration = 0
     private var jinhakLastLiveDiagnosticsAtMs = 0L
@@ -1552,9 +1566,8 @@ class MainActivity : Activity() {
     private fun blockJinhakV0174MainFrame(source: String, target: String, decision: JinhakStrictHigh3Sandbox.MainFrameDecision) {
         if (provider != ProviderId.JINHAK) return
         noteJinhakV0174Decision(source, target, decision)
-        if (JinhakDedicatedAuthPolicy.isLoginSurface(target)) {
-            jinhakV0180CollectorLoginRouteLoads += 1
-            handler.post { startV0180DedicatedJinhakAuth("collector-route:$source") }
+        if (JinhakStorageOnlyPolicy.isSiteLogin(target)) {
+            handler.post { pauseJinhakStorageForSiteLogin("route-block:$source", target) }
         }
 
         // v0.17.5: strict route rejection and authentication are independent state machines.
@@ -1716,12 +1729,16 @@ class MainActivity : Activity() {
                         return jinhakV0174BlockedResponse("lower-grade-any-request")
                     }
                     if (request.isForMainFrame) {
-                        if (JinhakDedicatedAuthPolicy.isLoginSurface(target)) {
+                        if (JinhakStorageOnlyPolicy.isSiteLogin(target)) {
+                            handler.post { pauseJinhakStorageForSiteLogin("network-login", target) }
+                            return super.shouldInterceptRequest(view, request)
+                        }
+                        if (!jinhakStorageLoginEpisodeOpen && !JinhakStorageOnlyPolicy.isLibrary(target) && target != "about:blank") {
                             handler.post {
-                                jinhakV0180CollectorLoginRouteLoads += 1
-                                startV0180DedicatedJinhakAuth("collector-network-login")
+                                jinhakStorageNonLibraryNavigationsBlocked += 1
+                                persistJinhakAuthDiagnostics("v0190-storage-non-library-network-block")
                             }
-                            return jinhakV0174BlockedResponse("dedicated-auth-route")
+                            return jinhakV0174BlockedResponse("v0190-storage-only")
                         }
                         val decision = JinhakStrictHigh3Sandbox.decision(target)
                         when (decision) {
@@ -1749,9 +1766,13 @@ class MainActivity : Activity() {
                     return true
                 }
                 if (!request.isForMainFrame) return false
-                if (JinhakDedicatedAuthPolicy.isLoginSurface(target)) {
-                    jinhakV0180CollectorLoginRouteLoads += 1
-                    startV0180DedicatedJinhakAuth("collector-navigation-login")
+                if (JinhakStorageOnlyPolicy.isSiteLogin(target)) {
+                    pauseJinhakStorageForSiteLogin("navigation-login", target)
+                    return false
+                }
+                if (!jinhakStorageLoginEpisodeOpen && !JinhakStorageOnlyPolicy.isLibrary(target) && target != "about:blank") {
+                    jinhakStorageNonLibraryNavigationsBlocked += 1
+                    persistJinhakAuthDiagnostics("v0190-storage-non-library-navigation-block")
                     return true
                 }
                 val decision = JinhakStrictHigh3Sandbox.decision(target)
@@ -1799,10 +1820,8 @@ class MainActivity : Activity() {
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 runtimeLastSafePath = runtimeSafePath(url)
                 if (provider == ProviderId.JINHAK) {
-                    if (JinhakDedicatedAuthPolicy.isLoginSurface(url) == true) {
-                        jinhakV0180CollectorLoginRouteLoads += 1
-                        runCatching { view.stopLoading() }
-                        startV0180DedicatedJinhakAuth("collector-page-started-login")
+                    if (JinhakStorageOnlyPolicy.isSiteLogin(url)) {
+                        pauseJinhakStorageForSiteLogin("page-started-login", url)
                         return
                     }
                     val decision = JinhakStrictHigh3Sandbox.decision(url)
@@ -1842,13 +1861,27 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView, url: String) {
                 CookieManager.getInstance().flush()
                 if (provider == ProviderId.JINHAK) {
-                    if (JinhakProtectedSessionPolicy.isProtectedProofUrl(url)) {
-                        markV0182ProtectedSessionVerified(url, "collector-page-finished-protected")
-                    }
-                    if (JinhakDedicatedAuthPolicy.isLoginSurface(url)) {
-                        jinhakV0180CollectorLoginRouteLoads += 1
-                        startV0180DedicatedJinhakAuth("collector-page-finished-login")
+                    if (JinhakStorageOnlyPolicy.isSiteLogin(url)) {
+                        pauseJinhakStorageForSiteLogin("page-finished-login", url)
                         return
+                    }
+                    if (JinhakStorageOnlyPolicy.isLibrary(url)) {
+                        val wasLoginEpisode = jinhakStorageLoginEpisodeOpen || batchPausedForLogin
+                        markV0182ProtectedSessionVerified(url, "v0190-library-page-finished")
+                        jinhakUserSessionConfirmed = true
+                        jinhakAuthVerifiedForBatch = true
+                        jinhakStorageLoginEpisodeOpen = false
+                        batchPausedForLogin = false
+                        jinhakTransitionAuthGateActive = false
+                        jinhakCoreBootstrapState = "v0190-storage-protected-session-verified"
+                        jinhakLastAuthEvidence = "protected-early-storage-page-finished"
+                        if (wasLoginEpisode) jinhakStorageNaturalResumes += 1
+                        if (!batchRunning && jinhakStorageMonitorActive) {
+                            handler.postDelayed({
+                                if (provider == ProviderId.JINHAK && !batchRunning && jinhakStorageMonitorActive && JinhakStorageOnlyPolicy.isLibrary(webView.url.orEmpty())) startBatch()
+                            }, 120L)
+                            return
+                        }
                     }
                     val visible = webView.url.orEmpty()
                     if (JinhakUserSessionPolicy.shouldIgnoreStaleLoginCallback(url, visible)) {
@@ -3404,12 +3437,12 @@ class MainActivity : Activity() {
     }
     private fun attemptSavedCredentialLoginV0912Baseline(reason: String) {
         if (provider != ProviderId.JINHAK) return
-        startV0180DedicatedJinhakAuth("legacy-entry:$reason")
+        persistJinhakAuthDiagnostics("v0190-collector-owned-login-disabled:$reason")
     }
     private fun attemptSavedCredentialLogin(which: ProviderId, reason: String) {
         if (which == ProviderId.JINHAK) {
             provider = ProviderId.JINHAK
-            startV0180DedicatedJinhakAuth("saved-credential:$reason")
+            persistJinhakAuthDiagnostics("v0190-saved-credential-submit-disabled:$reason")
             return
         }
         if (provider != which) return
@@ -4631,7 +4664,21 @@ class MainActivity : Activity() {
                     .put("v0173High3StabilityRejects", jinhakV0173High3StabilityRejects)
                     .put("v0173ActualLoginReturns", jinhakV0173ActualLoginReturns)
                     .put("v0173AutoBootstrapNavigations", 0)
-                    .put("jinhakAuthModel", "dedicated-auth-webview-autologin-v0180")
+                    .put("jinhakAuthModel", "single-webview-site-owned-storage-only-v0190")
+                    .put("jinhakCollectionMode", JinhakStorageOnlyPolicy.MODE)
+                    .put("storageMonitorIntervalMs", JinhakStorageOnlyPolicy.MONITOR_INTERVAL_MS)
+                    .put("storageMonitorActive", jinhakStorageMonitorActive)
+                    .put("storageRefreshes", jinhakStorageRefreshes)
+                    .put("storageCompetitionSnapshots", jinhakStorageCompetitionSnapshots)
+                    .put("storageCompetitionChanges", jinhakStorageCompetitionChanges)
+                    .put("storageTrackedApplications", jinhakStorageTrackedIdentityKeys.size)
+                    .put("storageLoginPauses", jinhakStorageLoginPauses)
+                    .put("storageNaturalResumes", jinhakStorageNaturalResumes)
+                    .put("storageNonLibraryNavigationsBlocked", jinhakStorageNonLibraryNavigationsBlocked)
+                    .put("storageLastRefreshAtMs", jinhakStorageLastRefreshAtMs)
+                    .put("storageNextRefreshAtMs", jinhakStorageNextRefreshAtMs)
+                    .put("collectorOwnedJinhakLogin", false)
+                    .put("dedicatedAuthUsedByV0190", false)
                     .put("v0174StrictHigh3Sandbox", true)
                     .put("v0175BlockedRoutesPreserveUserSession", true)
                     .put("v0175SpaHistoryBlankNeutralization", false)
@@ -4822,11 +4869,13 @@ class MainActivity : Activity() {
         jinhakV0173High3StabilityRejects = 0
         jinhakV0173High3StabilityGeneration = 0
         jinhakV0173ActualLoginReturns = 0
-        enterJinhakUserSessionGate("unified-transition")
-        val current = webView.url.orEmpty()
-        if (!isProviderUrl(current)) {
-            loadJinhakV0174High3Only(ProviderId.JINHAK.homeUrl, "legacy-jinhak-home-failsafe")
-        }
+        jinhakStorageMonitorActive = true
+        jinhakStorageLoginEpisodeOpen = false
+        jinhakCoreBootstrapState = "v0190-loading-protected-storage"
+        jinhakLastAuthEvidence = "awaiting-protected-storage-or-site-login"
+        currentBatchTarget = canonicalizeBatchUrl(JinhakStorageOnlyPolicy.LIBRARY_URL)
+        status.text = "통합 수집 2/2 · 진학사 수시 저장소 단일 경로로 전환합니다. 로그인은 진학사 사이트가 같은 WebView에서 처리합니다."
+        webView.loadUrl(JinhakStorageOnlyPolicy.LIBRARY_URL)
     }
 
     private fun jinhakTargetAuthRedirectKey(rawTarget: String?): String? {
@@ -4947,7 +4996,21 @@ class MainActivity : Activity() {
                     .put("v0173High3StabilityRejects", jinhakV0173High3StabilityRejects)
                     .put("v0173ActualLoginReturns", jinhakV0173ActualLoginReturns)
                     .put("v0173AutoBootstrapNavigations", 0)
-                    .put("jinhakAuthModel", "dedicated-auth-webview-autologin-v0180")
+                    .put("jinhakAuthModel", "single-webview-site-owned-storage-only-v0190")
+                    .put("jinhakCollectionMode", JinhakStorageOnlyPolicy.MODE)
+                    .put("storageMonitorIntervalMs", JinhakStorageOnlyPolicy.MONITOR_INTERVAL_MS)
+                    .put("storageMonitorActive", jinhakStorageMonitorActive)
+                    .put("storageRefreshes", jinhakStorageRefreshes)
+                    .put("storageCompetitionSnapshots", jinhakStorageCompetitionSnapshots)
+                    .put("storageCompetitionChanges", jinhakStorageCompetitionChanges)
+                    .put("storageTrackedApplications", jinhakStorageTrackedIdentityKeys.size)
+                    .put("storageLoginPauses", jinhakStorageLoginPauses)
+                    .put("storageNaturalResumes", jinhakStorageNaturalResumes)
+                    .put("storageNonLibraryNavigationsBlocked", jinhakStorageNonLibraryNavigationsBlocked)
+                    .put("storageLastRefreshAtMs", jinhakStorageLastRefreshAtMs)
+                    .put("storageNextRefreshAtMs", jinhakStorageNextRefreshAtMs)
+                    .put("collectorOwnedJinhakLogin", false)
+                    .put("dedicatedAuthUsedByV0190", false)
                     .put("v0174StrictHigh3Sandbox", true)
                     .put("v0175BlockedRoutesPreserveUserSession", true)
                     .put("v0175SpaHistoryBlankNeutralization", false)
@@ -5586,27 +5649,30 @@ class MainActivity : Activity() {
 
     private fun startBatch() {
         if (provider == ProviderId.JINHAK) {
-            activateV0181PinnedSixFocus("start-batch")
-            if (!jinhakUserSessionConfirmed) {
-                enterJinhakUserSessionGate("start-batch")
+            activateV0181PinnedSixFocus("v0190-storage-start-batch")
+            jinhakStorageMonitorActive = true
+            val current = webView.url.orEmpty()
+            if (JinhakStorageOnlyPolicy.isSiteLogin(current)) {
+                pauseJinhakStorageForSiteLogin("start-batch-login-visible", current)
                 return
             }
-            if (!jinhakV0182ProtectedSessionVerified) {
+            if (!JinhakStorageOnlyPolicy.isLibrary(current)) {
                 jinhakAuthVerifiedForBatch = false
-                requestV0182ProtectedSessionProbe("start-batch")
+                jinhakV0182ProtectedSessionVerified = false
+                jinhakCoreBootstrapState = "v0190-loading-protected-storage"
+                jinhakLastAuthEvidence = "awaiting-protected-storage-or-site-login"
+                currentBatchTarget = canonicalizeBatchUrl(JinhakStorageOnlyPolicy.LIBRARY_URL)
+                status.text = "진학사 수시 저장소만 엽니다. 로그인이 필요하면 같은 화면의 진학사 로그인으로 자연 전환됩니다."
+                webView.loadUrl(JinhakStorageOnlyPolicy.LIBRARY_URL)
                 return
             }
-            val visibleHigh3 = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(webView.url)
-            if (!jinhakUserSessionConfirmed || visibleHigh3 == null) {
-                jinhakV0174PersistedTargetBlocks += 1
-                enterJinhakUserSessionGate("v0174-start-batch-requires-visible-high3")
-                return
-            }
-            currentBatchTarget = canonicalizeBatchUrl(visibleHigh3)
-            jinhakAuthVerifiedForBatch = false
-            jinhakCoreBootstrapState = "v0182-user-approved-high3-awaiting-protected-proof"
-            jinhakLastAuthEvidence = "user-approved-public-high3-not-auth-proof"
-            jinhakLastCoreVerifiedAtMs = 0L
+            markV0182ProtectedSessionVerified(current, "v0190-start-batch-library-visible")
+            jinhakUserSessionConfirmed = true
+            jinhakAuthVerifiedForBatch = true
+            jinhakV0182ProtectedSessionVerified = true
+            jinhakCoreBootstrapState = "v0190-storage-protected-session-verified"
+            jinhakLastAuthEvidence = "protected-early-storage-visible"
+            currentBatchTarget = canonicalizeBatchUrl(JinhakStorageOnlyPolicy.LIBRARY_URL)
         }
         if (startupLoginPreflightActive) {
             Toast.makeText(this, "로그인 준비가 끝난 뒤 수집이 자동 시작됩니다.", Toast.LENGTH_SHORT).show()
@@ -5900,19 +5966,13 @@ class MainActivity : Activity() {
             status.text = "로컬 안전모드: 기본 정보영역 ${batchQueue.size}개 탐색"
         }
         if (provider == ProviderId.JINHAK) {
-            val visible = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(webView.url)
-            val target = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(currentBatchTarget)
-            if (!jinhakUserSessionConfirmed || visible == null) {
-                batchPausedForLogin = true
-                hideBatchCover()
-                enterJinhakUserSessionGate("v0174-begin-navigation-visible-high3-required")
-                return
-            }
-            currentBatchTarget = canonicalizeBatchUrl(visible)
-            if (target == null || canonicalizeBatchUrl(target) == canonicalizeBatchUrl(visible)) {
-                scheduleBatchSnapshot()
-            } else {
-                loadJinhakV0174High3Only(target, "begin-batch-navigation")
+            jinhakStorageMonitorActive = true
+            val visible = webView.url.orEmpty()
+            currentBatchTarget = canonicalizeBatchUrl(JinhakStorageOnlyPolicy.LIBRARY_URL)
+            when {
+                JinhakStorageOnlyPolicy.isSiteLogin(visible) -> pauseJinhakStorageForSiteLogin("begin-navigation-login", visible)
+                JinhakStorageOnlyPolicy.isLibrary(visible) -> scheduleBatchSnapshot()
+                else -> webView.loadUrl(JinhakStorageOnlyPolicy.LIBRARY_URL)
             }
             return
         }
@@ -7533,6 +7593,114 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun pauseJinhakStorageForSiteLogin(source: String, url: String) {
+        if (provider != ProviderId.JINHAK) return
+        jinhakStorageMonitorActive = true
+        if (!jinhakStorageLoginEpisodeOpen) {
+            jinhakStorageLoginEpisodeOpen = true
+            jinhakStorageLoginPauses += 1
+        }
+        batchPausedForLogin = batchRunning
+        jinhakAuthVerifiedForBatch = false
+        jinhakV0182ProtectedSessionVerified = false
+        jinhakCoreBootstrapState = "v0190-site-login-visible"
+        jinhakLastAuthEvidence = "site-owned-login-redirect-visible"
+        disarmBatchNavigationWatchdog()
+        if (::batchCover.isInitialized) batchCover.visibility = View.GONE
+        sessionState.text = "○ 진학사 수시 저장소 로그인 대기"
+        status.text = "진학사 사이트가 로그인 화면으로 전환했습니다. 이 화면에서 로그인하면 수시 저장소로 자연 복귀할 때 자동 재개합니다."
+        recordRuntimeEvent("jinhak-v0190-storage-login-pause", JSONObject()
+            .put("source", source.take(80))
+            .put("safePath", runtimeSafePath(url))
+            .put("dedicatedAuthStarted", false)
+            .put("credentialSubmit", false))
+        persistJinhakAuthDiagnostics("v0190-storage-login-pause:$source")
+    }
+
+    private fun appendJinhakStorageCompetitionSnapshots(records: JSONArray): Int {
+        val additions = JSONArray()
+        var added = 0
+        for (i in 0 until records.length()) {
+            val source = records.optJSONObject(i) ?: continue
+            if (source.optString("recordType") != "jinhak-saved-application-prediction") continue
+            val metrics = source.optJSONObject("metrics") ?: continue
+            val hasCurrent = metrics.has("currentApplicationCompetition") && !metrics.isNull("currentApplicationCompetition")
+            val hasUnresolved = metrics.has("genericCompetitionUnresolved") && !metrics.isNull("genericCompetitionUnresolved")
+            if (!hasCurrent && !hasUnresolved) continue
+            val identity = source.optString("applicationIdentityKey").takeIf { it.isNotBlank() && it != "null" }
+            if (identity != null) jinhakStorageTrackedIdentityKeys.add(identity)
+            val observedAt = source.optString("observedAt", Instant.now().toString())
+            val current = if (hasCurrent) metrics.optDouble("currentApplicationCompetition") else Double.NaN
+            val unresolved = if (hasUnresolved) metrics.optDouble("genericCompetitionUnresolved") else Double.NaN
+            if (identity != null && hasCurrent && !current.isNaN()) {
+                val prior = jinhakStorageLatestCompetition.put(identity, current)
+                if (prior != null && java.lang.Double.compare(prior, current) != 0) {
+                    jinhakStorageCompetitionChanges += 1
+                }
+            }
+            val record = JSONObject()
+                .put("recordType", "jinhak-competition-snapshot")
+                .put("providerPageType", "jinhak-early-storage")
+                .put("dataScope", "current-application-competition-monitor")
+                .put("year", source.opt("year") ?: JSONObject.NULL)
+                .put("university", source.opt("university") ?: JSONObject.NULL)
+                .put("department", source.opt("department") ?: JSONObject.NULL)
+                .put("admission", source.opt("admission") ?: JSONObject.NULL)
+                .put("applicationIdentityKey", identity ?: JSONObject.NULL)
+                .put("observedAt", observedAt)
+                .put("sourceClass", "jinhak-user-viewed-storage")
+                .put("official", false)
+                .put("probabilityInferred", false)
+                .put("metrics", JSONObject()
+                    .put("currentApplicationCompetition", if (hasCurrent) current else JSONObject.NULL)
+                    .put("currentApplicationCompetitionSource", metrics.opt("currentApplicationCompetitionSource") ?: JSONObject.NULL)
+                    .put("currentApplicationCompetitionDerived", metrics.optBoolean("currentApplicationCompetitionDerived", false))
+                    .put("genericCompetitionUnresolved", if (hasUnresolved) unresolved else JSONObject.NULL)
+                    .put("currentApplicationCompetitionAmbiguous", hasUnresolved && !hasCurrent))
+            record.put("sourceRowFingerprint", RecordUtils.sha256(listOf(
+                identity ?: "unbound", observedAt, if (hasCurrent) current.toString() else "null",
+                if (hasUnresolved) unresolved.toString() else "null"
+            ).joinToString("|")))
+            additions.put(record)
+            added += 1
+        }
+        for (i in 0 until additions.length()) records.put(additions.optJSONObject(i))
+        jinhakStorageCompetitionSnapshots += added
+        if (added > 0) {
+            recordRuntimeEvent("jinhak-v0190-competition-snapshot", JSONObject()
+                .put("added", added)
+                .put("trackedApplications", jinhakStorageTrackedIdentityKeys.size)
+                .put("changes", jinhakStorageCompetitionChanges))
+        }
+        return added
+    }
+
+    private fun scheduleJinhakStorageRefresh(source: String) {
+        if (provider != ProviderId.JINHAK || !batchRunning || !jinhakStorageMonitorActive) return
+        disarmBatchNavigationWatchdog()
+        val generation = ++jinhakStorageMonitorGeneration
+        jinhakStorageLastRefreshAtMs = System.currentTimeMillis()
+        jinhakStorageNextRefreshAtMs = jinhakStorageLastRefreshAtMs + JinhakStorageOnlyPolicy.MONITOR_INTERVAL_MS
+        sessionState.text = "● 진학사 수시 저장소 경쟁률 추적 중 · 15분 주기"
+        status.text = "수시 저장소 스냅샷 저장 완료 · 다음 갱신은 약 15분 후입니다."
+        persistJinhakAuthDiagnostics("v0190-storage-refresh-scheduled:$source")
+        handler.postDelayed({
+            if (generation != jinhakStorageMonitorGeneration || !batchRunning || !jinhakStorageMonitorActive || provider != ProviderId.JINHAK) return@postDelayed
+            val current = webView.url.orEmpty()
+            if (JinhakStorageOnlyPolicy.isSiteLogin(current) || jinhakStorageLoginEpisodeOpen) {
+                pauseJinhakStorageForSiteLogin("periodic-refresh-login-visible", current)
+                return@postDelayed
+            }
+            jinhakStorageRefreshes += 1
+            jinhakStorageLastRefreshAtMs = System.currentTimeMillis()
+            currentBatchTarget = canonicalizeBatchUrl(JinhakStorageOnlyPolicy.LIBRARY_URL)
+            recordRuntimeEvent("jinhak-v0190-storage-periodic-refresh", JSONObject()
+                .put("refresh", jinhakStorageRefreshes)
+                .put("intervalMs", JinhakStorageOnlyPolicy.MONITOR_INTERVAL_MS))
+            webView.loadUrl(JinhakStorageOnlyPolicy.LIBRARY_URL)
+        }, JinhakStorageOnlyPolicy.MONITOR_INTERVAL_MS)
+    }
+
     private fun collectSnapshotForBatch() {
         if (!batchRunning || batchPausedForLogin || batchCollecting) return
         if (provider == ProviderId.JINHAK && jinhakMissionCells.isSnapshotActive()) {
@@ -7781,6 +7949,9 @@ class MainActivity : Activity() {
             if (plan != null) registerListFingerprint(plan)
 
             val pageRecords = normalizeSnapshot(snapshot)
+            if (provider == ProviderId.JINHAK && JinhakStorageOnlyPolicy.isLibrary(snapshot.optString("url"))) {
+                appendJinhakStorageCompetitionSnapshots(pageRecords)
+            }
             if (provider == ProviderId.JINHAK) {
                 jinhakConsecutiveStalls = 0
                 val pageTypeNow = snapshot.optString("providerPageType")
@@ -7839,7 +8010,9 @@ class MainActivity : Activity() {
                         candidate.applicationContext?.identityKey != null
                 }
                 if (originInferred > 0) jinhakOriginInferredMissionTargets += originInferred
-                val ledgerAdded = if (pageTypeNow == "jinhak-recommended-university") {
+                val ledgerAdded = if (JinhakStorageOnlyPolicy.isLibrary(snapshot.optString("url"))) {
+                    0
+                } else if (pageTypeNow == "jinhak-recommended-university") {
                     recordRuntimeEvent("jinhak-recommendation-ledger-suppressed", JSONObject()
                         .put("safePath", runtimeSafePath(ledgerOrigin))
                         .put("candidateCount", parsedMissionCandidates.size))
@@ -8008,7 +8181,7 @@ class MainActivity : Activity() {
                 activeBatchPageAction = null
             }
 
-            if (provider == ProviderId.JINHAK && activeAction == null && jinhakAllowAgentAction && maybeExecuteJinhakAgentAction(snapshot, jinhakExpansionStateKey)) {
+            if (provider == ProviderId.JINHAK && activeAction == null && !JinhakStorageOnlyPolicy.isLibrary(snapshot.optString("url")) && jinhakAllowAgentAction && maybeExecuteJinhakAgentAction(snapshot, jinhakExpansionStateKey)) {
                 return@collectSnapshot
             }
             if (provider == ProviderId.JINHAK && activeAction == null && maybeReturnToJinhakMissionOrigin(snapshot)) {
@@ -8021,6 +8194,10 @@ class MainActivity : Activity() {
                 "일괄 수집: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / URL대기 ${batchQueue.size} / 페이지대기 ${batchPageActions.size} / 레코드 ${batchRecords.length()}"
             }
 
+            if (provider == ProviderId.JINHAK && JinhakStorageOnlyPolicy.isLibrary(snapshot.optString("url"))) {
+                scheduleJinhakStorageRefresh("snapshot-complete")
+                return@collectSnapshot
+            }
             if (batchPageCount >= MAX_BATCH_PAGES) {
                 finishBatch("page-limit")
             } else {

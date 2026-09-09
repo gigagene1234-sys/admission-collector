@@ -13,7 +13,7 @@ import org.json.JSONObject
  * Adiga/provider mappings; the raw Jinhak label is never silently expanded.
  */
 object JinhakApplicationMission {
-    const val SEMANTICS_VERSION = 3
+    const val SEMANTICS_VERSION = 4
 
     data class Context(
         val year: Int = 2027,
@@ -193,6 +193,18 @@ object JinhakApplicationMission {
         number(text, Regex("""(?:실시간\s*수시\s*)?모의지원\s*경쟁률\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)"""))?.let {
             out.put("mockCompetition", it)
         }
+        val liveCompetition = JinhakStorageCompetitionMonitor.extract(text)
+        liveCompetition.currentApplicationCompetition?.let {
+            out.put("currentApplicationCompetition", it)
+            out.put("currentApplicationCompetitionSource", liveCompetition.currentSource ?: "explicit-current")
+            out.put("currentApplicationCompetitionDerived", liveCompetition.derivedFromExplicitCounts)
+        }
+        liveCompetition.ambiguousGenericCompetition?.let {
+            out.put("genericCompetitionUnresolved", it)
+            out.put("currentApplicationCompetitionAmbiguous", true)
+        }
+        out.put("competitionSourceClass", "jinhak-user-viewed-storage")
+        out.put("competitionOfficial", false)
         number(text, Regex("""모의지원자\s*(?:수|인원)\s*[:：]?\s*([0-9,]+)"""))?.toInt()?.let {
             out.put("mockApplicants", it)
         }

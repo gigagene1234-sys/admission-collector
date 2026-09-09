@@ -7,6 +7,7 @@ import com.admissionhub.collector.jinhak.JinhakStrategyAnalyzer
 import com.admissionhub.collector.jinhak.JinhakApplicationMission
 import com.admissionhub.collector.jinhak.JinhakReportYearGuard
 import com.admissionhub.collector.jinhak.JinhakStrictHigh3Sandbox
+import com.admissionhub.collector.jinhak.JinhakStorageOnlyPolicy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -84,7 +85,7 @@ object JinhakAdapter : ProviderAdapter {
         val dedicatedMinimum = url.contains("esatminuniv") ||
             path.contains("/sat-minimum") || path.contains("/minimum-requirement")
         val scoreReport = Regex("(score|calc)").containsMatchIn(url) || Regex("성적산출\\s*리포트").containsMatchIn(headingText)
-        val earlyStorage = Regex("(storage|save)").containsMatchIn(url) || Regex("(수시|정시)?\\s*저장소|저장대학").containsMatchIn(headingText)
+        val earlyStorage = JinhakStorageOnlyPolicy.isLibrary(rawUrl) || Regex("(storage|save)").containsMatchIn(url) || Regex("(수시|정시)?\\s*저장소|저장대학").containsMatchIn(headingText)
         val universitySearch = url.contains("four-year-university/search") || Regex("대학검색").containsMatchIn(headingText)
         val curation = url.contains("/curation") || Regex("큐레이션").containsMatchIn(headingText)
         val recommended = Regex("추천대학").containsMatchIn(headingText)
@@ -156,7 +157,7 @@ object JinhakAdapter : ProviderAdapter {
                 val cEvidence = (cObj?.optString("text") ?: cards.optString(ci)).replace(Regex("""\s+"""), " ").trim()
                 if (cEvidence.isBlank()) continue
                 val cMetrics = predictionMetrics(cEvidence)
-                if (listOf("mockCompetition", "predictionProbability", "myRank", "predictedCut", "mockApplicants", "applicants").any { cMetrics.has(it) && !cMetrics.isNull(it) }) {
+                if (listOf("currentApplicationCompetition", "genericCompetitionUnresolved", "mockCompetition", "predictionProbability", "myRank", "predictedCut", "mockApplicants", "applicants").any { cMetrics.has(it) && !cMetrics.isNull(it) }) {
                     hasRicherPredictionCards = true
                     break
                 }
@@ -196,6 +197,7 @@ object JinhakAdapter : ProviderAdapter {
                 val summaryOnly = metricKeys.size == 1 && metricKeys.firstOrNull() == "stabilityBars"
                 if (hasRicherPredictionCards && summaryOnly) continue
                 val hasPrimaryPrediction = listOf(
+                    "currentApplicationCompetition", "genericCompetitionUnresolved",
                     "stabilityBars", "predictionProbability", "predictionLabel", "myRank", "predictedCut"
                 ).any { cardMetrics.has(it) && !cardMetrics.isNull(it) }
                 if (!hasPrimaryPrediction) continue
