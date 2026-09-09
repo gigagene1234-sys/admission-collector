@@ -11,6 +11,7 @@ on:
       - "app/src/main/AndroidManifest.xml"
       - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakFocusedSixPolicy.kt"
       - "app/src/test/java/com/admissionhub/collector/jinhak/JinhakFocusedSixPolicyTest.kt"
+      - "app/src/test/java/com/admissionhub/collector/jinhak/JinhakSiteTopologyV0172Test.kt"
       - "docs/releases/v0.18.1.md"
   workflow_dispatch:
 
