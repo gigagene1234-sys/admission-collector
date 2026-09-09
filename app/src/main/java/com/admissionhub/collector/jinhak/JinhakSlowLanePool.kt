@@ -9,6 +9,7 @@ import android.view.View
 import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -17,6 +18,7 @@ import com.admissionhub.collector.capture.SnapshotScript
 import com.admissionhub.collector.parser.RecordUtils
 import org.json.JSONObject
 import java.util.ArrayDeque
+import java.io.ByteArrayInputStream
 
 /**
  * Bounded authenticated background browser pool for slow Jinhak read-only pages.
@@ -239,11 +241,25 @@ class JinhakSlowLanePool(
         }
         val slot = WorkerSlot(id, view)
         view.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(v: WebView, request: WebResourceRequest): WebResourceResponse? {
+                val target = request.url?.toString().orEmpty()
+                if (JinhakStrictHigh3Sandbox.shouldBlockAnyRequest(target)) return blockedResponse("lower-grade-any-request")
+                if (request.isForMainFrame && !JinhakStrictHigh3Sandbox.allowsCollectorNavigation(target)) {
+                    return blockedResponse("non-high3-main-frame")
+                }
+                return super.shouldInterceptRequest(v, request)
+            }
+
             override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean =
-                !isAllowedJinhakUrl(request.url.toString())
+                !JinhakStrictHigh3Sandbox.allowsCollectorNavigation(request.url.toString())
 
             override fun onPageStarted(v: WebView, url: String, favicon: Bitmap?) {
                 if (slot.task == null) return
+                if (!JinhakStrictHigh3Sandbox.allowsCollectorNavigation(url)) {
+                    runCatching { v.stopLoading() }
+                    finishFailure(slot, "slow-lane-strict-high3-block")
+                    return
+                }
                 slot.lastProgressAtMs = System.currentTimeMillis()
                 slot.pageFinished = false
                 slot.stablePolls = 0
@@ -544,11 +560,17 @@ class JinhakSlowLanePool(
         """.trimIndent()
     }
 
-    private fun isAllowedJinhakUrl(raw: String): Boolean = try {
-        val uri = Uri.parse(raw)
-        val host = uri.host.orEmpty().lowercase()
-        uri.scheme == "https" && (host == "jinhak.com" || host.endsWith(".jinhak.com"))
-    } catch (_: Exception) { false }
+    private fun blockedResponse(reason: String): WebResourceResponse = WebResourceResponse(
+        "text/plain",
+        "UTF-8",
+        204,
+        "No Content",
+        mapOf("Cache-Control" to "no-store", "X-Admission-Hub-SlowLane-Fence" to reason),
+        ByteArrayInputStream(ByteArray(0))
+    )
+
+    private fun isAllowedJinhakUrl(raw: String): Boolean =
+        JinhakStrictHigh3Sandbox.allowsCollectorNavigation(raw)
 
     private fun decodeJson(encoded: String?): JSONObject? {
         if (encoded.isNullOrBlank() || encoded == "null") return null
