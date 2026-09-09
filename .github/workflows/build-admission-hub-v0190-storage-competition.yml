@@ -5,6 +5,13 @@ on:
     branches: [codex/v0190-jinhak-storage-competition-monitor]
     paths:
       - ".github/workflows/build-admission-hub-v0190-storage-competition.yml"
+      - ".github/scripts/run_v0190_storage_monitor_patch.py"
+      - ".github/scripts/patch_v0190_storage_monitor.py"
+      - ".github/scripts/verify_v0190_storage_monitor.py"
+      - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakStorageOnlyPolicy.kt"
+      - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakStorageCompetitionMonitor.kt"
+      - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakSiteTopology.kt"
+      - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakFocusedSixPolicy.kt"
   workflow_dispatch:
 
 permissions:
@@ -28,7 +35,7 @@ jobs:
       - name: Apply v0.19.0 product patch
         run: |
           set -euo pipefail
-          python3 .github/scripts/patch_v0190_storage_monitor.py
+          python3 .github/scripts/run_v0190_storage_monitor_patch.py
           git diff --check
       - name: Verify source contracts before commit
         run: python3 .github/scripts/verify_v0190_storage_monitor.py
