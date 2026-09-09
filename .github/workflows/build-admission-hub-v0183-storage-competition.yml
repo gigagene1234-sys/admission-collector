@@ -8,6 +8,7 @@ on:
       - ".github/scripts/patch_v0183_storage_only_competition.py"
       - ".github/scripts/verify_v0183_storage_only_competition.py"
       - ".github/scripts/verify_apk_v0183.sh"
+      - "app/src/test/java/com/admissionhub/collector/jinhak/JinhakStrictHigh3IntegrationPolicyTest.kt"
   workflow_dispatch:
 
 permissions:
@@ -30,7 +31,11 @@ jobs:
       - name: Apply v0.18.3 product patch
         run: |
           set -euo pipefail
-          python3 .github/scripts/patch_v0183_storage_only_competition.py
+          if grep -F 'versionName = "0.18.3"' app/build.gradle.kts >/dev/null; then
+            echo 'v0.18.3 product source is already committed; skipping patch replay'
+          else
+            python3 .github/scripts/patch_v0183_storage_only_competition.py
+          fi
           git diff --check
       - name: Verify source contracts before commit
         run: python3 .github/scripts/verify_v0183_storage_only_competition.py
@@ -39,7 +44,7 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add app/build.gradle.kts app/src/main/AndroidManifest.xml app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt app/src/main/java/com/admissionhub/collector/jinhak/JinhakStorageCompetitionPolicy.kt app/src/test/java/com/admissionhub/collector/jinhak/JinhakStorageCompetitionPolicyTest.kt
+          git add app/build.gradle.kts app/src/main/AndroidManifest.xml app/src/main/java/com/admissionhub/collector/MainActivity.kt app/src/main/java/com/admissionhub/collector/provider/JinhakAdapter.kt app/src/main/java/com/admissionhub/collector/jinhak/JinhakStorageCompetitionPolicy.kt app/src/test/java/com/admissionhub/collector/jinhak/JinhakStorageCompetitionPolicyTest.kt app/src/test/java/com/admissionhub/collector/jinhak/JinhakStrictHigh3IntegrationPolicyTest.kt
           if ! git diff --cached --quiet; then
             git commit -m 'Admission Hub v0.18.3 storage-only competition watch'
             git push origin HEAD:codex/v0183-storage-only-competition-watch
