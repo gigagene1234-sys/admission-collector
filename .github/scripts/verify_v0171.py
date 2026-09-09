@@ -45,22 +45,24 @@ if failed:
     raise SystemExit("v0.17.1 verification failed: " + ", ".join(failed))
 
 
-def member_region(name: str) -> str:
-    marker = f"    private fun {name}"
-    start = main.find(marker)
+def member_region_exact(signature: str) -> str:
+    start = main.find(signature)
     if start < 0:
-        raise SystemExit(f"member missing: {name}")
-    tail = main[start + len(marker):]
+        raise SystemExit(f"member missing: {signature.strip()}")
+    tail = main[start + len(signature):]
     m = re.search(r"\n    private\s+(?:fun|val|var|data\s+class|class|object)\b", tail)
-    end = start + len(marker) + m.start() if m else len(main)
+    end = start + len(signature) + m.start() if m else len(main)
     return main[start:end]
+
+
+def member_region(name: str) -> str:
+    return member_region_exact(f"    private fun {name}")
 
 # Critical negative contracts: Jinhak session ownership must not leak back through legacy entry points.
 keep_start = main.index("    private val sessionKeepAlive = object : Runnable {")
 keep_end = main.index("    private data class BatchPageAction(", keep_start)
 keep = main[keep_start:keep_end]
 assert 'attemptSessionExtension()' in keep  # Adiga still gets keep-alive.
-# But it must be explicitly confined away from Jinhak.
 assert 'active && provider != ProviderId.JINHAK' in keep
 assert 'openJinhakDirectHigh3Auth(' not in keep
 assert 'verifyRecoveredJinhakHigh3AndResume(' not in keep
@@ -94,10 +96,19 @@ assert 'checkSessionState' not in probe
 resume = member_region("resumeAfterLogin")
 assert 'confirmJinhakUserSessionAndResume("legacy-resume-button")' in resume
 
-attempt = member_region("attemptSavedCredentialLogin")
-first_part = attempt[:900]
+# Verify both credential entry points exactly. The Jinhak-only compatibility baseline must itself
+# be pure user handoff, and the generic provider path must return for Jinhak before vault/DOM logic.
+baseline = member_region_exact("    private fun attemptSavedCredentialLoginV0912Baseline(reason: String)")
+assert 'enterJinhakUserSessionGate("saved-credential-login-disabled:$reason")' in baseline
+assert 'credentialVault.load' not in baseline
+assert 'evaluateJavascript' not in baseline
+assert 'which ==' not in baseline
+
+attempt = member_region_exact("    private fun attemptSavedCredentialLogin(which: ProviderId, reason: String)")
+first_part = attempt[:1100]
 assert 'if (which == ProviderId.JINHAK)' in first_part
 assert 'saved-credential-login-disabled' in first_part
+assert first_part.index('if (which == ProviderId.JINHAK)') < attempt.find('credentialVault.load')
 
 # The app may still maintain Adiga auth metadata. Generic restore is allowed only with an explicit Jinhak-null guard.
 for line in main.splitlines():
