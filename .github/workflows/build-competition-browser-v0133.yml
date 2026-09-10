@@ -30,6 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/patch_competition_browser_v0133_visible_challenge.py
+          python3 .github/scripts/patch_competition_browser_v0133_timeout_guard.py
 
       - name: Persist patched product source
         shell: bash
@@ -63,6 +64,7 @@ jobs:
           grep -q 'location.origin+location.pathname' "$C"
           grep -q 'countsMatch(quota,applicants,r)' "$C"
           grep -q 'WebChromeClient' "$C"
+          grep -q 'generation == pageGeneration && challengeDialog == null' "$C"
           grep -q 'USER_CHALLENGE_TIMEOUT_MS = 180_000L' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserPolicy.kt
           grep -q 'versionName = "0.13.3"' app/build.gradle.kts
           grep -q 'versionCode = 113300' app/build.gradle.kts
