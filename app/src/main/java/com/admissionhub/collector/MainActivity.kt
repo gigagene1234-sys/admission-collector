@@ -2520,6 +2520,27 @@ class MainActivity : Activity() {
         jinhakLastAuthEvidence = "manual-browser-no-auth-inference"
     }
 
+    private fun clearJinhakLegacyAuthState() {
+        val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
+        prefs.edit()
+            .remove("jinhakAuthProofCollectorVersion")
+            .remove("jinhakRealAuthProbeResult")
+            .remove("jinhakRealAuthProbeVerifiedAtMs")
+            .remove("jinhakLastCoreVerifiedAtMs")
+            .remove("jinhakLastAuthEvidence")
+            .remove("jinhakAuthProofSafePath")
+            .apply()
+        jinhakAuthVerifiedForBatch = false
+        jinhakV0182ProtectedSessionVerified = false
+        jinhakUserSessionConfirmed = false
+        jinhakTransitionAuthGateActive = false
+        jinhakRealAuthProbeActive = false
+        jinhakRealAuthResumeGatePending = false
+        jinhakLastCoreVerifiedAtMs = 0L
+        jinhakRealAuthProbeVerifiedAtMs = 0L
+        jinhakLastAuthEvidence = "manual-browser-no-auth-inference"
+    }
+
     private fun persistJinhakAuthProofCheckpoint(synchronous: Boolean = false) {
         clearJinhakLegacyAuthState()
     }
