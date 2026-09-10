@@ -277,6 +277,11 @@ class CompetitionBrowserCollector(
                   return h;
                 }
                 function at(a,i){return i>=0&&i<a.length?a[i]:null;}
+                function countsMatch(q,a,r){
+                  if(q===null||a===null||r===null)return true;
+                  if(q===0)return a===0&&Math.abs(r)<=0.005;
+                  return Math.abs((a/q)-r)<=0.015;
+                }
 
                 var out=[];var currentHeader=null;var section=null;
                 Array.from(document.querySelectorAll('table tr')).forEach(function(tr){
@@ -294,27 +299,37 @@ class CompetitionBrowserCollector(
                   }
                   if(ri<0)return;
                   var r=ratio(cells[ri]);if(r===null)return;
-                  var admission=label(at(cells,currentHeader?currentHeader.admission:-1))||label(section);
-                  var department=label(at(cells,currentHeader?currentHeader.department:-1));
-                  var quota=integer(at(cells,currentHeader?currentHeader.quota:-1));
-                  var applicants=integer(at(cells,currentHeader?currentHeader.applicants:-1));
-                  if(!department){
-                    var texts=cells.slice(0,ri).filter(function(c){return !numeric(c);});
-                    if(texts.length)department=label(texts[texts.length-1]);
-                    if(!admission&&texts.length>1)admission=label(texts[texts.length-2]);
+                  var before=cells.slice(0,ri);
+                  var ints=[];
+                  before.forEach(function(c,i){var v=integer(c);if(v!==null)ints.push({i:i,v:v});});
+                  var quota=null,applicants=null,tail=ri;
+                  if(ints.length>=2){
+                    quota=ints[ints.length-2].v;
+                    applicants=ints[ints.length-1].v;
+                    tail=ints[ints.length-2].i;
+                  }else{
+                    quota=integer(at(cells,currentHeader?currentHeader.quota:-1));
+                    applicants=integer(at(cells,currentHeader?currentHeader.applicants:-1));
                   }
-                  if(quota===null||applicants===null){
-                    var nums=cells.slice(0,ri).map(integer).filter(function(x){return x!==null;});
-                    if(nums.length>=2){if(quota===null)quota=nums[nums.length-2];if(applicants===null)applicants=nums[nums.length-1];}
-                  }
+                  var texts=before.slice(0,tail).filter(function(c){return !numeric(c);});
+                  var department=texts.length?label(texts[texts.length-1]):label(at(cells,currentHeader?currentHeader.department:-1));
+                  var admission=label(section);
+                  var indexedAdmission=label(at(cells,currentHeader?currentHeader.admission:-1));
+                  if(indexedAdmission&&indexedAdmission!==department)admission=indexedAdmission;
+                  else if(!admission&&texts.length>1)admission=label(texts[texts.length-2]);
+                  if(!countsMatch(quota,applicants,r))return;
                   if(!department&&quota===null&&applicants===null)return;
                   out.push({admission:admission,department:department,quota:quota,applicants:applicants,ratio:r,cells:cells});
                 });
 
                 var seen={};out=out.filter(function(r){var k=JSON.stringify([r.admission,r.department,r.quota,r.applicants,r.ratio]);if(seen[k])return false;seen[k]=true;return true;});
                 var sourceUpdatedAt=null;
-                var dm=body.match(/(20\d{2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{1,2})[^\d]{0,40}(\d{1,2})\s*:\s*(\d{2})/)||body.match(/(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일[^\d]{0,40}(\d{1,2})\s*:\s*(\d{2})/);
-                if(dm){sourceUpdatedAt=dm[1]+'-'+String(dm[2]).padStart(2,'0')+'-'+String(dm[3]).padStart(2,'0')+'T'+String(dm[4]).padStart(2,'0')+':'+dm[5]+':00+09:00';}
+                var datePattern='(20\\d{2})\\s*[.\\/-]\\s*(\\d{1,2})\\s*[.\\/-]\\s*(\\d{1,2})[^\\d]{0,20}(\\d{1,2})\\s*:\\s*(\\d{2})';
+                var dm=body.match(new RegExp('(?:업데이트|갱신|기준|현재)[^0-9]{0,30}'+datePattern,'i'))||body.match(new RegExp(datePattern+'[^가-힣A-Za-z0-9]{0,20}(?:업데이트|갱신|기준|현재)','i'));
+                if(dm){
+                  var offset=dm.length>6?dm.length-5:1;
+                  sourceUpdatedAt=dm[offset]+'-'+String(dm[offset+1]).padStart(2,'0')+'-'+String(dm[offset+2]).padStart(2,'0')+'T'+String(dm[offset+3]).padStart(2,'0')+':'+dm[offset+4]+':00+09:00';
+                }
                 return JSON.stringify({
                   challenge:false,
                   sourceUrl:location.origin+location.pathname,
