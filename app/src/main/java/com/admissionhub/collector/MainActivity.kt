@@ -32,6 +32,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import com.admissionhub.collector.capture.SnapshotScript
 import com.admissionhub.collector.cloud.CloudOffloadCoordinator
+import com.admissionhub.collector.competition.CompetitionBrowserCollector
 import com.admissionhub.collector.local.LocalCollectorStore
 import com.admissionhub.collector.hub.HubDashboardModel
 import com.admissionhub.collector.score.ScoreReviewUi
@@ -88,6 +89,7 @@ class MainActivity : Activity() {
     private lateinit var scoreReviewUi: ScoreReviewUi
     private lateinit var slowLaneHost: FrameLayout
     private lateinit var slowLanePool: JinhakSlowLanePool
+    private lateinit var competitionCollector: CompetitionBrowserCollector
     private val jinhakMissionCells = JinhakMissionCellSupervisor()
 
     private val handler = Handler(Looper.getMainLooper())
@@ -492,8 +494,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.13.0"
-        private const val BUILD_CODE = 113000
+        private const val VERSION = "0.13.1"
+        private const val BUILD_CODE = 113100
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = true
     }
@@ -528,6 +530,14 @@ class MainActivity : Activity() {
             }
         })
         configureWebView()
+        competitionCollector = CompetitionBrowserCollector(
+            activity = this,
+            host = slowLaneHost,
+            cloud = cloudOffload,
+            isBusy = { unifiedRunning || batchRunning || startupLoginPreflightActive || jinhakTransitionAuthGateActive },
+            onStatus = { message -> if (!unifiedRunning && !batchRunning) status.text = message },
+        )
+        competitionCollector.start()
         initializeProcessResumeJournal()
         restoreJinhakAuthProofCheckpoint("activity-create")
         val localDecision = localStore.localRebindDecision()
@@ -8321,6 +8331,7 @@ class MainActivity : Activity() {
             persistProcessResumeJournal("onDestroy-active-or-system", synchronous = true)
         }
         if (::slowLanePool.isInitialized) slowLanePool.destroy()
+        if (::competitionCollector.isInitialized) competitionCollector.destroy()
         handler.removeCallbacksAndMessages(null)
         CookieManager.getInstance().flush()
         stopCollectionKeepAlive()
