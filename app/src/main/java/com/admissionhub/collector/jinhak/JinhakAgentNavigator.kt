@@ -4,6 +4,13 @@ import com.admissionhub.collector.parser.RecordUtils
 import org.json.JSONArray
 import org.json.JSONObject
 
+/**
+ * v0.18.5 application-report navigator.
+ *
+ * It never performs a generic Jinhak crawl. On the storage page, only a read-only report action
+ * structurally bound to one application card is eligible. Inside a report family, only report
+ * lane controls are eligible. This preserves same-application provenance across every click.
+ */
 object JinhakAgentNavigator {
     data class Candidate(
         val scanIndex: Int,
@@ -19,6 +26,8 @@ object JinhakAgentNavigator {
 
     fun candidates(snapshot: JSONObject): List<Candidate> {
         val route = snapshot.optString("url")
+        if (!JinhakManualStorageReportPolicy.isAllowedMissionUrl(route)) return emptyList()
+
         val out = mutableListOf<Candidate>()
         val seen = linkedSetOf<String>()
 
@@ -30,10 +39,9 @@ object JinhakAgentNavigator {
                 val label = obj.optString("label").replace(Regex("\\s+"), " ").trim().take(120)
                 val tag = obj.optString("tag").take(24)
                 val kind = obj.optString("kind", "read-navigation").take(40)
-                val contextText = obj.optString("contextText")
-                    .replace(Regex("\\s+"), " ").trim().take(2400)
+                val contextText = obj.optString("contextText").replace(Regex("\\s+"), " ").trim().take(2400)
                 if (scanIndex < 0 || label.isBlank()) continue
-                if (!isSafeReadNavigationLabel(label)) continue
+
                 val explicitUniversity = obj.optString("applicationUniversity")
                     .replace(Regex("\\s+"), " ").trim().take(80).takeIf { it.isNotBlank() }
                 val explicitDepartment = obj.optString("applicationDepartment")
@@ -45,26 +53,51 @@ object JinhakAgentNavigator {
                     explicitUniversity = explicitUniversity,
                     explicitDepartment = explicitDepartment
                 )
-                val dedupeKey = listOf(scanIndex.toString(), label, kind, app?.identityKey ?: contextText.take(1000)).joinToString("|")
+                val bound = !app?.identityKey.isNullOrBlank()
+                if (!JinhakManualStorageReportPolicy.shouldPromoteAction(route, label, bound)) continue
+
+                // Storage must always retain a same-card identity. Report pages inherit identity
+                // through JinhakReportContextBridge and therefore may expose unbound tab controls.
+                if (JinhakManualStorageReportPolicy.isStorageEntry(route) && !bound) continue
+
+                val dedupeKey = listOf(scanIndex.toString(), label, kind, app?.identityKey ?: "report-tab").joinToString("|")
                 if (!seen.add(dedupeKey)) continue
-                var priority = JinhakSiteTopology.priority(route, label)
-                if (app?.identityKey != null) priority += 14
-                if (app != null && Regex("(리포트|실제\\s*합격자|모의\\s*지원|합격\\s*예측)").containsMatchIn(label)) priority += 8
-                if (kind == "mission-link-navigation" && app?.identityKey != null) priority += 35
-                if (kind == "mission-bound-control" && app?.identityKey != null) priority += 35
-                if (promoted && app?.identityKey != null) priority += 45
-                out += Candidate(scanIndex, label, tag, kind, priority.coerceIn(0, 220), contextText, app, promoted, applicationBindingSource)
+
+                val lane = JinhakReportContextBridge.laneHint(label)
+                var priority = when (lane) {
+                    "actual-admit" -> 130
+                    "current-prediction" -> 125
+                    "mock-support" -> 120
+                    "score-analysis" -> 115
+                    else -> 90
+                }
+                if (bound) priority += 35
+                if (kind == "mission-link-navigation" || kind == "mission-bound-control") priority += 25
+                if (promoted) priority += 20
+
+                out += Candidate(
+                    scanIndex = scanIndex,
+                    label = label,
+                    tag = tag,
+                    kind = kind,
+                    missionPriority = priority.coerceIn(0, 220),
+                    contextText = contextText,
+                    applicationContext = app,
+                    promotedMissionAction = promoted,
+                    applicationBindingSource = applicationBindingSource
+                )
             }
         }
 
-        // Dedicated mission anchors cannot be displaced by the generic action cap.
-        append("missionAgentActions", promoted = true, limit = 120)
-        append("agentActions", promoted = false, limit = 160)
+        // Same-card mission anchors are first-class. Generic site links never enter the candidate set.
+        append("missionAgentActions", promoted = true, limit = 160)
+        if (JinhakManualStorageReportPolicy.isReportUrl(route)) {
+            append("agentActions", promoted = false, limit = 160)
+        }
 
         return out.sortedWith(
-            compareByDescending<Candidate> { it.promotedMissionAction && it.applicationContext?.identityKey != null }
-                .thenByDescending { it.kind == "mission-link-navigation" && it.applicationContext?.identityKey != null }
-                .thenByDescending { it.applicationContext?.identityKey != null }
+            compareByDescending<Candidate> { !it.applicationContext?.identityKey.isNullOrBlank() }
+                .thenByDescending { it.promotedMissionAction }
                 .thenByDescending { it.missionPriority }
                 .thenBy { it.scanIndex }
         )
@@ -75,15 +108,12 @@ object JinhakAgentNavigator {
             safeRoute,
             candidate.scanIndex.toString(),
             candidate.label,
-            candidate.tag,
             candidate.kind,
-            candidate.missionPriority.toString(),
-            candidate.promotedMissionAction.toString(),
-            candidate.applicationContext?.identityKey ?: RecordUtils.sha256(candidate.contextText.take(1200))
+            candidate.applicationContext?.identityKey ?: "report-tab"
         ).joinToString("|")
     )
 
-    fun laneForCandidate(candidate: Candidate): String = JinhakMissionLaneSequencer.laneForLabel(candidate.label, candidate.kind)
+    fun laneForCandidate(candidate: Candidate): String = JinhakReportContextBridge.laneHint(candidate.label)
 
     fun executionScript(candidate: Candidate): String {
         val expected = JSONObject.quote(candidate.label)
@@ -91,45 +121,39 @@ object JinhakAgentNavigator {
         val department = JSONObject.quote(candidate.applicationContext?.departmentRaw.orEmpty().take(120))
         val admission = JSONObject.quote(candidate.applicationContext?.admission.orEmpty().take(100))
         val capacity = candidate.applicationContext?.capacity ?: -1
-        val requiresSameCard = candidate.applicationContext?.identityKey != null
-        val requiresReportFamily = candidate.kind == "report-lane-navigation"
+        val requiresSameCard = !candidate.applicationContext?.identityKey.isNullOrBlank()
+        val reportPage = candidate.applicationContext == null
         return """
             (function(){
               function visible(el){
                 if(!el) return false;
-                var s=getComputedStyle(el);
-                if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0') return false;
-                var r=el.getBoundingClientRect();
-                return r.width>0&&r.height>0;
+                var s=getComputedStyle(el), r=el.getBoundingClientRect();
+                return s.display!=='none' && s.visibility!=='hidden' && s.opacity!=='0' && r.width>0 && r.height>0;
               }
               function clean(v){return String(v||'').replace(/\s+/g,' ').trim();}
-              function norm(v){
-                return clean(v).toLowerCase().replace(/[\s\[\](){}·._\-\/:|]/g,'');
-              }
-              function containsToken(text,token){
-                var nt=norm(token);
-                return !nt || norm(text).indexOf(nt)>=0;
-              }
+              function norm(v){return clean(v).toLowerCase().replace(/[\s\[\](){}·._\-\/:|]/g,'');}
+              function containsToken(text,token){var nt=norm(token);return !nt || norm(text).indexOf(nt)>=0;}
               var expected=$expected, uni=$university, dept=$department, adm=$admission, capacity=$capacity;
               var requireSameCard=${if (requiresSameCard) "true" else "false"};
-              var requireReportFamily=${if (requiresReportFamily) "true" else "false"};
-              if(requireReportFamily && !/\/jh\/high3\/early\/four-year-university\/report\//i.test(location.pathname)) return JSON.stringify({ok:false,reason:'report-family-context-mismatch'});
+              var requireReportPage=${if (reportPage) "true" else "false"};
+              var storage=/\/jh\/high3\/early\/four-year-university\/library\/?$/i.test(location.pathname);
+              var report=/\/jh\/high3\/early\/four-year-university\/report\//i.test(location.pathname);
+              if(requireSameCard && !storage) return JSON.stringify({ok:false,reason:'storage-context-required'});
+              if(requireReportPage && !report) return JSON.stringify({ok:false,reason:'report-context-required'});
+
               var blocked=/(원서\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰|동의|미동의)/i;
-              var allowed=/(실제\s*합격자|과거\s*입시결과|입시\s*결과|합격\s*예측\s*리포트|모의\s*지원\s*리포트|지원자\s*분포|대학.?학과별\s*합격\s*예측|합격\s*안정성|상세|보기|조회|검색|리포트|대학\s*정보|전형\s*정보|학과\s*정보|합격\s*예측|모의\s*지원|수시\s*저장소|정시\s*저장소|추천\s*대학|성적\s*분석|성적\s*산출|입시\s*전략|입시\s*지식|경쟁률|모집\s*요강|다음|더보기|결과|탭)/i;
+              var allowed=/(합격\s*예측|합격\s*안정성|모의\s*지원|지원자\s*분포|실제\s*합격자|과거\s*입시결과|입시\s*결과|성적\s*분석|성적\s*산출|환산\s*점수|리포트)/i;
               var selector='a,button,[role=button],[role=tab],[onclick],[data-href],[data-url],[data-link],[data-path]';
               var nodes=document.querySelectorAll(selector);
-              function labelOf(el){return clean(el&& (el.innerText||el.textContent||el.getAttribute('aria-label')||el.getAttribute('title')||'')).slice(0,120);}
-              function matchingActionCount(scope){
+              function labelOf(el){return clean(el&&(el.innerText||el.textContent||el.getAttribute('aria-label')||el.getAttribute('title')||'')).slice(0,120);}
+              function sameLabelCount(scope){
                 if(!scope||!scope.querySelectorAll) return 0;
                 var all=scope.querySelectorAll(selector), count=0;
-                for(var i=0;i<all.length;i++){
-                  if(visible(all[i])&&labelOf(all[i])===expected) count++;
-                  if(count>1) break;
-                }
+                for(var i=0;i<all.length;i++) if(visible(all[i])&&labelOf(all[i])===expected) count++;
                 return count;
               }
               function cardProof(el){
-                if(!requireSameCard) return {ok:true,depth:0,reason:'not-required'};
+                if(!requireSameCard) return {ok:true,depth:0,reason:'report-tab'};
                 var cur=el;
                 for(var d=0;cur&&d<10;d++,cur=cur.parentElement){
                   var tag=String(cur.tagName||'').toUpperCase();
@@ -146,56 +170,33 @@ object JinhakAgentNavigator {
                   }
                   var admissionOk=!!adm&&containsToken(t,adm);
                   if(capacity>=0 ? !capacityOk : !admissionOk) continue;
-                  if(matchingActionCount(cur)!==1) continue;
+                  if(sameLabelCount(cur)!==1) continue;
                   return {ok:true,depth:d,reason:capacity>=0?'unique-card-capacity':'unique-card-admission'};
                 }
                 return {ok:false,depth:-1,reason:'bounded-card-proof-missing'};
               }
               function tryClick(el,resolution){
-                if(!el) return null;
-                if(!visible(el)) return {ok:false,reason:'hidden',resolution:resolution};
+                if(!el||!visible(el)) return {ok:false,reason:'hidden-or-missing',resolution:resolution};
                 var lab=labelOf(el);
-                if(lab!==expected) return {ok:false,reason:'label-changed',resolution:resolution,observedLabel:lab};
+                if(lab!==expected) return {ok:false,reason:'label-changed',resolution:resolution};
                 if(blocked.test(lab)||!allowed.test(lab)) return {ok:false,reason:'policy-block',resolution:resolution};
                 var proof=cardProof(el);
                 if(!proof.ok) return {ok:false,reason:'same-card-context-mismatch',resolution:resolution,proofReason:proof.reason};
                 try{
                   var before=location.href;
                   el.click();
-                  return {ok:true,label:lab,before:before===location.href?'same-document':'navigation-started',resolution:resolution,matchedSameCard:requireSameCard,contextDepth:proof.depth,proofReason:proof.reason};
+                  return {ok:true,label:lab,before:before===location.href?'same-document':'navigation-started',resolution:resolution,proofReason:proof.reason};
                 }catch(e){return {ok:false,reason:'click-failed',resolution:resolution};}
               }
               var primary=tryClick(nodes[${candidate.scanIndex}], 'scan-index');
               if(primary&&primary.ok) return JSON.stringify(primary);
-
-              // SPA order may change after the snapshot. Re-resolve only the exact same label and
-              // accept it only when bounded card ownership is independently reproved.
-              var fallbackReasons=[];
-              var sameLabelSeen=0;
               for(var i=0;i<nodes.length;i++){
-                var el=nodes[i];
-                if(labelOf(el)!==expected) continue;
-                sameLabelSeen++;
-                var result=tryClick(el,'bounded-context-fallback');
-                if(result&&result.ok) return JSON.stringify(result);
-                if(result&&result.reason) fallbackReasons.push(result.reason+':'+String(result.proofReason||''));
+                if(labelOf(nodes[i])!==expected) continue;
+                var r=tryClick(nodes[i], 'bounded-fallback');
+                if(r&&r.ok) return JSON.stringify(r);
               }
-              return JSON.stringify({
-                ok:false,
-                reason:requireSameCard?'same-card-action-not-found':'action-not-found',
-                primaryReason:primary&&primary.reason?primary.reason:'missing',
-                sameLabelSeen:sameLabelSeen,
-                fallbackReasons:fallbackReasons.slice(0,12)
-              });
+              return JSON.stringify({ok:false,reason:'report-action-not-found'});
             })();
         """.trimIndent()
-    }
-
-    private fun isSafeReadNavigationLabel(label: String): Boolean {
-        if (Regex("(원서\\s*접수|결제|구매|저장|삭제|탈퇴|로그아웃|회원정보|수정|등록|전송|제출|확정|취소|신청|지원하기|장바구니|쿠폰|동의|미동의)", RegexOption.IGNORE_CASE).containsMatchIn(label)) return false
-        return Regex(
-            "(실제\\s*합격자|과거\\s*입시결과|입시\\s*결과|합격\\s*예측\\s*리포트|모의\\s*지원\\s*리포트|지원자\\s*분포|대학.?학과별\\s*합격\\s*예측|합격\\s*안정성|상세|보기|조회|검색|리포트|대학\\s*정보|전형\\s*정보|학과\\s*정보|합격\\s*예측|모의\\s*지원|수시\\s*저장소|정시\\s*저장소|추천\\s*대학|성적\\s*분석|성적\\s*산출|입시\\s*전략|입시\\s*지식|경쟁률|모집\\s*요강|다음|더보기|결과|탭)",
-            RegexOption.IGNORE_CASE
-        ).containsMatchIn(label)
     }
 }
