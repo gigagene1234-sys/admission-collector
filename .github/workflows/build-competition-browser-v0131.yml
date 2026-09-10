@@ -21,8 +21,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply deterministic competition bridge patch
-        run: python3 .github/scripts/patch_competition_browser_v0131.py
+      - name: Apply deterministic competition bridge patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch_competition_browser_v0131.py
+          python3 .github/scripts/patch_competition_browser_dom_v3.py
 
       - name: Persist patched product source on feature branch
         shell: bash
@@ -34,8 +38,9 @@ jobs:
             git add app/build.gradle.kts \
               app/src/main/java/com/admissionhub/collector/MainActivity.kt \
               app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadClient.kt \
-              app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt
-            git commit -m "Wire competition browser collector into Admission Hub v0.13.1"
+              app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt \
+              app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
+            git commit -m "Wire validated competition browser collector into Admission Hub v0.13.1"
             git push origin HEAD:codex/competition-browser-v0131
           fi
 
@@ -47,6 +52,7 @@ jobs:
           grep -q 'credentialExported.*false' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
           grep -q 'sessionSecretExported.*false' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
           grep -q 'location.origin+location.pathname' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
+          grep -q 'countsMatch(quota,applicants,r)' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
           grep -q 'versionName = "0.13.1"' app/build.gradle.kts
           test -z "$(git status --porcelain)"
 
