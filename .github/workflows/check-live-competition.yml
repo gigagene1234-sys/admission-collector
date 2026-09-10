@@ -17,6 +17,42 @@ jobs:
     env:
       ADMISSION_INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
     steps:
+      - name: Inspect upstream competition pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          urls=(
+            "knut|https://addon.jinhakapply.com/RatioV1/RatioH/Ratio30150631.html"
+            "hanbat|https://addon.jinhakapply.com/RatioV1/RatioH/Ratio30040971.html"
+            "hannam|https://addon.jinhakapply.com/RatioV1/RatioH/Ratio11560931.html"
+            "kongju|https://addon.jinhakapply.com/RatioV1/RatioH/Ratio10281081.html"
+            "woosong|https://ent.wsu.ac.kr/page/index.jsp?code=susi0701"
+            "koreatech|https://www.koreatech.ac.kr/index.es?sid=01"
+          )
+          for pair in "${urls[@]}"; do
+            name="${pair%%|*}"
+            url="${pair#*|}"
+            echo "=== UPSTREAM $name ==="
+            curl -L --max-time 20 --silent --show-error \
+              -A "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/140 Safari/537.36" \
+              -H "Accept-Language: ko-KR,ko;q=0.9" \
+              -D "/tmp/${name}.headers" -o "/tmp/${name}.body" "$url" || true
+            head -n 20 "/tmp/${name}.headers" || true
+            echo "bytes=$(wc -c < "/tmp/${name}.body" 2>/dev/null || echo 0)"
+            node - "$name" <<'NODE'
+          const fs = require('fs');
+          const name = process.argv[2];
+          const path = `/tmp/${name}.body`;
+          if (!fs.existsSync(path)) process.exit(0);
+          const b = fs.readFileSync(path);
+          let s = b.toString('utf8');
+          const clean = s.replace(/\s+/g,' ').slice(0,12000);
+          const signals = [...clean.matchAll(/.{0,100}(경쟁률|지원현황|모집인원|지원인원|iframe|Ratio|uway|jinhak).{0,180}/gi)].slice(0,12).map(x=>x[0]);
+          console.log('signals=' + JSON.stringify(signals));
+          console.log('prefix=' + JSON.stringify(clean.slice(0,2500)));
+          NODE
+          done
+
       - name: Force one collection and inspect snapshots
         shell: bash
         run: |
@@ -45,27 +81,18 @@ jobs:
           const collect = JSON.parse(fs.readFileSync('/tmp/collect.json', 'utf8'));
           const status = JSON.parse(fs.readFileSync('/tmp/status.json', 'utf8'));
           const latest = JSON.parse(fs.readFileSync('/tmp/latest.json', 'utf8'));
-          if (!Array.isArray(status.targets) || status.targets.length !== 6) {
-            throw new Error(`expected 6 targets, got ${status.targets?.length}`);
-          }
-          if (!Array.isArray(latest.targets) || latest.targets.length !== 6) {
-            throw new Error(`expected 6 latest target entries, got ${latest.targets?.length}`);
-          }
+          if (!Array.isArray(status.targets) || status.targets.length !== 6) throw new Error(`expected 6 targets, got ${status.targets?.length}`);
+          if (!Array.isArray(latest.targets) || latest.targets.length !== 6) throw new Error(`expected 6 latest target entries, got ${latest.targets?.length}`);
           console.log('\n=== COLLECTION SUMMARY ===');
           for (const x of collect.results || []) console.log(JSON.stringify(x));
           console.log('\n=== TARGET SUMMARY ===');
           for (const t of status.targets) {
             const l = latest.targets.find(x => x.targetId === t.targetId);
             console.log(JSON.stringify({
-              targetId: t.targetId,
-              university: t.university,
-              provider: t.provider,
-              cadence: t.refreshMinutes,
-              cadenceVerified: t.cadenceVerified,
-              lastSuccessAt: t.lastSuccessAt,
-              sourceUpdatedAt: t.lastSourceUpdatedAt,
-              failures: t.consecutiveFailures,
-              lastError: t.lastError,
+              targetId: t.targetId, university: t.university, provider: t.provider,
+              cadence: t.refreshMinutes, cadenceVerified: t.cadenceVerified,
+              lastSuccessAt: t.lastSuccessAt, sourceUpdatedAt: t.lastSourceUpdatedAt,
+              failures: t.consecutiveFailures, lastError: t.lastError,
               latestRows: Array.isArray(l?.rows) ? l.rows.length : 0,
               hasSnapshot: Boolean(l?.snapshot),
             }));
