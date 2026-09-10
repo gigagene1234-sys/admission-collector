@@ -1,0 +1,40 @@
+name: Validate Competition Dashboard v0.13.1
+
+on:
+  push:
+    branches: [codex/competition-dashboard-v0131-clean2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate proxy syntax and Vercel routing
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check api/worker.js
+          node -e "JSON.parse(require('fs').readFileSync('vercel.json','utf8'))"
+          grep -q 'competition_status' api/worker.js
+          grep -q 'competition_latest' api/worker.js
+          grep -q '"/competition"' vercel.json
+      - name: Validate dashboard safety contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'STANDALONE DASHBOARD' web/competition-dashboard.html
+          grep -q 'JINHAK_APPLY' web/competition-dashboard.html
+          grep -q 'UWAY_APPLY' web/competition-dashboard.html
+          grep -q '브라우저 관측 대기' web/competition-dashboard.html
+          grep -q '합격 가능성' web/competition-dashboard.html
+          grep -q "api('competition_status')" web/competition-dashboard.html
+          grep -q "api('competition_latest')" web/competition-dashboard.html
+          if grep -Eq 'Bearer |ADMISSION_INGEST_TOKEN|password' web/competition-dashboard.html; then
+            echo 'dashboard must not contain auth secrets or token inputs' >&2
+            exit 1
+          fi
