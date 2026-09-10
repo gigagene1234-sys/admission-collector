@@ -14,7 +14,7 @@ class JinhakStrictHigh3IntegrationPolicyTest {
     }
 
     @Test
-    fun adapterQueuesOnlyProtectedSusiStorageInV0183() {
+    fun adapterQueuesOnlyManualStorageAndReportScopeInV0185() {
         val forbidden = listOf(
             "https://www.jinhak.com/",
             "https://www.jinhak.com/jh/member/login",
@@ -24,14 +24,23 @@ class JinhakStrictHigh3IntegrationPolicyTest {
             "https://member.jinhak.com/MemberV3/MemberJoin/MemberLogIn.aspx",
             JinhakSiteTopology.userSessionBootstrapUrl(),
             "https://www.jinhak.com/jh/high3/early/four-year-university/search",
-            "https://www.jinhak.com/jh/high3/early/four-year-university/report/pass-predict"
+            "https://www.jinhak.com/jh/high3/early/four-year-university/university-major-predict"
         )
-        forbidden.forEach { url -> assertFalse("v0.18.3 storage-only mode must not queue $url", JinhakAdapter.isBatchNavigable(url)) }
+        forbidden.forEach { url ->
+            assertFalse("v0.18.5 manual-storage mode must not queue generic/non-report route $url", JinhakAdapter.isBatchNavigable(url))
+        }
+
         assertTrue(JinhakAdapter.isBatchNavigable(JinhakSiteTopology.protectedCoreProbeUrl()))
+        assertTrue(JinhakAdapter.isBatchNavigable(
+            "https://www.jinhak.com/jh/high3/early/four-year-university/report/pass-predict"
+        ))
+        assertTrue(JinhakAdapter.isBatchNavigable(
+            "https://www.jinhak.com/jh/high3/early/four-year-university/report/actual-admission"
+        ))
     }
 
     @Test
-    fun everyDeclaredMissionSeedRemainsStrictHigh3ButAdapterUsesStorageOnlySeed() {
+    fun everyDeclaredMissionSeedRemainsStrictHigh3ButAdapterBootstrapsFromStorageOnly() {
         val declared = JinhakSiteTopology.missionSeeds()
         assertTrue(declared.isNotEmpty())
         declared.forEach { seed -> assertTrue("seed must be strict high3: $seed", JinhakStrictHigh3Sandbox.allowsCollectorNavigation(seed)) }
