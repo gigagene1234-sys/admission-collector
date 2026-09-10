@@ -142,6 +142,7 @@ export async function runCompetitionCollector(env, options = {}) {
     const state = states.get(target.id) || null;
 
     if (target.collectionMode === MODE_USER_BROWSER) {
+      await markTargetWaitingForUserBrowser(env, target.id, now);
       results.push({
         targetId: target.id,
         university: target.university,
@@ -480,7 +481,7 @@ function parseCompetitionPage(html, lastModified, target) {
   return {
     title,
     text,
-    sourceUpdatedAt: textTimestamp || headerTimestamp,
+    sourceUpdatedAt: headerTimestamp || textTimestamp,
     rows,
     university: target.university,
   };
@@ -527,25 +528,42 @@ function extractStructuredRows(tableRows) {
     const ratio = parseRatio(cells[ratioIndex]);
     if (ratio == null) continue;
 
-    let admission = valueAt(cells, header?.admissionIndex) || section;
-    let department = valueAt(cells, header?.departmentIndex);
-    let quota = parseInteger(valueAt(cells, header?.quotaIndex));
-    let applicants = parseInteger(valueAt(cells, header?.applicantsIndex));
-
-    if (!department || isNumericLike(department)) {
-      const textCells = cells.slice(0, ratioIndex).filter((c) => !isNumericLike(c));
-      department = textCells.length ? textCells[textCells.length - 1] : null;
-      if (!admission && textCells.length > 1) admission = textCells[textCells.length - 2];
+    const beforeRatio = cells.slice(0, ratioIndex);
+    const integerCells = [];
+    for (let i = 0; i < beforeRatio.length; i += 1) {
+      const value = parseInteger(beforeRatio[i]);
+      if (value != null) integerCells.push({ index: i, value });
     }
 
-    if (quota == null || applicants == null) {
-      const nums = cells.slice(0, ratioIndex).map(parseInteger).filter((x) => x != null);
-      if (nums.length >= 2) {
-        if (quota == null) quota = nums[nums.length - 2];
-        if (applicants == null) applicants = nums[nums.length - 1];
-      }
+    // Uway/Jinhak competition tables can collapse rowspan cells on subsequent rows, so fixed
+    // header indices are not stable. The two right-most integer cells immediately before the
+    // published ratio are the row's 모집인원 and 지원인원. Prefer that structural invariant.
+    let quota = null;
+    let applicants = null;
+    let numericTailStart = ratioIndex;
+    if (integerCells.length >= 2) {
+      const quotaCell = integerCells[integerCells.length - 2];
+      const applicantCell = integerCells[integerCells.length - 1];
+      quota = quotaCell.value;
+      applicants = applicantCell.value;
+      numericTailStart = quotaCell.index;
+    } else {
+      quota = parseInteger(valueAt(cells, header?.quotaIndex));
+      applicants = parseInteger(valueAt(cells, header?.applicantsIndex));
     }
 
+    const labelCells = beforeRatio.slice(0, numericTailStart).filter((c) => !isNumericLike(c));
+    let department = labelCells.length ? labelCells[labelCells.length - 1] : valueAt(cells, header?.departmentIndex);
+    let admission = section;
+    const indexedAdmission = valueAt(cells, header?.admissionIndex);
+    if (indexedAdmission && !isNumericLike(indexedAdmission) && indexedAdmission !== department) {
+      admission = indexedAdmission;
+    } else if (!admission && labelCells.length > 1) {
+      admission = labelCells[labelCells.length - 2];
+    }
+
+    // Reject structurally inconsistent rows instead of silently persisting shifted columns.
+    if (!ratioMatchesCounts(quota, applicants, ratio)) continue;
     if (!department && quota == null && applicants == null) continue;
     output.push({
       admission: cleanLabel(admission),
@@ -673,6 +691,16 @@ async function competitionLatest(env, query) {
   return json({ targets: result });
 }
 
+async function markTargetWaitingForUserBrowser(env, targetId, now) {
+  await env.DB.prepare(`
+    UPDATE competition_targets
+       SET last_error = NULL,
+           consecutive_failures = 0,
+           updated_at = ?
+     WHERE target_id = ?
+  `).bind(now.toISOString(), targetId).run();
+}
+
 async function noteAttempt(env, targetId, now) {
   await env.DB.prepare("UPDATE competition_targets SET last_attempt_at = ?, updated_at = ? WHERE target_id = ?")
     .bind(now.toISOString(), now.toISOString(), targetId).run();
@@ -721,6 +749,14 @@ function nullableRatio(value) {
   if (value == null || value === "") return null;
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 && n < 100000 ? n : null;
+}
+
+function ratioMatchesCounts(quota, applicants, ratio) {
+  if (quota == null || applicants == null || ratio == null) return true;
+  if (quota === 0) return applicants === 0 && Math.abs(ratio) <= 0.005;
+  const expected = applicants / quota;
+  // Published ratios are normally rounded to two decimals. Allow only a narrow rounding margin.
+  return Math.abs(expected - ratio) <= 0.015;
 }
 
 function parseRatio(value) {
