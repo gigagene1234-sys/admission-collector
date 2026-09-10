@@ -66,6 +66,7 @@ import com.admissionhub.collector.jinhak.JinhakStorageCompetitionPolicy
 import com.admissionhub.collector.jinhak.JinhakSingleSurfaceStoragePolicy
 import com.admissionhub.collector.jinhak.JinhakManualStorageReportPolicy
 import com.admissionhub.collector.jinhak.JinhakManualBrowserStateMachine
+import com.admissionhub.collector.jinhak.JinhakPassiveBrowserSurfacePolicy
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -619,8 +620,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.18.6"
-        private const val BUILD_CODE = 118600
+        private const val VERSION = "0.18.7"
+        private const val BUILD_CODE = 118700
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -1321,6 +1322,7 @@ class MainActivity : Activity() {
 
     private fun startLaunchAwareCollection() {
         provider = ProviderId.JINHAK
+        configureJinhakBrowserSurface(batchMode = false)
         credentialVault.clear(ProviderId.JINHAK.wireName)
         startupLoginPreflightActive = false
         startupLoginPreflightVerified = false
@@ -1568,8 +1570,29 @@ class MainActivity : Activity() {
             status.text = "자동 탐색 범위를 벗어났습니다. 로그인/라우팅 복구는 실행하지 않습니다."
         }
     }
+    private fun configureJinhakBrowserSurface(batchMode: Boolean) {
+        if (provider != ProviderId.JINHAK || !::webView.isInitialized) return
+        webView.settings.apply {
+            if (JinhakPassiveBrowserSurfacePolicy.USE_DEFAULT_WEBVIEW_USER_AGENT) {
+                userAgentString = WebSettings.getDefaultUserAgent(this@MainActivity)
+            }
+            javaScriptCanOpenWindowsAutomatically = JinhakPassiveBrowserSurfacePolicy.automaticWindowsEnabled(batchMode)
+            setSupportMultipleWindows(JinhakPassiveBrowserSurfacePolicy.multipleWindowsEnabled(batchMode))
+        }
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(webView, true)
+            if (JinhakPassiveBrowserSurfacePolicy.FLUSH_PROVIDER_COOKIES) flush()
+        }
+    }
+
     private fun loadMainUrl(target: String, source: String = "app-load"): Boolean {
         if (provider != ProviderId.JINHAK) {
+            webView.loadUrl(target)
+            return true
+        }
+        if (!batchRunning) {
+            configureJinhakBrowserSurface(batchMode = false)
             webView.loadUrl(target)
             return true
         }
@@ -1690,10 +1713,14 @@ class MainActivity : Activity() {
             domStorageEnabled = true
             databaseEnabled = true
             cacheMode = WebSettings.LOAD_DEFAULT
-            javaScriptCanOpenWindowsAutomatically = true
-            setSupportMultipleWindows(true)
+            javaScriptCanOpenWindowsAutomatically = provider != ProviderId.JINHAK || batchRunning
+            setSupportMultipleWindows(provider != ProviderId.JINHAK || batchRunning)
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            userAgentString = userAgentString + " AdmissionCollector/$VERSION"
+            userAgentString = if (provider == ProviderId.JINHAK) {
+                WebSettings.getDefaultUserAgent(this@MainActivity)
+            } else {
+                WebSettings.getDefaultUserAgent(this@MainActivity) + " AdmissionCollector/$VERSION"
+            }
         }
 
         webView.webViewClient = object : WebViewClient() {
@@ -1816,6 +1843,7 @@ class MainActivity : Activity() {
                 runtimeLastSafePath = runtimeSafePath(url)
                 if (provider == ProviderId.JINHAK && !batchRunning) {
                     clearJinhakLegacyAuthState()
+                    configureJinhakBrowserSurface(batchMode = false)
                     return
                 }
                 if (provider == ProviderId.JINHAK) {
@@ -1874,6 +1902,7 @@ class MainActivity : Activity() {
 
                     if (!batchRunning) {
                         if (JinhakManualStorageReportPolicy.isStorageEntry(current)) {
+                            configureJinhakBrowserSurface(batchMode = false)
                             batchPausedForLogin = false
                             jinhakCoreBootstrapState = "manual-storage-visible"
                             sessionState.text = "● 수시 저장소 확인 · 리포트 탐색 시작"
@@ -1882,6 +1911,7 @@ class MainActivity : Activity() {
                                 if (provider == ProviderId.JINHAK && !batchRunning && JinhakManualStorageReportPolicy.isStorageEntry(webView.url)) startBatch()
                             }, 250L)
                         } else {
+                            configureJinhakBrowserSurface(batchMode = false)
                             sessionState.text = "○ 진학사 직접 탐색"
                             status.text = "직접 로그인한 뒤 수시 저장소까지 이동하세요. Admission Hub는 로그인·세션을 건드리지 않습니다."
                         }
@@ -2211,6 +2241,10 @@ class MainActivity : Activity() {
                 isUserGesture: Boolean,
                 resultMsg: android.os.Message?
             ): Boolean {
+                if (provider == ProviderId.JINHAK &&
+                    !JinhakPassiveBrowserSurfacePolicy.allowCollectorPopupHandoff(batchRunning)) {
+                    return false
+                }
                 val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
                 val child = WebView(this@MainActivity)
                 if (provider == ProviderId.JINHAK) jinhakPopupWebViewsCreated += 1
@@ -3644,6 +3678,7 @@ class MainActivity : Activity() {
     }
     private fun startV0180DedicatedJinhakAuth(reason: String, forceManual: Boolean = false) {
         if (provider != ProviderId.JINHAK) provider = ProviderId.JINHAK
+        configureJinhakBrowserSurface(batchMode = false)
         clearJinhakLegacyAuthState()
         batchPausedForLogin = false
         if (::authHost.isInitialized) authHost.visibility = View.GONE
@@ -3723,6 +3758,7 @@ class MainActivity : Activity() {
 
     private fun startJinhakRealAuthProbe(autoContinue: Boolean, trigger: String) {
         provider = ProviderId.JINHAK
+        configureJinhakBrowserSurface(batchMode = false)
         clearJinhakLegacyAuthState()
         sessionState.text = "○ 직접 로그인 · 수시 저장소로 이동"
         status.text = "진학사 인증 probe는 비활성화되어 있습니다. 수시 저장소가 열린 사실만 자동 탐색 시작 신호로 사용합니다."
@@ -5174,6 +5210,7 @@ class MainActivity : Activity() {
         batchRetryEvents = JSONArray()
         batchDuplicateYearViews = JSONArray()
         batchRunning = true
+        if (provider == ProviderId.JINHAK) configureJinhakBrowserSurface(batchMode = true)
         showBatchCover()
         startCollectionKeepAlive()
         batchPausedForLogin = false
@@ -6343,7 +6380,11 @@ class MainActivity : Activity() {
         batchCloudFinalCheckInProgress = false
         disarmBatchNavigationWatchdog()
         if (::slowLanePool.isInitialized) slowLanePool.cancelAll("batch-stopped")
-        webView.stopLoading()
+        if (provider == ProviderId.JINHAK) {
+            configureJinhakBrowserSurface(batchMode = false)
+        } else {
+            webView.stopLoading()
+        }
         hideBatchCover()
         stopCollectionKeepAlive()
         batchQueue.clear()
