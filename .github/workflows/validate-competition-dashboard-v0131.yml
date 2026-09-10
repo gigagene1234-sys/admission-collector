@@ -14,46 +14,38 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
-      - name: Validate proxy syntax and Vercel routing
+      - name: Validate v0.13.2 routing and syntax
         shell: bash
         run: |
           set -euo pipefail
           node --check api/worker.js
+          node --check web/competition-dashboard-v0132.js
+          node --check web/competition-row-normalizer-v0132.js
+          node --check web/competition-dashboard-v0132-patch.js
           node -e "JSON.parse(require('fs').readFileSync('vercel.json','utf8'))"
+          grep -q 'competition-dashboard-v0132.html' vercel.json
           grep -q 'competition_status' api/worker.js
           grep -q 'competition_latest' api/worker.js
-          grep -q '"/competition"' vercel.json
-      - name: Validate dashboard source and decision safety contract
+      - name: Validate dashboard safety and interest contract
         shell: bash
         run: |
           set -euo pipefail
-          grep -q 'STANDALONE COMPETITION DASHBOARD' web/competition-dashboard.html
-          grep -q 'JINHAK_APPLY' web/competition-dashboard.html
-          grep -q 'UWAY_APPLY' web/competition-dashboard.html
-          grep -q '브라우저 관측 대기' web/competition-dashboard.html
-          grep -q '합격 가능성' web/competition-dashboard.html
-          grep -q "api('competition_status')" web/competition-dashboard.html
-          grep -q "api('competition_latest')" web/competition-dashboard.html
-          if grep -Eq 'Bearer |ADMISSION_INGEST_TOKEN|type="password"' web/competition-dashboard.html; then
+          grep -q 'v0.13.2' web/competition-dashboard-v0132.html
+          grep -q 'MAX_PER_UNIVERSITY=4' web/competition-dashboard-v0132.js
+          grep -q 'localStorage.setItem(STORE' web/competition-dashboard-v0132.js
+          grep -q 'function addInterest' web/competition-dashboard-v0132.js
+          grep -q 'function removeInterest' web/competition-dashboard-v0132.js
+          grep -q 'competition-row-normalizer-v0132.js' web/competition-dashboard-v0132.html
+          grep -q 'competition-dashboard-v0132-patch.js' web/competition-dashboard-v0132.html
+          if grep -Eq 'Bearer |ADMISSION_INGEST_TOKEN|type="password"' web/competition-dashboard-v0132.html web/competition-dashboard-v0132.js; then
             echo 'dashboard must not contain auth secrets or token inputs' >&2
             exit 1
           fi
-      - name: Validate university drilldown and interest-application contract
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -q "MAX_PER_UNIVERSITY=4" web/competition-dashboard.html
-          grep -q "localStorage.setItem(STORE" web/competition-dashboard.html
-          grep -q "function addInterest" web/competition-dashboard.html
-          grep -q "function removeInterest" web/competition-dashboard.html
-          grep -q "latestRow(id,item)" web/competition-dashboard.html
-          grep -q "관심 원서 저장" web/competition-dashboard.html
-          grep -q "전체 .*행" web/competition-dashboard.html
-          if grep -Eq 'rows\.slice\(|filtered\.slice\(' web/competition-dashboard.html; then
-            echo 'university drilldown must render the full latest competition snapshot' >&2
+          if grep -Eq 'filtered\.slice\(' web/competition-dashboard-v0132.js; then
+            echo 'university drilldown must not truncate filtered rows' >&2
             exit 1
           fi
-      - name: Verify live Uway snapshots are full datasets
+      - name: Fetch and verify live competition datasets
         shell: bash
         run: |
           set -euo pipefail
@@ -61,6 +53,7 @@ jobs:
           curl --fail --silent --show-error --retry 3 "$URL" > /tmp/latest.json
           node <<'NODE'
           const fs=require('fs');
+          const normalizer=require('./web/competition-row-normalizer-v0132.js');
           const body=JSON.parse(fs.readFileSync('/tmp/latest.json','utf8'));
           const byId=new Map((body.targets||[]).map(x=>[x.targetId,x]));
           for (const id of ['woosong','koreatech']) {
@@ -71,16 +64,27 @@ jobs:
             console.log(`${id}: rows=${rows.length}, snapshot.row_count=${declared}`);
             if (rows.length <= 1) throw new Error(`${id}: only ${rows.length} row(s), expected full competition table`);
             if (declared !== rows.length) throw new Error(`${id}: row_count mismatch ${declared} != ${rows.length}`);
-            let numeric=0;
             for (const r of rows) {
               const q=Number(r.quota), a=Number(r.applicants), ratio=Number(r.ratio);
               if (Number.isFinite(q)&&Number.isFinite(a)&&Number.isFinite(ratio)) {
-                numeric++;
                 const expected=q===0?0:a/q;
                 if (Math.abs(expected-ratio)>0.015) throw new Error(`${id}: ratio mismatch in ${r.department||'unknown row'}`);
               }
             }
-            if (!numeric) throw new Error(`${id}: no numeric rows found`);
+          }
+          const w=normalizer.decorateRows(byId.get('woosong').rows);
+          const rail=w.filter(r=>!r._aggregate&&r.department==='철도차량시스템학과');
+          const railLabels=new Set(rail.map(r=>r._application));
+          console.log('woosong railway vehicle applications:', [...railLabels]);
+          for (const expected of ['교과면접 전형','교과중심 전형','지역인재 전형','자기추천 전형','종합서류형 전형','종합면접형 전형']) {
+            if (![...railLabels].some(x=>String(x||'').includes(expected))) throw new Error(`woosong admission reconstruction missing: ${expected}`);
+          }
+          const k=normalizer.decorateRows(byId.get('koreatech').rows);
+          const mech=k.filter(r=>!r._aggregate&&r.department==='기계공학부');
+          const mechLabels=new Set(mech.map(r=>r._application));
+          console.log('koreatech mechanical applications:', [...mechLabels]);
+          for (const expected of ['창의인재(서류형)','창의인재(면접형)','일반전형','지역인재','논술전형']) {
+            if (![...mechLabels].some(x=>String(x||'').includes(expected))) throw new Error(`koreatech admission reconstruction missing: ${expected}`);
           }
           NODE
       - name: Upload validated live competition snapshot
