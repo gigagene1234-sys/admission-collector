@@ -40,7 +40,7 @@ jobs:
           echo
           cat /tmp/latest.json
 
-      - name: Assert hybrid collector contract
+      - name: Assert hybrid collector and numeric integrity
         run: |
           node <<'NODE'
           const fs=require('fs');
@@ -56,12 +56,35 @@ jobs:
           for (const id of ['knut','hanbat','hannam','kongju']) {
             const r=results.get(id);
             if (!r || r.status!=='WAITING_FOR_USER_BROWSER') throw new Error(id+' expected WAITING_FOR_USER_BROWSER, got '+JSON.stringify(r));
+            const s=status.targets.find(t=>t.targetId===id);
+            if (!s || s.lastError!==null || Number(s.consecutiveFailures)!==0) {
+              throw new Error(id+' retains stale server-fetch failure state: '+JSON.stringify(s));
+            }
           }
+
+          function assertRows(id, rows) {
+            let checked=0;
+            for (const row of rows) {
+              const q=Number(row.quota), a=Number(row.applicants), r=Number(row.ratio);
+              if (!Number.isFinite(q) || !Number.isFinite(a) || !Number.isFinite(r)) continue;
+              if (q===0) {
+                if (a!==0 || Math.abs(r)>0.005) throw new Error(id+' zero-quota row inconsistent: '+JSON.stringify(row));
+              } else {
+                const delta=Math.abs((a/q)-r);
+                if (delta>0.015) throw new Error(id+' ratio/count mismatch delta='+delta+': '+JSON.stringify(row));
+              }
+              checked++;
+            }
+            if (checked<1) throw new Error(id+' no rows with numeric integrity evidence');
+            return checked;
+          }
+
           for (const id of ['woosong','koreatech']) {
             const r=results.get(id);
             if (!r || r.status==='ERROR') throw new Error(id+' server collection error: '+JSON.stringify(r));
             const l=latest.targets.find(x=>x.targetId===id);
             if (!l || !l.snapshot || !Array.isArray(l.rows) || l.rows.length<1) throw new Error(id+' has no saved competition rows');
-            console.log(JSON.stringify({id,status:r.status,rows:l.rows.length,sourceUpdatedAt:l.snapshot.source_updated_at||null}));
+            const checked=assertRows(id,l.rows);
+            console.log(JSON.stringify({id,status:r.status,rows:l.rows.length,numericRowsChecked:checked,sourceUpdatedAt:l.snapshot.source_updated_at||null}));
           }
           NODE
