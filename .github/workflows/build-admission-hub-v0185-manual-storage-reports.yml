@@ -8,6 +8,7 @@ on:
       - ".github/scripts/patch_v0185_manual_storage_reports.py"
       - ".github/scripts/fix_v0185_report_activation.py"
       - ".github/scripts/fix_v0185_compile_auth_metadata.py"
+      - ".github/scripts/fix_v0185_final_session_cleanup.py"
       - ".github/scripts/verify_v0185_manual_storage_reports.py"
       - ".github/scripts/verify_apk_v0185.sh"
       - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakManualStorageReportPolicy.kt"
@@ -45,6 +46,7 @@ jobs:
           fi
           python3 .github/scripts/fix_v0185_report_activation.py
           python3 .github/scripts/fix_v0185_compile_auth_metadata.py
+          python3 .github/scripts/fix_v0185_final_session_cleanup.py
           git diff --check
 
       - name: Verify source contracts before commit
