@@ -7,6 +7,7 @@ on:
       - ".github/workflows/build-admission-hub-v0186-manual-browser-state-machine.yml"
       - ".github/scripts/patch_v0186_manual_browser_state_machine.py"
       - ".github/scripts/fix_v0185_neutralize_legacy_auth_entrypoints.py"
+      - ".github/scripts/fix_v0186_review_input_collision.py"
       - ".github/scripts/verify_v0186_manual_browser_state_machine.py"
       - ".github/scripts/verify_apk_v0186.sh"
       - "app/src/main/java/com/admissionhub/collector/MainActivity.kt"
@@ -44,6 +45,7 @@ jobs:
           set -euo pipefail
           python3 .github/scripts/fix_v0185_neutralize_legacy_auth_entrypoints.py
           python3 .github/scripts/patch_v0186_manual_browser_state_machine.py
+          python3 .github/scripts/fix_v0186_review_input_collision.py
           git diff --check
 
       - name: Verify source contracts before commit
