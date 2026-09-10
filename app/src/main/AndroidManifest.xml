@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.18.3 Storage Competition Watch"
+        android:label="Admission Hub v0.18.4 Single Surface Storage"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

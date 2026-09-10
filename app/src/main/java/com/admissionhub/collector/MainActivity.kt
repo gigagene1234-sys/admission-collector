@@ -63,6 +63,7 @@ import com.admissionhub.collector.jinhak.JinhakDedicatedAuthPolicy
 import com.admissionhub.collector.jinhak.JinhakFocusedSixPolicy
 import com.admissionhub.collector.jinhak.JinhakProtectedSessionPolicy
 import com.admissionhub.collector.jinhak.JinhakStorageCompetitionPolicy
+import com.admissionhub.collector.jinhak.JinhakSingleSurfaceStoragePolicy
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -470,6 +471,14 @@ class MainActivity : Activity() {
     private var jinhakV0183StorageRefreshes = 0
     private var jinhakV0183StorageWatchGeneration = 0
     private var jinhakV0183NextRefreshAtMs = 0L
+    private var jinhakV0184SingleSurfaceLoginPages = 0
+    private var jinhakV0184SingleSurfaceAutofillAttempts = 0
+    private var jinhakV0184SingleSurfaceSubmits = 0
+    private var jinhakV0184AutofillGeneration = 0
+    private var jinhakV0184AutofillRunning = false
+    private var adigaV0184BaselineCompletedPages = 0
+    private var adigaV0184BaselineCompletedDocuments = 0
+    private var adigaV0184BaselineRecords = 0
     private var jinhakV0174StrictEntryRequests = 0
     private var jinhakV0174ForbiddenPageStartsStopped = 0
     private var jinhakV0174ForbiddenPageFinishesObserved = 0
@@ -612,8 +621,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.18.3"
-        private const val BUILD_CODE = 118300
+        private const val VERSION = "0.18.4"
+        private const val BUILD_CODE = 118400
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -1726,9 +1735,10 @@ class MainActivity : Activity() {
                         if (JinhakDedicatedAuthPolicy.isLoginSurface(target)) {
                             handler.post {
                                 jinhakV0180CollectorLoginRouteLoads += 1
-                                startV0180DedicatedJinhakAuth("collector-network-login")
+                                jinhakV0184SingleSurfaceLoginPages += 1
+                                status.text = "진학사 로그인 페이지 · 수시저장소와 동일한 WebView 세션"
                             }
-                            return jinhakV0174BlockedResponse("dedicated-auth-route")
+                            return null
                         }
                         val decision = JinhakStrictHigh3Sandbox.decision(target)
                         when (decision) {
@@ -1758,8 +1768,8 @@ class MainActivity : Activity() {
                 if (!request.isForMainFrame) return false
                 if (JinhakDedicatedAuthPolicy.isLoginSurface(target)) {
                     jinhakV0180CollectorLoginRouteLoads += 1
-                    startV0180DedicatedJinhakAuth("collector-navigation-login")
-                    return true
+                    jinhakV0184SingleSurfaceLoginPages += 1
+                    return false
                 }
                 val decision = JinhakStrictHigh3Sandbox.decision(target)
                 return when (decision) {
@@ -1808,8 +1818,9 @@ class MainActivity : Activity() {
                 if (provider == ProviderId.JINHAK) {
                     if (JinhakDedicatedAuthPolicy.isLoginSurface(url) == true) {
                         jinhakV0180CollectorLoginRouteLoads += 1
-                        runCatching { view.stopLoading() }
-                        startV0180DedicatedJinhakAuth("collector-page-started-login")
+                        jinhakV0184SingleSurfaceLoginPages += 1
+                        jinhakV0180AuthState = "V0184_SINGLE_SURFACE_LOGIN_VISIBLE"
+                        sessionState.text = "○ 진학사 로그인 · 동일 WebView"
                         return
                     }
                     val decision = JinhakStrictHigh3Sandbox.decision(url)
@@ -1854,7 +1865,9 @@ class MainActivity : Activity() {
                     }
                     if (JinhakDedicatedAuthPolicy.isLoginSurface(url)) {
                         jinhakV0180CollectorLoginRouteLoads += 1
-                        startV0180DedicatedJinhakAuth("collector-page-finished-login")
+                        jinhakV0184SingleSurfaceLoginPages += 1
+                        jinhakV0180AuthState = "V0184_SINGLE_SURFACE_LOGIN_READY"
+                        beginV0184SingleSurfaceAutofill()
                         return
                     }
                     val visible = webView.url.orEmpty()
@@ -3638,183 +3651,95 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun beginV0184SingleSurfaceAutofill() {
+        if (provider != ProviderId.JINHAK || !JinhakSingleSurfaceStoragePolicy.ENABLED) return
+        if (!JinhakDedicatedAuthPolicy.isLoginSurface(webView.url.orEmpty())) return
+        if (jinhakV0184AutofillRunning) return
+        val credential = credentialVault.load(ProviderId.JINHAK.wireName)
+        if (credential == null) {
+            status.text = "진학사 로그인 화면입니다. 같은 탐색 화면에서 직접 로그인하세요. 로그인 후 수시저장소로 복귀하면 자동 검증합니다."
+            return
+        }
+        val generation = ++jinhakV0184AutofillGeneration
+        jinhakV0184AutofillRunning = true
+        attemptV0184SingleSurfaceAutofill(generation, 0, credential.username, credential.password)
+    }
+
+    private fun attemptV0184SingleSurfaceAutofill(generation: Int, attempt: Int, username: String, password: String) {
+        if (generation != jinhakV0184AutofillGeneration || provider != ProviderId.JINHAK) return
+        if (!JinhakDedicatedAuthPolicy.isLoginSurface(webView.url.orEmpty())) {
+            jinhakV0184AutofillRunning = false
+            return
+        }
+        if (attempt >= JinhakSingleSurfaceStoragePolicy.AUTOFILL_MAX_ATTEMPTS_PER_PAGE) {
+            jinhakV0184AutofillRunning = false
+            status.text = "자동 입력 폼을 확인하지 못했습니다. 현재 진학사 화면에서 직접 로그인하면 같은 WebView 세션으로 계속합니다."
+            persistJinhakAuthDiagnostics("v0184-single-surface-autofill-exhausted")
+            return
+        }
+        jinhakV0184SingleSurfaceAutofillAttempts += 1
+        val u = JSONObject.quote(username)
+        val p = JSONObject.quote(password)
+        val js = """
+            (function(){
+              try {
+                function visible(e){ if(!e) return false; var s=getComputedStyle(e),r=e.getBoundingClientRect(); return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0; }
+                function setv(e,v){ var proto=Object.getPrototypeOf(e), d=Object.getOwnPropertyDescriptor(proto,'value'); if(d&&d.set)d.set.call(e,v); else e.value=v; e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true})); }
+                var docs=[document]; try{document.querySelectorAll('iframe,frame').forEach(function(f){try{if(f.contentDocument)docs.push(f.contentDocument);}catch(e){}});}catch(e){}
+                for(var di=0;di<docs.length;di++){
+                  var d=docs[di];
+                  var pass=Array.from(d.querySelectorAll('input[type=password]')).find(visible); if(!pass) continue;
+                  var form=pass.form||pass.closest('form')||d;
+                  var users=Array.from(form.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);
+                  users.sort(function(a,b){function sc(x){var m=((x.name||'')+' '+(x.id||'')+' '+(x.placeholder||'')+' '+(x.autocomplete||'')).toLowerCase(); return (/아이디|user|login|member|email|account/.test(m)?100:0)+((x.autocomplete||'').toLowerCase()==='username'?100:0)-(/search|검색/.test(m)?200:0);} return sc(b)-sc(a);});
+                  var user=users[0]; if(!user) continue;
+                  setv(user,$u); setv(pass,$p);
+                  var controls=Array.from(form.querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')).filter(visible);
+                  var submit=controls.find(function(e){var t=((e.innerText||e.value||e.textContent||'')+'').replace(/\s+/g,' ').trim().toLowerCase(); return /로그인|login|sign in/.test(t);}) || controls.find(function(e){return (e.type||'').toLowerCase()==='submit';});
+                  if(submit){ submit.click(); return JSON.stringify({filled:true,submitted:true}); }
+                  if(form && form.submit){ if(form.requestSubmit) form.requestSubmit(); else form.submit(); return JSON.stringify({filled:true,submitted:true}); }
+                  return JSON.stringify({filled:true,submitted:false});
+                }
+                return JSON.stringify({filled:false,submitted:false});
+              } catch(e) { return JSON.stringify({filled:false,submitted:false,error:String(e)}); }
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) { raw ->
+            if (generation != jinhakV0184AutofillGeneration) return@evaluateJavascript
+            val result = runCatching {
+                val decoded = if (raw.startsWith("\"") && raw.endsWith("\"")) JSONTokener(raw).nextValue() as? String ?: "{}" else raw
+                JSONObject(decoded)
+            }.getOrElse { JSONObject() }
+            if (result.optBoolean("submitted", false)) {
+                jinhakV0184SingleSurfaceSubmits += 1
+                jinhakV0184AutofillRunning = false
+                credentialAutoLoginLastResult = "v0184-single-surface-submitted-awaiting-storage"
+                status.text = "진학사 로그인 제출 완료 · 같은 WebView에서 수시저장소 복귀를 기다립니다."
+                persistJinhakAuthDiagnostics("v0184-single-surface-submitted")
+            } else {
+                handler.postDelayed({ attemptV0184SingleSurfaceAutofill(generation, attempt + 1, username, password) }, JinhakSingleSurfaceStoragePolicy.AUTOFILL_RETRY_MS)
+            }
+        }
+    }
+
     private fun startV0180DedicatedJinhakAuth(reason: String, forceManual: Boolean = false) {
         provider = ProviderId.JINHAK
         jinhakV0180AuthLastReason = reason.take(100)
-        if (::authHost.isInitialized && authHost.visibility == View.VISIBLE &&
-            jinhakV0180AuthState !in setOf("IDLE", "SUCCESS", "AUTH_RENDERER_FAILED")) {
-            persistJinhakAuthDiagnostics("v0180-auth-duplicate-start-suppressed")
-            return
-        }
-
-        val credential = credentialVault.load(ProviderId.JINHAK.wireName)
-        if (credential == null && !forceManual) {
-            jinhakV0180AuthState = "CREDENTIALS_REQUIRED"
-            batchPausedForLogin = batchRunning
-            sessionState.text = "○ 진학사 자동 로그인 계정 1회 설정 필요"
-            status.text = "기기에 저장된 진학사 계정이 없습니다. 한 번 저장하면 이후 수집부터 자동 로그인합니다."
-            if (startupCredentialPromptedProvider != ProviderId.JINHAK) {
-                startupCredentialPromptedProvider = ProviderId.JINHAK
-                handler.post { showCredentialDialog(ProviderId.JINHAK, continueAfterSave = true) }
-            }
-            persistJinhakAuthDiagnostics("v0180-credentials-required")
-            return
-        }
-
-        jinhakV0180AuthGeneration += 1
-        jinhakV0180AuthSubmitGeneration = -1
-        jinhakV0180AuthFillAttempt = 0
-        jinhakV0180AuthHigh3ProbeGeneration = -1
-        jinhakV0180AuthRendererRestarts = 0
-        jinhakV0182AutofillChainGeneration = -1
-        jinhakV0182AutofillAttemptsThisGeneration = 0
-        jinhakV0182ProtectedSessionVerified = false
+        jinhakV0180AuthState = "V0184_SINGLE_SURFACE_STORAGE_AUTH"
         jinhakAuthVerifiedForBatch = false
-        jinhakV0180AuthState = if (credential == null) "MANUAL_LOGIN" else "AUTH_WEBVIEW_LOADING"
-        batchPausedForLogin = batchRunning
-        if (::batchCover.isInitialized) batchCover.visibility = View.GONE
-        if (::authHost.isInitialized) authHost.visibility = View.VISIBLE
-        if (::authWebView.isInitialized) {
-            authWebView.visibility = View.VISIBLE
-            runCatching { authWebView.stopLoading() }
-            runCatching { authWebView.clearHistory() }
-            authWebView.loadUrl(JinhakDedicatedAuthPolicy.LOGIN_URL)
+        jinhakUserSessionConfirmed = false
+        batchPausedForLogin = true
+        if (::authHost.isInitialized) authHost.visibility = View.GONE
+        webView.visibility = View.VISIBLE
+        val current = webView.url.orEmpty()
+        val storage = JinhakSiteTopology.protectedCoreProbeUrl()
+        sessionState.text = "○ 진학사 단일 WebView · 수시저장소 인증 대기"
+        when {
+            JinhakDedicatedAuthPolicy.isLoginSurface(current) -> beginV0184SingleSurfaceAutofill()
+            JinhakStorageCompetitionPolicy.isStorageUrl(current) -> webView.reload()
+            else -> loadJinhakV0174High3Only(storage, "v0184-single-surface-auth:$reason")
         }
-        sessionState.text = if (credential == null) "○ 진학사 로그인 화면" else "● 진학사 자동 로그인 실행 중"
-        status.text = if (credential == null) {
-            "진학사 로그인 화면을 열었습니다. 로그인 완료 후 고3 화면으로 이동하면 자동으로 수집을 재개합니다."
-        } else {
-            "진학사 전용 로그인 WebView에서 저장 계정을 자동 입력합니다. 수집 WebView는 로그인 페이지를 열지 않습니다."
-        }
-        persistJinhakAuthDiagnostics("v0180-auth-start")
-    }
-
-    private fun attemptV0180JinhakAuthAutofill(generation: Int, attempt: Int) {
-        if (provider != ProviderId.JINHAK || generation != jinhakV0180AuthGeneration) return
-        if (!::authHost.isInitialized || authHost.visibility != View.VISIBLE) return
-        if (jinhakV0180AuthSubmitGeneration == generation) return
-        if (attempt == 0) {
-            if (jinhakV0182AutofillChainGeneration == generation) return
-            jinhakV0182AutofillChainGeneration = generation
-            jinhakV0182AutofillAttemptsThisGeneration = 0
-        }
-        if (jinhakV0182AutofillAttemptsThisGeneration >= V0180_AUTH_MAX_FILL_ATTEMPTS) return
-        jinhakV0182AutofillAttemptsThisGeneration += 1
-        val credential = credentialVault.load(ProviderId.JINHAK.wireName) ?: run {
-            jinhakV0180AuthState = "WAITING_USER_LOGIN"
-            return
-        }
-        if (attempt >= V0180_AUTH_MAX_FILL_ATTEMPTS) {
-            jinhakV0180AuthFailures += 1
-            jinhakV0180AuthState = "FORM_NOT_AUTOMATABLE"
-            status.text = "자동 입력 폼을 찾지 못했습니다. 현재 로그인 화면에서 직접 로그인하면 고3 복귀 후 자동 재개합니다."
-            persistJinhakAuthDiagnostics("v0180-auth-form-not-found")
-            return
-        }
-
-        jinhakV0180AuthFillAttempt = attempt + 1
-        jinhakV0180AuthSubmitAttempts += 1
-        credentialAutoLoginAttempts += 1
-        credentialAutoLoginLastProvider = ProviderId.JINHAK.wireName
-        credentialAutoLoginLastAtMs = System.currentTimeMillis()
-        val userJson = JSONObject.quote(credential.username)
-        val passJson = JSONObject.quote(credential.password)
-        val js = """
-            (function(){
-              try{
-                function visible(el){if(!el)return false;var s=getComputedStyle(el);if(s.display==='none'||s.visibility==='hidden'||s.opacity==='0')return false;var r=el.getBoundingClientRect();return r.width>0&&r.height>0;}
-                function setValue(el,v){
-                  try{var proto=Object.getPrototypeOf(el);var d=Object.getOwnPropertyDescriptor(proto,'value')||Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');if(d&&d.set)d.set.call(el,v);else el.value=v;}catch(e){el.value=v;}
-                  try{el.focus();el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:v}));}catch(e){try{el.dispatchEvent(new Event('input',{bubbles:true}));}catch(x){}}
-                  try{el.dispatchEvent(new Event('change',{bubbles:true}));el.blur();}catch(e){}
-                }
-                var roots=[document];
-                try{Array.from(document.querySelectorAll('*')).forEach(function(el){if(el.shadowRoot)roots.push(el.shadowRoot);});}catch(e){}
-                for(var r=0;r<roots.length;r++){
-                  var root=roots[r];
-                  var passList=[];try{passList=Array.from(root.querySelectorAll('input[type=password]')).filter(visible);}catch(e){}
-                  for(var p=0;p<passList.length;p++){
-                    var pass=passList[p],form=pass.form||pass.closest('form'),base=form||root;
-                    var users=[];try{users=Array.from(base.querySelectorAll('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button])')).filter(visible);}catch(e){}
-                    if(!users.length)continue;
-                    function score(el){var m=((el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')+' '+(el.autocomplete||'')).toLowerCase();var n=0;if(/아이디|user|login|member|email|account/.test(m))n+=80;if((el.autocomplete||'').toLowerCase()==='username')n+=120;if(/search|검색/.test(m))n-=300;if(form&&el.form===form)n+=100;return n;}
-                    users.sort(function(a,b){return score(b)-score(a);});
-                    var user=users[0];if(!user)continue;
-                    setValue(user,$userJson);setValue(pass,$passJson);
-                    var controls=[];try{controls=Array.from(base.querySelectorAll('button,input[type=submit],input[type=button],[role=button]')).filter(visible);}catch(e){}
-                    function label(el){return ((el.innerText||el.value||el.textContent||el.getAttribute('aria-label')||'')+'').replace(/\s+/g,' ').trim();}
-                    var submit=controls.find(function(el){return /^(로그인|로그인하기|log\s*in|sign\s*in)$/i.test(label(el));})||controls.find(function(el){return (el.type||'').toLowerCase()==='submit';})||null;
-                    if(submit){submit.click();return JSON.stringify({submitted:true,method:'button'});}
-                    if(form){if(form.requestSubmit)form.requestSubmit();else form.submit();return JSON.stringify({submitted:true,method:'form'});}
-                    return JSON.stringify({submitted:false,reason:'submit-control-missing'});
-                  }
-                }
-                return JSON.stringify({submitted:false,reason:'visible-login-fields-missing'});
-              }catch(e){return JSON.stringify({submitted:false,reason:'script-error'});}
-            })();
-        """.trimIndent()
-
-        authWebView.evaluateJavascript(js) { raw ->
-            if (generation != jinhakV0180AuthGeneration) return@evaluateJavascript
-            val decoded = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
-            val result = runCatching { JSONObject(decoded) }.getOrDefault(JSONObject())
-            if (result.optBoolean("submitted", false)) {
-                jinhakV0180AuthSubmitGeneration = generation
-                jinhakV0180AuthSubmissions += 1
-                credentialAutoLoginSubmissions += 1
-                credentialAutoLoginLastResult = "v0180-submitted-${result.optString("method", "unknown")}"
-                jinhakV0180AuthState = "SUBMITTED"
-                status.text = "진학사 자동 로그인 제출 완료 · 서버의 고3 복귀를 기다립니다."
-                handler.postDelayed({ inspectV0180SubmittedLogin(generation) }, 5_000L)
-            } else {
-                credentialAutoLoginLastResult = "v0180-not-submitted-${result.optString("reason", "unknown")}"
-                val next = attempt + 1
-                if (next < V0180_AUTH_MAX_FILL_ATTEMPTS) {
-                    val delay = when { next <= 2 -> 350L; next <= 5 -> 700L; else -> 1_200L }
-                    handler.postDelayed({ attemptV0180JinhakAuthAutofill(generation, next) }, delay)
-                } else {
-                    jinhakV0180AuthFailures += 1
-                    credentialAutoLoginFailures += 1
-                    jinhakV0180AuthState = "FORM_NOT_AUTOMATABLE"
-                    status.text = "진학사 로그인 폼 자동 입력에 실패했습니다. 현재 화면에서 직접 로그인하면 수집은 자동 재개됩니다."
-                }
-            }
-            persistJinhakAuthDiagnostics("v0180-auth-autofill-result")
-        }
-    }
-
-    private fun inspectV0180SubmittedLogin(generation: Int) {
-        if (generation != jinhakV0180AuthGeneration || !::authHost.isInitialized || authHost.visibility != View.VISIBLE) return
-        val current = authWebView.url.orEmpty()
-        if (JinhakDedicatedAuthPolicy.isHigh3Success(current)) {
-            completeV0180DedicatedJinhakAuth(current)
-            return
-        }
-        if (!JinhakDedicatedAuthPolicy.isLoginSurface(current)) return
-        val js = """
-            (function(){
-              try{
-                var t=(document.body&&document.body.innerText?document.body.innerText:'').slice(0,30000);
-                var bad=/(아이디|비밀번호).*(확인|일치하지|잘못|오류|실패)|로그인.*실패/i.test(t);
-                return JSON.stringify({credentialError:bad});
-              }catch(e){return JSON.stringify({credentialError:false});}
-            })();
-        """.trimIndent()
-        authWebView.evaluateJavascript(js) { raw ->
-            if (generation != jinhakV0180AuthGeneration) return@evaluateJavascript
-            val decoded = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
-            val result = runCatching { JSONObject(decoded) }.getOrDefault(JSONObject())
-            if (result.optBoolean("credentialError", false)) {
-                jinhakV0180AuthFailures += 1
-                credentialAutoLoginFailures += 1
-                credentialAutoLoginLastResult = "v0180-credential-rejected"
-                jinhakV0180AuthState = "CREDENTIAL_REJECTED"
-                status.text = "진학사에서 로그인 정보 확인 오류를 반환했습니다. 저장 계정을 다시 입력하면 즉시 재시도합니다."
-                startupCredentialPromptedProvider = null
-                showCredentialDialog(ProviderId.JINHAK, continueAfterSave = true)
-            }
-            persistJinhakAuthDiagnostics("v0180-auth-submit-inspection")
-        }
+        persistJinhakAuthDiagnostics("v0184-single-surface-auth-start")
     }
 
     private fun completeV0180DedicatedJinhakAuth(successUrl: String) {
@@ -4676,6 +4601,12 @@ class MainActivity : Activity() {
                     .put("v0183CurrentCompetitionVerifiedRecords", jinhakV0183CurrentCompetitionVerifiedRecords)
                     .put("v0183StorageRefreshes", jinhakV0183StorageRefreshes)
                     .put("v0183NextRefreshAtMs", jinhakV0183NextRefreshAtMs)
+                    .put("v0184SingleSurfaceAuth", JinhakSingleSurfaceStoragePolicy.ENABLED)
+                    .put("v0184AuthAndCollectionSurface", JinhakSingleSurfaceStoragePolicy.AUTH_AND_COLLECTION_SURFACE)
+                    .put("v0184ExternalAppSessionBridge", JinhakSingleSurfaceStoragePolicy.EXTERNAL_APP_SESSION_BRIDGE)
+                    .put("v0184SingleSurfaceLoginPages", jinhakV0184SingleSurfaceLoginPages)
+                    .put("v0184SingleSurfaceAutofillAttempts", jinhakV0184SingleSurfaceAutofillAttempts)
+                    .put("v0184SingleSurfaceSubmits", jinhakV0184SingleSurfaceSubmits)
                     .put("v0180RecursiveAuthPolling", false)
                     .put("v0180CollectorOwnsLogin", false)
                     .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
@@ -4796,6 +4727,14 @@ class MainActivity : Activity() {
         jinhakV0183StorageRefreshes = 0
         jinhakV0183StorageWatchGeneration += 1
         jinhakV0183NextRefreshAtMs = 0L
+        jinhakV0184SingleSurfaceLoginPages = 0
+        jinhakV0184SingleSurfaceAutofillAttempts = 0
+        jinhakV0184SingleSurfaceSubmits = 0
+        jinhakV0184AutofillGeneration += 1
+        jinhakV0184AutofillRunning = false
+        adigaV0184BaselineCompletedPages = 0
+        adigaV0184BaselineCompletedDocuments = 0
+        adigaV0184BaselineRecords = 0
         jinhakNormalizedMissionSeedContexts.clear()
         jinhakNormalizedIdentitySeedKeys.clear()
         jinhakNormalizedCandidateBindingKeys.clear()
@@ -5005,6 +4944,12 @@ class MainActivity : Activity() {
                     .put("v0183CurrentCompetitionVerifiedRecords", jinhakV0183CurrentCompetitionVerifiedRecords)
                     .put("v0183StorageRefreshes", jinhakV0183StorageRefreshes)
                     .put("v0183NextRefreshAtMs", jinhakV0183NextRefreshAtMs)
+                    .put("v0184SingleSurfaceAuth", JinhakSingleSurfaceStoragePolicy.ENABLED)
+                    .put("v0184AuthAndCollectionSurface", JinhakSingleSurfaceStoragePolicy.AUTH_AND_COLLECTION_SURFACE)
+                    .put("v0184ExternalAppSessionBridge", JinhakSingleSurfaceStoragePolicy.EXTERNAL_APP_SESSION_BRIDGE)
+                    .put("v0184SingleSurfaceLoginPages", jinhakV0184SingleSurfaceLoginPages)
+                    .put("v0184SingleSurfaceAutofillAttempts", jinhakV0184SingleSurfaceAutofillAttempts)
+                    .put("v0184SingleSurfaceSubmits", jinhakV0184SingleSurfaceSubmits)
                     .put("v0180RecursiveAuthPolling", false)
                     .put("v0180CollectorOwnsLogin", false)
                     .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
@@ -5705,6 +5650,12 @@ class MainActivity : Activity() {
         batchPausedForLogin = false
         batchCollecting = false
         batchPageCount = 0
+        if (provider == ProviderId.ADIGA) {
+            val baseline = localRunId?.let { localStore.diagnosticSnapshot(it) } ?: JSONObject()
+            adigaV0184BaselineCompletedPages = baseline.optInt("completedPages", 0)
+            adigaV0184BaselineCompletedDocuments = baseline.optInt("completedDocuments", 0)
+            adigaV0184BaselineRecords = baseline.optInt("records", 0)
+        }
         batchPaginationRetries = 0
         batchCloudPlansPending = 0
         batchCloudResumePlans = 0
@@ -8056,10 +8007,15 @@ class MainActivity : Activity() {
                 return@collectSnapshot
             }
 
-            status.text = if (activeAction != null) {
-                "목록 ${activeAction.page}/${activeAction.totalPages}쪽 완료 / 시도 $batchPageCount / 오류 ${batchErrors.length()} / 레코드 ${batchRecords.length()}"
+            status.text = if (provider == ProviderId.ADIGA) {
+                val persisted = localRunId?.let { localStore.diagnosticSnapshot(it) } ?: JSONObject()
+                val completedNow = persisted.optInt("completedPages", adigaV0184BaselineCompletedPages)
+                val newCompleted = JinhakSingleSurfaceStoragePolicy.completedDelta(adigaV0184BaselineCompletedPages, completedNow)
+                "어디가: 이번 실행 화면시도 $batchPageCount / 이번 신규완료 $newCompleted / 시작 전 누적 ${adigaV0184BaselineCompletedPages} / 현재 누적 $completedNow / 오류 ${batchErrors.length()}"
+            } else if (activeAction != null) {
+                "목록 ${activeAction.page}/${activeAction.totalPages}쪽 완료 / 화면시도 $batchPageCount / 오류 ${batchErrors.length()} / 레코드 ${batchRecords.length()}"
             } else {
-                "일괄 수집: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / URL대기 ${batchQueue.size} / 페이지대기 ${batchPageActions.size} / 레코드 ${batchRecords.length()}"
+                "일괄 수집: 화면시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 오류 ${batchErrors.length()} / URL대기 ${batchQueue.size} / 페이지대기 ${batchPageActions.size} / 레코드 ${batchRecords.length()}"
             }
 
             if (batchPageCount >= MAX_BATCH_PAGES) {
@@ -8502,7 +8458,8 @@ class MainActivity : Activity() {
             val storage = JinhakSiteTopology.protectedCoreProbeUrl()
             currentBatchTarget = storage
             status.text = "진학사 수시저장소 경쟁률 새로 확인 중…"
-            loadJinhakV0174High3Only(storage, "v0183-periodic-storage-refresh")
+            if (JinhakStorageCompetitionPolicy.isStorageUrl(webView.url.orEmpty())) webView.reload()
+            else loadJinhakV0174High3Only(storage, "v0184-periodic-storage-refresh")
         }, JinhakStorageCompetitionPolicy.REFRESH_INTERVAL_MS)
     }
 
@@ -8943,6 +8900,11 @@ class MainActivity : Activity() {
                 .put("paginationActionsCompleted", batchPageActionVisited.size)
                 .put("paginationActionsFailed", batchPageActionFailed.size)
                 .put("paginationRetries", batchPaginationRetries)
+                .put("adigaCurrentBatchSnapshotAttempts", if (provider == ProviderId.ADIGA) batchPageCount else 0)
+                .put("adigaPersistedCompletedPagesAtStart", if (provider == ProviderId.ADIGA) adigaV0184BaselineCompletedPages else 0)
+                .put("adigaPersistedCompletedDocumentsAtStart", if (provider == ProviderId.ADIGA) adigaV0184BaselineCompletedDocuments else 0)
+                .put("adigaPersistedRecordsAtStart", if (provider == ProviderId.ADIGA) adigaV0184BaselineRecords else 0)
+                .put("adigaCounterSemantics", if (provider == ProviderId.ADIGA) "attempts=current-batch-snapshots; completedPages=persisted-run-page-rows; resumed runs may start with hundreds already completed" else JSONObject.NULL)
                 .put("localPagesScheduled", batchLocalPagesScheduled)
                 .put("localPagesSkipped", batchLocalPagesSkipped)
                 .put("localRecordsPersisted", batchLocalRecordsPersisted))
