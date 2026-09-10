@@ -14,6 +14,8 @@ object CompetitionBrowserPolicy {
     const val RENDER_SETTLE_MS = 1_500L
     const val CHALLENGE_RECHECK_MS = 2_500L
     const val MAX_CHALLENGE_RECHECKS = 6
+    const val CHALLENGE_VISIBLE_RECHECK_MS = 1_500L
+    const val USER_CHALLENGE_TIMEOUT_MS = 180_000L
 
     val targets = listOf(
         CompetitionBrowserTarget("knut", "국립한국교통대학교", "https://addon.jinhakapply.com/RatioV1/RatioH/Ratio30150631.html"),

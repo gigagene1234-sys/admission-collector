@@ -1,10 +1,12 @@
 package com.admissionhub.collector.competition
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.os.Handler
 import android.os.Looper
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -36,6 +38,8 @@ class CompetitionBrowserCollector(
     private var firstCyclePending = true
     private var activeTargetIndex = -1
     private var challengeChecks = 0
+    private var challengeDialog: AlertDialog? = null
+    private var challengeVisibleSinceMs = 0L
     private var pageGeneration = 0
     private var lastScheduledBucket = Long.MIN_VALUE
 
@@ -61,6 +65,10 @@ class CompetitionBrowserCollector(
         running = false
         pageGeneration += 1
         handler.removeCallbacksAndMessages(null)
+        challengeDialog?.setOnCancelListener(null)
+        challengeDialog?.dismiss()
+        challengeDialog = null
+        challengeVisibleSinceMs = 0L
         webView?.let { view ->
             runCatching { view.stopLoading() }
             runCatching { host.removeView(view) }
@@ -98,6 +106,7 @@ class CompetitionBrowserCollector(
 
         val target = CompetitionBrowserPolicy.targets[activeTargetIndex]
         challengeChecks = 0
+        challengeVisibleSinceMs = 0L
         val generation = ++pageGeneration
         onStatus("경쟁률 수집 · ${target.university} 공개 페이지 확인 중")
         ensureWebView().loadUrl(target.sourceUrl)
@@ -135,17 +144,26 @@ class CompetitionBrowserCollector(
 
             if (payload.optBoolean("challenge", false)) {
                 challengeChecks += 1
-                if (challengeChecks <= CompetitionBrowserPolicy.MAX_CHALLENGE_RECHECKS) {
-                    onStatus("경쟁률 수집 · ${target.university} 브라우저 안전 접속 확인 대기")
+                if (challengeVisibleSinceMs == 0L) challengeVisibleSinceMs = System.currentTimeMillis()
+                if (challengeDialog == null) showChallengeDialog(target, generation)
+                val elapsed = System.currentTimeMillis() - challengeVisibleSinceMs
+                if (elapsed < CompetitionBrowserPolicy.USER_CHALLENGE_TIMEOUT_MS) {
+                    onStatus("경쟁률 수집 · ${target.university} 사용자 안전 접속 확인 필요")
                     handler.postDelayed(
                         { probeRenderedPage(target, generation) },
-                        CompetitionBrowserPolicy.CHALLENGE_RECHECK_MS,
+                        CompetitionBrowserPolicy.CHALLENGE_VISIBLE_RECHECK_MS,
                     )
                 } else {
-                    onStatus("경쟁률 수집 · ${target.university} 안전 접속 확인 미해제 · 이번 주기 건너뜀")
+                    onStatus("경쟁률 수집 · ${target.university} 안전 접속 확인 시간 초과 · 이번 주기 건너뜀")
+                    restoreHiddenWebView()
                     moveNextTarget()
                 }
                 return@evaluateJavascript
+            }
+
+            if (challengeDialog != null) {
+                restoreHiddenWebView()
+                onStatus("경쟁률 수집 · ${target.university} 안전 접속 확인 완료 · 공개 표 분석 중")
             }
 
             val rows = payload.optJSONArray("rows")
@@ -183,8 +201,81 @@ class CompetitionBrowserCollector(
         }
     }
 
+    private fun showChallengeDialog(target: CompetitionBrowserTarget, generation: Int) {
+        if (destroyed || !running || generation != pageGeneration || challengeDialog != null) return
+        val view = webView ?: return
+        (view.parent as? ViewGroup)?.removeView(view)
+        val container = FrameLayout(activity).apply {
+            minimumHeight = (resources.displayMetrics.heightPixels * 0.68f).toInt()
+            setPadding(12, 12, 12, 12)
+        }
+        container.addView(
+            view,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        val dialog = AlertDialog.Builder(activity)
+            .setTitle("${target.university} · 안전 접속 확인")
+            .setMessage(
+                "진학어플라이가 사용자 브라우저 확인을 요구합니다. 아래 페이지에서 정상 보안 확인을 완료하면 경쟁률 표를 자동으로 읽고 이 창을 닫습니다. 로그인 정보·쿠키·세션 값은 서버로 전송하지 않습니다."
+            )
+            .setView(container)
+            .setNegativeButton("이번 대학 건너뛰기", null)
+            .create()
+        challengeDialog = dialog
+        dialog.setOnCancelListener {
+            if (challengeDialog === dialog && !destroyed && running && generation == pageGeneration) {
+                challengeDialog = null
+                reattachToHiddenHost()
+                onStatus("경쟁률 수집 · ${target.university} 사용자 확인 취소 · 이번 주기 건너뜀")
+                moveNextTarget()
+            }
+        }
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+                if (!destroyed && running && generation == pageGeneration) {
+                    restoreHiddenWebView()
+                    onStatus("경쟁률 수집 · ${target.university} 사용자 선택으로 이번 주기 건너뜀")
+                    moveNextTarget()
+                }
+            }
+        }
+        dialog.show()
+        dialog.window?.setLayout(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            (activity.resources.displayMetrics.heightPixels * 0.90f).toInt(),
+        )
+        onStatus("경쟁률 수집 · ${target.university} 안전 접속 확인 창 표시")
+    }
+
+    private fun restoreHiddenWebView() {
+        val dialog = challengeDialog
+        challengeDialog = null
+        challengeVisibleSinceMs = 0L
+        dialog?.setOnCancelListener(null)
+        reattachToHiddenHost()
+        dialog?.dismiss()
+    }
+
+    private fun reattachToHiddenHost() {
+        val view = webView ?: return
+        (view.parent as? ViewGroup)?.removeView(view)
+        if (!destroyed) {
+            host.addView(
+                view,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                ),
+            )
+        }
+    }
+
     private fun moveNextTarget() {
         if (destroyed || !running) return
+        restoreHiddenWebView()
         pageGeneration += 1
         webView?.stopLoading()
         activeTargetIndex += 1
@@ -216,6 +307,7 @@ class CompetitionBrowserCollector(
             setSupportMultipleWindows(false)
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
+        view.webChromeClient = WebChromeClient()
         view.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val target = CompetitionBrowserPolicy.targets.getOrNull(activeTargetIndex) ?: return true
