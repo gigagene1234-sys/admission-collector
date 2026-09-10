@@ -18,7 +18,7 @@ required = {
     "auto-start-on-storage": '수시 저장소 확인 · 리포트 탐색 시작' in main,
     "no-jinhak-credential-dialog": 'Admission Hub는 진학사 ID/PW·로그인 세션·인증 상태를 저장하거나 판정하지 않습니다.' in main,
     "manual-unified-handoff": 'navigationModel", "application-card-report-only"' in main,
-    "no-auth-proof-diagnostics": 'JINHAK_MANUAL_STORAGE_REPORT_DIAGNOSTICS' in main,
+    "manual-diagnostics": 'JINHAK_MANUAL_STORAGE_REPORT_DIAGNOSTICS' in main,
     "adapter-scope": 'JinhakManualStorageReportPolicy.isAllowedMissionUrl(url)' in adapter,
     "storage-policy": 'const val STORAGE_PATH = "/jh/high3/early/four-year-university/library"' in policy,
     "report-policy": 'const val REPORT_PREFIX = "/jh/high3/early/four-year-university/report/"' in policy,
@@ -31,6 +31,14 @@ required = {
     "generic-link-expansion-off": 'var jinhakExpandOutgoingLinks = !jinhakManualReportScope' in main and 'if (JinhakManualStorageReportPolicy.ENABLED) false else jinhakExpandedNavigationStates.add' in main,
     "report-agent-actions-on": 'var jinhakAllowAgentAction = true' in main,
     "legacy-storage-watch-not-authoritative": 'Manual-storage report mode is mission-driven' in main,
+    "no-auth-inference": 'callback?.invoke(false, false)' in main and 'callback?.invoke(false, true)' not in main,
+    "auth-proof-cleared": 'private fun clearJinhakLegacyAuthState()' in main and '.remove("jinhakAuthProofCollectorVersion")' in main,
+    "no-auth-proof-on-create": 'restoreJinhakAuthProofCheckpoint("activity-create")' not in main,
+    "no-jinhak-session-keepalive": 'no Jinhak session keep-alive, measurement, or auth diagnostic exists' in main,
+    "route-only-batch-guard": 'if (JinhakManualStorageReportPolicy.isAllowedMissionUrl(current))' in main and '현재 고3 화면에서 탐색 시작/재개' not in main,
+    "auth-probe-ui-removed": 'text = "진학사 직접 탐색 안내"' in main,
+    "runtime-auth-proof-not-persisted": '.remove("jinhakRealAuthProbeVerifiedAtMs")' in main and '.remove("jinhakAuthProofSafePath")' in main,
+    "no-authenticated-evidence-label": 'authStateClass = "authenticated"' not in main,
 }
 
 failed = [name for name, ok in required.items() if not ok]
