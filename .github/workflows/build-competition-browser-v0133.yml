@@ -106,7 +106,9 @@ jobs:
         run: |
           set -euo pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
-          apksigner verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$APKSIGNER"
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
           SIGNER=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' /tmp/apksigner.txt | tr -d '[:space:]')
           test -n "$SIGNER"
           test "$SIGNER" = "$EXPECTED_SIGNER_SHA256"
