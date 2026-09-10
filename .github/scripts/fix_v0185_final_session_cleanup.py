@@ -82,4 +82,38 @@ new_diag = '''                .put("authOwnership", JinhakManualStorageReportPol
                 .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)'''
 patch(old_diag, new_diag, "remove-live-auth-diagnostics")
 
+# The same legacy auth fields also existed in non-live/final diagnostics. They are not useful in the
+# manual-storage model, so remove every remaining occurrence rather than weakening the verifier.
+legacy_diag_lines = [
+    '                .put("loginSurfaceDetections", credentialLoginSurfaceDetections)\n',
+    '                .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)\n',
+    '                .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)\n',
+    '                .put("credentialAutoLoginSuccesses", credentialAutoLoginSuccesses)\n',
+    '                .put("credentialAutoLoginFailures", credentialAutoLoginFailures)\n',
+    '                    .put("credentialAutoLoginSuppressedInFlight", credentialAutoLoginSuppressedInFlight)\n',
+    '                    .put("credentialAutoLoginSuppressedThrottle", credentialAutoLoginSuppressedThrottle)\n',
+    '                    .put("credentialAutoLoginSuppressedNoCredential", credentialAutoLoginSuppressedNoCredential)\n',
+    '                    .put("credentialAutoLoginSuppressedProbeLost", credentialAutoLoginSuppressedProbeLost)\n',
+    '                    .put("credentialAutoLoginSuppressedRetryLimit", credentialAutoLoginSuppressedRetryLimit)\n',
+    '                .put("loginRouteFallbackPauses", loginRouteFallbackPauses)\n',
+    '                .put("loginRouteFallbackCredentialPrompts", loginRouteFallbackCredentialPrompts)\n',
+    '                .put("staleSessionLeaseBypassesPrevented", staleSessionLeaseBypassesPrevented)\n',
+    '                .put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)\n',
+]
+for line in legacy_diag_lines:
+    text = text.replace(line, '')
+
+# Make the release contract explicit in any diagnostics object that already contains the manual
+# traversal bootstrap state but did not receive the live replacement above.
+marker = '                .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)'
+manual_fields = '''                .put("authOwnership", JinhakManualStorageReportPolicy.AUTH_OWNERSHIP)
+                .put("authStateInferred", false)
+                .put("autoLogin", false)
+                .put("credentialStorage", false)
+                .put("sessionRestore", false)
+                .put("authProofCache", false)
+'''
+if '.put("authOwnership", JinhakManualStorageReportPolicy.AUTH_OWNERSHIP)' not in text:
+    text = text.replace(marker, manual_fields + marker, 1)
+
 MAIN.write_text(text)
