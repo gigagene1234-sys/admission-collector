@@ -5506,8 +5506,8 @@ class MainActivity : Activity() {
             jinhakActiveOwnerPreservations = 0
             jinhakLastTargetAuthRedirectSafePath = ""
         }
-        if (provider == ProviderId.JINHAK && jinhakAuthVerifiedForBatch) {
-            jinhakCoreBootstrapState = "batch-core-start"
+        if (provider == ProviderId.JINHAK) {
+            jinhakCoreBootstrapState = "manual-storage-report-batch"
         }
         jinhakLastMeaningfulProgressAtMs = if (provider == ProviderId.JINHAK) System.currentTimeMillis() else 0L
         jinhakLastLiveDiagnosticsAtMs = 0L
@@ -5668,20 +5668,18 @@ class MainActivity : Activity() {
             status.text = "로컬 안전모드: 기본 정보영역 ${batchQueue.size}개 탐색"
         }
         if (provider == ProviderId.JINHAK) {
-            val visible = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(webView.url)
-            val target = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(currentBatchTarget)
-            if (!jinhakUserSessionConfirmed || visible == null) {
-                batchPausedForLogin = true
+            val visible = canonicalizeBatchUrl(webView.url.orEmpty())
+            if (!JinhakManualStorageReportPolicy.isAllowedMissionUrl(visible)) {
+                batchRunning = false
+                batchPausedForLogin = false
                 hideBatchCover()
-                enterJinhakUserSessionGate("v0174-begin-navigation-visible-high3-required")
+                stopCollectionKeepAlive()
+                sessionState.text = "○ 수시 저장소 직접 진입 필요"
+                status.text = "수시 저장소/지원 리포트 범위가 아닙니다. 직접 수시 저장소로 이동하면 다시 시작합니다."
                 return
             }
-            currentBatchTarget = canonicalizeBatchUrl(visible)
-            if (target == null || canonicalizeBatchUrl(target) == canonicalizeBatchUrl(visible)) {
-                scheduleBatchSnapshot()
-            } else {
-                loadJinhakV0174High3Only(target, "begin-batch-navigation")
-            }
+            currentBatchTarget = visible
+            scheduleBatchSnapshot()
             return
         }
         checkSessionState { needsLogin, _ ->
@@ -6089,8 +6087,7 @@ class MainActivity : Activity() {
                 val now = System.currentTimeMillis()
                 val elapsed = now - jinhakLastMeaningfulProgressAtMs
                 val missionTargetCount = jinhakMissionTargetLedger.summary().optInt("targets", 0)
-                if (elapsed >= JINHAK_NO_PROGRESS_FENCE_MS &&
-                    JinhakProtectedSessionPolicy.shouldRunMissionStallFence(jinhakV0182ProtectedSessionVerified, missionTargetCount)) {
+                if (elapsed >= JINHAK_NO_PROGRESS_FENCE_MS && missionTargetCount > 0) {
                     val slowWork = ::slowLanePool.isInitialized && slowLanePool.hasWork()
                     val ledgerOutstanding = jinhakMissionTargetLedger.outstandingCount()
                     val cellExpiry = jinhakMissionCells.expireStaleOwnership(now)
@@ -6696,6 +6693,20 @@ class MainActivity : Activity() {
 
     private fun recoverCollectorSessionOrPause() {
         if (!batchRunning) return
+        if (provider == ProviderId.JINHAK) {
+            val current = webView.url.orEmpty()
+            if (JinhakManualStorageReportPolicy.isAllowedMissionUrl(current)) {
+                batchPausedForLogin = false
+                showBatchCover()
+                scheduleBatchSnapshot()
+            } else {
+                batchPausedForLogin = false
+                stopBatch("jinhak-recovery-outside-storage-report-scope")
+                sessionState.text = "○ 수시 저장소 직접 재진입 필요"
+                status.text = "진학사 세션 복구는 수행하지 않습니다. 수시 저장소로 직접 돌아오면 다시 탐색합니다."
+            }
+            return
+        }
         CookieManager.getInstance().flush()
         checkSessionState { needsLogin, authenticated ->
             if (!batchRunning) return@checkSessionState
@@ -6724,7 +6735,15 @@ class MainActivity : Activity() {
 
     private fun resumeAfterLogin() {
         if (provider == ProviderId.JINHAK) {
-            confirmJinhakUserSessionAndResume("legacy-resume-button")
+            clearJinhakLegacyAuthState()
+            val current = webView.url.orEmpty()
+            if (JinhakManualStorageReportPolicy.isStorageEntry(current)) {
+                if (!batchRunning) startBatch() else scheduleBatchSnapshot()
+            } else {
+                batchPausedForLogin = false
+                sessionState.text = "○ 수시 저장소 직접 진입 필요"
+                status.text = "진학사 로그인/세션은 직접 관리합니다. 수시 저장소까지 이동한 뒤 다시 진행하세요."
+            }
             return
         }
         if (provider != ProviderId.JINHAK) {
