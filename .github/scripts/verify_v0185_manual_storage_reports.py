@@ -48,6 +48,8 @@ required = {
     "recovery-route-only": 'stopBatch("jinhak-recovery-outside-storage-report-scope")' in main and '진학사 세션 복구는 수행하지 않습니다.' in main,
     "progress-fence-no-auth-proof": 'if (elapsed >= JINHAK_NO_PROGRESS_FENCE_MS && missionTargetCount > 0)' in main and 'shouldRunMissionStallFence(jinhakV0182ProtectedSessionVerified, missionTargetCount)' not in main,
     "batch-state-no-auth-proof": 'jinhakCoreBootstrapState = "manual-storage-report-batch"' in main and 'if (provider == ProviderId.JINHAK && jinhakAuthVerifiedForBatch)' not in main,
+    "final-start-gate-route-only": 'val target = selected.takeIf { JinhakManualStorageReportPolicy.isAllowedMissionUrl(it) }' in main and 'enterJinhakUserSessionGate("v0174-invalid-persisted-or-visible-target")' not in main,
+    "live-diagnostics-no-auth-counters": '.put("authOwnership", JinhakManualStorageReportPolicy.AUTH_OWNERSHIP)' in main and '.put("authStateInferred", false)' in main and '.put("loginSurfaceDetections", credentialLoginSurfaceDetections)' not in main and '.put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)' not in main,
 }
 
 failed = [name for name, ok in required.items() if not ok]
