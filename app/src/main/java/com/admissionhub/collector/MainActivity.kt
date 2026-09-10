@@ -3603,7 +3603,8 @@ class MainActivity : Activity() {
                     JinhakDedicatedAuthPolicy.Route.LOGIN_FORM,
                     JinhakDedicatedAuthPolicy.Route.MEMBER_LOGIN -> {
                         jinhakV0180AuthState = "FORM_READY"
-                        attemptV0180JinhakAuthAutofill(jinhakV0180AuthGeneration, 0)
+                        // v0.18.4: legacy authWebView is inactive; same-surface autofill runs only in webView.
+                        jinhakV0168LegacyNavigationSuppressions += 1
                     }
                     JinhakDedicatedAuthPolicy.Route.JINHAK_SUPPORT -> {
                         // Some login implementations hand off through a same-site support/root page.
