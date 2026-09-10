@@ -26,6 +26,11 @@ required = {
     "generic-crawl-disabled": 'const val GENERIC_SITE_CRAWL = false' in policy,
     "navigator-policy": 'JinhakManualStorageReportPolicy.shouldPromoteAction' in nav,
     "navigator-no-generic-labels": '추천\\s*대학' not in nav and '입시\\s*전략' not in nav and '입시\\s*지식' not in nav,
+    "report-candidates-active": 'val rawMissionCandidates = JinhakAgentNavigator.candidates(snapshot)' in main,
+    "legacy-empty-candidate-gate-removed": 'if (JinhakStorageCompetitionPolicy.ENABLED) emptyList() else JinhakAgentNavigator.candidates(snapshot)' not in main,
+    "generic-link-expansion-off": 'var jinhakExpandOutgoingLinks = !jinhakManualReportScope' in main and 'if (JinhakManualStorageReportPolicy.ENABLED) false else jinhakExpandedNavigationStates.add' in main,
+    "report-agent-actions-on": 'var jinhakAllowAgentAction = true' in main,
+    "legacy-storage-watch-not-authoritative": 'Manual-storage report mode is mission-driven' in main,
 }
 
 failed = [name for name, ok in required.items() if not ok]
