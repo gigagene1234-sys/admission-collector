@@ -1,7 +1,9 @@
 {
   "rewrites": [
     { "source": "/", "destination": "/web/index.html" },
-    { "source": "/live", "destination": "/web/index.html" }
+    { "source": "/live", "destination": "/web/index.html" },
+    { "source": "/competition", "destination": "/web/competition-dashboard.html" },
+    { "source": "/competition/", "destination": "/web/competition-dashboard.html" }
   ],
   "headers": [
     {
