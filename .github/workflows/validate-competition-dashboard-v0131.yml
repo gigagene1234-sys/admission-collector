@@ -23,18 +23,33 @@ jobs:
           grep -q 'competition_status' api/worker.js
           grep -q 'competition_latest' api/worker.js
           grep -q '"/competition"' vercel.json
-      - name: Validate dashboard safety contract
+      - name: Validate dashboard source and decision safety contract
         shell: bash
         run: |
           set -euo pipefail
-          grep -q 'STANDALONE DASHBOARD' web/competition-dashboard.html
+          grep -q 'STANDALONE COMPETITION DASHBOARD' web/competition-dashboard.html
           grep -q 'JINHAK_APPLY' web/competition-dashboard.html
           grep -q 'UWAY_APPLY' web/competition-dashboard.html
           grep -q '브라우저 관측 대기' web/competition-dashboard.html
           grep -q '합격 가능성' web/competition-dashboard.html
           grep -q "api('competition_status')" web/competition-dashboard.html
           grep -q "api('competition_latest')" web/competition-dashboard.html
-          if grep -Eq 'Bearer |ADMISSION_INGEST_TOKEN|password' web/competition-dashboard.html; then
+          if grep -Eq 'Bearer |ADMISSION_INGEST_TOKEN|type="password"' web/competition-dashboard.html; then
             echo 'dashboard must not contain auth secrets or token inputs' >&2
+            exit 1
+          fi
+      - name: Validate university drilldown and interest-application contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "MAX_PER_UNIVERSITY=4" web/competition-dashboard.html
+          grep -q "localStorage.setItem(STORE" web/competition-dashboard.html
+          grep -q "function addInterest" web/competition-dashboard.html
+          grep -q "function removeInterest" web/competition-dashboard.html
+          grep -q "latestRow(id,item)" web/competition-dashboard.html
+          grep -q "관심 원서 저장" web/competition-dashboard.html
+          grep -q "전체 .*행" web/competition-dashboard.html
+          if grep -Eq 'rows\.slice\(|filtered\.slice\(' web/competition-dashboard.html; then
+            echo 'university drilldown must render the full latest competition snapshot' >&2
             exit 1
           fi
