@@ -1,0 +1,67 @@
+name: Verify Live Competition v0.13.1
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/verify-live-competition-v0131.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ADMISSION_INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      BASE: https://admission-collector-offload.gigagene1234.workers.dev
+    steps:
+      - name: Force one server-side public collection
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ADMISSION_INGEST_TOKEN"
+          curl --retry 3 --retry-delay 2 --retry-all-errors --fail --silent --show-error \
+            -X POST "$BASE/v1/competition/collect?force=1" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN" \
+            -o /tmp/collect.json
+          cat /tmp/collect.json
+
+      - name: Read competition status and latest snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --retry 3 --retry-delay 2 --retry-all-errors --fail --silent --show-error \
+            "$BASE/v1/competition/status" -o /tmp/status.json
+          curl --retry 3 --retry-delay 2 --retry-all-errors --fail --silent --show-error \
+            "$BASE/v1/competition/latest" -o /tmp/latest.json
+          cat /tmp/status.json
+          echo
+          cat /tmp/latest.json
+
+      - name: Assert hybrid collector contract
+        run: |
+          node <<'NODE'
+          const fs=require('fs');
+          const collect=JSON.parse(fs.readFileSync('/tmp/collect.json','utf8'));
+          const status=JSON.parse(fs.readFileSync('/tmp/status.json','utf8'));
+          const latest=JSON.parse(fs.readFileSync('/tmp/latest.json','utf8'));
+          const expected=['knut','woosong','hanbat','hannam','koreatech','kongju'];
+          if (!Array.isArray(status.targets) || status.targets.length!==6) throw new Error('status target count != 6');
+          if (!Array.isArray(latest.targets) || latest.targets.length!==6) throw new Error('latest target count != 6');
+          for (const id of expected) if (!status.targets.some(t=>t.targetId===id)) throw new Error('missing target '+id);
+
+          const results=new Map((collect.results||[]).map(x=>[x.targetId,x]));
+          for (const id of ['knut','hanbat','hannam','kongju']) {
+            const r=results.get(id);
+            if (!r || r.status!=='WAITING_FOR_USER_BROWSER') throw new Error(id+' expected WAITING_FOR_USER_BROWSER, got '+JSON.stringify(r));
+          }
+          for (const id of ['woosong','koreatech']) {
+            const r=results.get(id);
+            if (!r || r.status==='ERROR') throw new Error(id+' server collection error: '+JSON.stringify(r));
+            const l=latest.targets.find(x=>x.targetId===id);
+            if (!l || !l.snapshot || !Array.isArray(l.rows) || l.rows.length<1) throw new Error(id+' has no saved competition rows');
+            console.log(JSON.stringify({id,status:r.status,rows:l.rows.length,sourceUpdatedAt:l.snapshot.source_updated_at||null}));
+          }
+          NODE
