@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b1220">
+<title>Admission Competition Dashboard v0.13.2</title>
+<link rel="stylesheet" href="/web/competition-dashboard-v0132.css">
+</head>
+<body>
+<div class="wrap">
+<header class="hero">
+  <div class="hero-top">
+    <div><div class="eyebrow">08 PROJECT · STANDALONE DASHBOARD · v0.13.2</div><h1>실시간 경쟁률 + 관심 원서</h1><p>대학 카드를 누르면 해당 대학의 최신 경쟁률 스냅샷 전체를 표시합니다. 전형·모집단위 조합은 대학별 최대 4개까지 관심 원서로 저장할 수 있습니다.</p></div>
+    <span id="healthBadge" class="badge"><span id="healthDot" class="dot"></span><span id="healthText">API 확인 중</span></span>
+  </div>
+  <div class="hero-actions"><button id="refreshBtn" class="hero-btn">지금 새로고침</button><button id="autoBtn" class="hero-btn">자동갱신 60초 · ON</button></div>
+</header>
+<div class="notice"><b>자료 구분:</b> 이 화면은 UWAY/JINHAK 원서접수 경쟁률 관측 자료입니다. 어디가 공식 입결 및 진학사 합격예측과는 별도이며, 경쟁률만으로 합격 가능성·안정/적정/소신을 추론하지 않습니다.</div>
+<section class="card">
+  <div class="section-head"><div><h2>6개 대학</h2><div class="sub">카드 선택 → 전체 경쟁률 → 관심 원서 저장</div></div><span id="summaryBadge" class="badge info">불러오는 중</span></div>
+  <div id="targets" class="targets"><div class="empty wide">데이터를 불러오는 중입니다.</div></div>
+</section>
+<section class="card section">
+  <div class="section-head"><div><h2 id="interestTitle">관심 원서</h2><div class="sub">전형 + 학과/모집단위 조합 · 대학별 최대 4개</div></div><span id="interestCount" class="badge">0 / 4</span></div>
+  <div id="interestList" class="interest-list"><div class="empty wide">저장된 관심 원서가 없습니다.</div></div>
+</section>
+<section class="card section">
+  <div class="section-head"><div><h2 id="tableTitle">최신 경쟁률 전체</h2><div id="tableMeta" class="sub">대학을 선택하세요.</div></div><span id="rowBadge" class="badge">0행</span></div>
+  <div class="toolbar">
+    <input id="searchBox" class="search" type="search" placeholder="전형명 또는 학과/전공 검색">
+    <select id="admissionFilter" class="select"><option value="">전체 전형</option></select>
+    <select id="kindFilter" class="select"><option value="">전체 행</option><option value="detail">모집단위 상세만</option><option value="aggregate">합계/요약만</option></select>
+  </div>
+  <div id="tableArea" class="table-wrap"><div class="empty">표시할 경쟁률 스냅샷이 없습니다.</div></div>
+</section>
+<div class="footer">관심 원서는 현재 브라우저 localStorage에만 저장됩니다. 원서 제출·결제·변경 기능은 연결하지 않습니다.</div>
+</div>
+<script src="/web/competition-dashboard-v0132.js" defer></script>
+</body>
+</html>
