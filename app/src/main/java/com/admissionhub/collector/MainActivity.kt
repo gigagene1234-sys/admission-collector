@@ -7603,7 +7603,7 @@ class MainActivity : Activity() {
                         jinhakMissionAnchorStructuredKeys.add(key)
                     }
                 }
-                val rawMissionCandidates = if (JinhakStorageCompetitionPolicy.ENABLED) emptyList() else JinhakAgentNavigator.candidates(snapshot)
+                val rawMissionCandidates = JinhakAgentNavigator.candidates(snapshot)
                 val normalizedMissionSeeds = jinhakMissionContextsFromNormalizedRecords(pageRecords)
                 normalizedMissionSeeds.forEach { context ->
                     val identity = context.identityKey ?: return@forEach
@@ -7662,10 +7662,11 @@ class MainActivity : Activity() {
                 }
             }
             var jinhakExpansionStateKey: String? = null
-            val jinhakStorageOnlySnapshot = provider == ProviderId.JINHAK && JinhakStorageCompetitionPolicy.ENABLED &&
-                snapshot.optString("providerPageType") == "jinhak-early-storage"
-            var jinhakExpandOutgoingLinks = !jinhakStorageOnlySnapshot
-            var jinhakAllowAgentAction = !jinhakStorageOnlySnapshot
+            val jinhakManualReportScope = provider == ProviderId.JINHAK && JinhakManualStorageReportPolicy.ENABLED
+            // v0.18.5 never expands the site's generic link graph. All autonomous movement is
+            // through JinhakAgentNavigator's same-card report actions / report-lane controls.
+            var jinhakExpandOutgoingLinks = !jinhakManualReportScope
+            var jinhakAllowAgentAction = true
             if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
                 val sessionId = unifiedSessionId
                 val runId = localRunId ?: localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION).also { localRunId = it }
@@ -7682,7 +7683,7 @@ class MainActivity : Activity() {
                         ProviderId.JINHAK.wireName, safeRoute, explicitContext, digest
                     )
                     jinhakExpansionStateKey = expansionIdentity.observationId
-                    jinhakExpandOutgoingLinks = jinhakExpandedNavigationStates.add(expansionIdentity.observationId)
+                    jinhakExpandOutgoingLinks = if (JinhakManualStorageReportPolicy.ENABLED) false else jinhakExpandedNavigationStates.add(expansionIdentity.observationId)
                     val routeCaptureCount = (jinhakReferenceRouteCaptureCounts[safeRoute] ?: 0) + 1
                     jinhakReferenceRouteCaptureCounts[safeRoute] = routeCaptureCount
                     val lowValueReference = isJinhakLowValueReferencePageType(snapshot.optString("providerPageType"))
@@ -8260,7 +8261,10 @@ class MainActivity : Activity() {
 
     private fun loadNextBatchPage() {
         if (!batchRunning || batchPausedForLogin) return
-        if (provider == ProviderId.JINHAK && JinhakStorageCompetitionPolicy.ENABLED &&
+        if (provider == ProviderId.JINHAK && JinhakManualStorageReportPolicy.ENABLED) {
+            // Manual-storage report mode is mission-driven. Do not enter the legacy storage-only
+            // periodic watcher while per-application report targets remain to be processed.
+        } else if (provider == ProviderId.JINHAK && JinhakStorageCompetitionPolicy.ENABLED &&
             jinhakV0182ProtectedSessionVerified && batchSnapshots.length() > 0) {
             scheduleV0183StorageCompetitionRefresh()
             return
