@@ -64,6 +64,7 @@ import com.admissionhub.collector.jinhak.JinhakFocusedSixPolicy
 import com.admissionhub.collector.jinhak.JinhakProtectedSessionPolicy
 import com.admissionhub.collector.jinhak.JinhakStorageCompetitionPolicy
 import com.admissionhub.collector.jinhak.JinhakSingleSurfaceStoragePolicy
+import com.admissionhub.collector.jinhak.JinhakManualStorageReportPolicy
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -657,7 +658,6 @@ class MainActivity : Activity() {
             }
         })
         configureWebView()
-        configureDedicatedJinhakAuthWebView()
         initializeProcessResumeJournal()
         restoreJinhakAuthProofCheckpoint("activity-create")
         val localDecision = localStore.localRebindDecision()
@@ -928,14 +928,10 @@ class MainActivity : Activity() {
         webView = WebView(this)
         webView.settings.useWideViewPort = true
         webView.settings.loadWithOverviewMode = false
-        authWebView = WebView(this)
+        // v0.18.5: no application-owned Jinhak authentication surface exists.
+        // The user browses/logs in directly in the main WebView.
         authHost = FrameLayout(this).apply {
             visibility = View.GONE
-            setBackgroundColor(android.graphics.Color.WHITE)
-            addView(authWebView, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            ))
         }
         batchCover = TextView(this).apply {
             text = "수집 대기 중"
@@ -999,8 +995,8 @@ class MainActivity : Activity() {
         }
         primaryActions.addView(fullDashboardButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         jinhakSessionConfirmButton = Button(this).apply {
-            text = "진학사 고3 전용 진입 / 현재 고3 탐색 시작"
-            setOnClickListener { confirmJinhakUserSessionAndResume("dashboard-browser-button") }
+            text = "수시 저장소에서 리포트 탐색 시작"
+            setOnClickListener { startBatch() }
         }
         hubAdvancedToggle = Button(this).apply { text = "고급 도구" }
         primaryActions.addView(hubAdvancedToggle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -1327,18 +1323,17 @@ class MainActivity : Activity() {
     }
 
     private fun startLaunchAwareCollection() {
-        // On app launch, six-slot Hub state is authoritative. Never silently spend another
-        // full 27-target run when the user has already fixed their six applications.
-        when {
-            selectedSixRecoveryNeeded() -> startSelectedSixRecovery()
-            selectedSixAlreadyComplete() -> {
-                rebuildCanonicalHubFromLatestSessionIfReady("launch-six-complete")
-                openProvider(ProviderId.JINHAK)
-                status.text = "선택한 6장의 핵심 coverage가 완료되어 앱 시작 시 전체 재수집을 생략했습니다. 필요할 때 통합 수집 버튼으로 갱신하세요."
-            }
-            isFreshJinhakRealAuthProbe() -> startAutomaticLoginAndCollectionSequence("app-launch-restored-real-auth")
-            else -> startJinhakRealAuthProbe(autoContinue = true, trigger = "app-launch")
-        }
+        provider = ProviderId.JINHAK
+        credentialVault.clear(ProviderId.JINHAK.wireName)
+        startupLoginPreflightActive = false
+        startupLoginPreflightVerified = false
+        jinhakTransitionAuthGateActive = false
+        jinhakUserSessionConfirmed = false
+        jinhakAuthVerifiedForBatch = false
+        jinhakV0182ProtectedSessionVerified = false
+        currentBatchTarget = null
+        sessionState.text = "○ 진학사 직접 탐색 대기"
+        status.text = "진학사 사이트에서 직접 로그인하고 수시 저장소까지 이동하세요. 저장소가 실제 화면에 열리면 각 대학·학과 카드의 리포트부터 자동 탐색을 시작합니다."
     }
 
     private fun startPreferredHubCollection() {
@@ -1411,9 +1406,10 @@ class MainActivity : Activity() {
         activateProcessResumeJournal("selected-six-recovery")
         unifiedButton.text = "선택 6장 보강 종료"
         hubRecoveryButton.isEnabled = false
-        status.text = "선택한 6장 보강도 사용자 진학사 로그인 세션만 사용합니다. 아래 사이트에서 로그인 완료 후 버튼을 누르세요."
-        enterJinhakUserSessionGate("selected-six-recovery-user-session")
-        if (!isProviderUrl(webView.url.orEmpty())) loadJinhakV0174High3Only(ProviderId.JINHAK.homeUrl, "legacy-jinhak-home-failsafe")
+        credentialVault.clear(ProviderId.JINHAK.wireName)
+        status.text = "선택 6장 보강 준비 완료. 진학사에 직접 로그인하고 수시 저장소까지 이동하면 선택 지원안의 리포트만 보강합니다."
+        sessionState.text = "○ 수시 저장소 직접 진입 대기"
+        currentBatchTarget = null
         return
         val coreProbe = JinhakSiteTopology.protectedCoreProbeUrl()
         if (coreProbe.isBlank()) {
@@ -1858,49 +1854,39 @@ class MainActivity : Activity() {
             }
 
             override fun onPageFinished(view: WebView, url: String) {
-                CookieManager.getInstance().flush()
+                if (provider != ProviderId.JINHAK) CookieManager.getInstance().flush()
                 if (provider == ProviderId.JINHAK) {
-                    if (JinhakProtectedSessionPolicy.isProtectedProofUrl(url)) {
-                        markV0182ProtectedSessionVerified(url, "collector-page-finished-protected")
-                    }
-                    if (JinhakDedicatedAuthPolicy.isLoginSurface(url)) {
-                        jinhakV0180CollectorLoginRouteLoads += 1
-                        jinhakV0184SingleSurfaceLoginPages += 1
-                        jinhakV0180AuthState = "V0184_SINGLE_SURFACE_LOGIN_READY"
-                        beginV0184SingleSurfaceAutofill()
+                    val current = webView.url.orEmpty()
+                    credentialVault.clear(ProviderId.JINHAK.wireName)
+                    jinhakTransitionAuthGateActive = false
+                    jinhakUserSessionConfirmed = false
+                    jinhakAuthVerifiedForBatch = false
+                    jinhakV0182ProtectedSessionVerified = false
+                    jinhakLastCoreVerifiedAtMs = 0L
+                    jinhakLastAuthEvidence = "manual-browser-no-auth-inference"
+
+                    if (!batchRunning) {
+                        if (JinhakManualStorageReportPolicy.isStorageEntry(current)) {
+                            batchPausedForLogin = false
+                            jinhakCoreBootstrapState = "manual-storage-visible"
+                            sessionState.text = "● 수시 저장소 확인 · 리포트 탐색 시작"
+                            status.text = "수시 저장소가 확인되었습니다. 같은 대학·학과 카드에 결합된 리포트만 순차 탐색합니다."
+                            handler.postDelayed({
+                                if (provider == ProviderId.JINHAK && !batchRunning && JinhakManualStorageReportPolicy.isStorageEntry(webView.url)) startBatch()
+                            }, 250L)
+                        } else {
+                            sessionState.text = "○ 진학사 직접 탐색"
+                            status.text = "직접 로그인한 뒤 수시 저장소까지 이동하세요. Admission Hub는 로그인·세션을 건드리지 않습니다."
+                        }
                         return
                     }
-                    val visible = webView.url.orEmpty()
-                    if (JinhakUserSessionPolicy.shouldIgnoreStaleLoginCallback(url, visible)) {
-                        jinhakV0173StaleLoginCallbacksIgnored += 1
-                        recordRuntimeEvent("jinhak-v0174-stale-member-login-callback-ignored", JSONObject()
-                            .put("callbackSafePath", runtimeSafePath(url))
-                            .put("currentSafePath", runtimeSafePath(visible)))
-                    } else {
-                        val decision = JinhakStrictHigh3Sandbox.decision(url)
-                        when (decision) {
-                            JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN -> {
-                                enterJinhakUserSessionGate("v0174-member-login-page-finished")
-                                return
-                            }
-                            JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3 -> {
-                                noteJinhakV0174Decision("page-finished-high3", url, decision)
-                                if (!jinhakUserSessionConfirmed) {
-                                    batchPausedForLogin = batchRunning
-                                    if (::batchCover.isInitialized) batchCover.visibility = View.GONE
-                                    jinhakSessionConfirmButton.text = "현재 고3 화면에서 탐색 시작/재개"
-                                    sessionState.text = "● 고3 화면 확인 · 사용자 탐색 시작 승인 대기"
-                                    status.text = "고3 화면에 도착했습니다. 자동 재개하지 않습니다. 현재 고3 화면을 직접 확인한 뒤 버튼을 눌러야 탐색을 시작합니다."
-                                    return
-                                }
-                            }
-                            JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_BLANK -> return
-                            else -> {
-                                jinhakV0174ForbiddenPageFinishesObserved += 1
-                                blockJinhakV0174MainFrame("page-finished-strict-block", url, decision)
-                                return
-                            }
-                        }
+
+                    if (!JinhakManualStorageReportPolicy.isAllowedMissionUrl(current)) {
+                        batchPausedForLogin = false
+                        sessionState.text = "○ 리포트 탐색 정지 · 수시 저장소 재진입 필요"
+                        status.text = "수시 저장소/지원 리포트 범위를 벗어났습니다. 로그인 처리는 하지 않습니다. 수시 저장소로 직접 돌아오면 다시 시작합니다."
+                        stopBatch("jinhak-left-manual-storage-report-scope")
+                        return
                     }
                 } else {
                     scheduleLoginSurfaceDetection(provider, "page-finished")
@@ -2920,13 +2906,9 @@ class MainActivity : Activity() {
                 .put("missionNeedsReturn", jinhakMissionNeedsReturn)
                 .put("reportBridgeContext", jinhakReportBridgeContext?.let { JSONObject(it.toString()) } ?: JSONObject.NULL)
                 .put("targetAuthRedirectCounts", JSONObject(jinhakTargetAuthRedirectCounts as Map<*, *>))
-                .put("targetAuthRedirectEpisodeOpenKey", if (jinhakTargetAuthRedirectEpisodeOpenKey.isBlank()) JSONObject.NULL else jinhakTargetAuthRedirectEpisodeOpenKey)
-                .put("authProofCollectorVersion", VERSION)
-                .put("realAuthProbeResult", jinhakRealAuthProbeResult.take(80))
-                .put("realAuthProbeVerifiedAtMs", jinhakRealAuthProbeVerifiedAtMs)
-                .put("lastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
-                .put("lastAuthEvidence", jinhakLastAuthEvidence.take(80))
-                .put("authProofSafePath", runtimeSafePath(webView.url).take(300))
+                .put("targetAuthRedirectEpisodeOpenKey", JSONObject.NULL)
+                .put("authOwnership", JinhakManualStorageReportPolicy.AUTH_OWNERSHIP)
+                .put("authStatePersisted", false)
                 .put("credentialStored", false)
                 .put("sessionSecretStored", false)
                 .put("trigger", trigger.take(60))
@@ -2963,23 +2945,11 @@ class MainActivity : Activity() {
             }
             jinhakTargetAuthRedirectEpisodeOpenKey = runtime.optString("targetAuthRedirectEpisodeOpenKey")
                 .takeIf { it.isNotBlank() && it != "null" }.orEmpty()
-            if (runtime.optString("authProofCollectorVersion") == VERSION) {
-                val runtimeProbeAt = runtime.optLong("realAuthProbeVerifiedAtMs", 0L)
-                val runtimeCoreAt = runtime.optLong("lastCoreVerifiedAtMs", 0L)
-                if (runtimeProbeAt > jinhakRealAuthProbeVerifiedAtMs) {
-                    jinhakRealAuthProbeVerifiedAtMs = runtimeProbeAt
-                    jinhakRealAuthProbeResult = runtime.optString("realAuthProbeResult", "never-run").take(80)
-                }
-                if (runtimeCoreAt > jinhakLastCoreVerifiedAtMs) {
-                    jinhakLastCoreVerifiedAtMs = runtimeCoreAt
-                    jinhakLastAuthEvidence = runtime.optString("lastAuthEvidence", "none").take(80)
-                }
-                if (hasFreshJinhakProtectedCoreProof()) {
-                    jinhakAuthVerifiedForBatch = true
-                    jinhakCoreBootstrapState = "protected-core-session-checkpoint-restored"
-                    jinhakAuthProofRestores += 1
-                }
-            }
+            // v0.18.5: mission progress may be restored, authentication/session proof may not.
+            jinhakAuthVerifiedForBatch = false
+            jinhakV0182ProtectedSessionVerified = false
+            jinhakLastCoreVerifiedAtMs = 0L
+            jinhakLastAuthEvidence = "manual-browser-no-auth-inference"
         }
         if (restored > 0) {
             recordRuntimeEvent(
@@ -3189,6 +3159,12 @@ class MainActivity : Activity() {
     }
 
     private fun showCredentialDialog(which: ProviderId, continueAfterSave: Boolean) {
+        if (which == ProviderId.JINHAK) {
+            credentialVault.clear(ProviderId.JINHAK.wireName)
+            sessionState.text = "○ 진학사 로그인은 사이트에서 직접 진행"
+            status.text = "Admission Hub는 진학사 ID/PW·로그인 세션·인증 상태를 저장하거나 판정하지 않습니다. 아래 사이트에서 직접 로그인한 뒤 수시 저장소까지 이동하세요."
+            return
+        }
         if (credentialAutoLoginInFlight) return
         val existing = credentialVault.load(which.wireName)
         val container = LinearLayout(this).apply {
@@ -4706,87 +4682,43 @@ class MainActivity : Activity() {
         val sessionId = unifiedSessionId ?: return
         unifiedPhase = "jinhak"
         unifiedPendingAdigaStart = false
-        unifiedPendingJinhakStart = true
+        unifiedPendingJinhakStart = false
         unifiedJinhakAutoCapture = false
         unifiedAutoCaptureScheduled = false
-        unifiedJinhakCapturedPages.clear()
-        jinhakBatchStartCount = 0
-        jinhakV0182ProtectedSessionVerified = false
-        jinhakV0182ProtectedSessionVerifications = 0
-        jinhakV0182ProtectedBootstrapAttempts = 0
-        jinhakV0182ProtectedBootstrapFailures = 0
-        jinhakV0182ProtectedBootstrapGeneration = 0
-        jinhakV0182High3ReturnsAwaitingProof = 0
-        jinhakV0182AutofillChainGeneration = -1
-        jinhakV0182AutofillAttemptsThisGeneration = 0
-        jinhakV0182CredentialSubmitVerifiedSuccesses = 0
-        jinhakV0182ManualHigh3Returns = 0
-        jinhakV0182RecoveryScopePreparations = 0
-        jinhakV0183StorageSnapshots = 0
-        jinhakV0183CompetitionRecords = 0
-        jinhakV0183CurrentCompetitionVerifiedRecords = 0
-        jinhakV0183StorageRefreshes = 0
-        jinhakV0183StorageWatchGeneration += 1
-        jinhakV0183NextRefreshAtMs = 0L
-        jinhakV0184SingleSurfaceLoginPages = 0
-        jinhakV0184SingleSurfaceAutofillAttempts = 0
-        jinhakV0184SingleSurfaceSubmits = 0
-        jinhakV0184AutofillGeneration += 1
-        jinhakV0184AutofillRunning = false
-        adigaV0184BaselineCompletedPages = 0
-        adigaV0184BaselineCompletedDocuments = 0
-        adigaV0184BaselineRecords = 0
-        jinhakNormalizedMissionSeedContexts.clear()
-        jinhakNormalizedIdentitySeedKeys.clear()
-        jinhakNormalizedCandidateBindingKeys.clear()
-        jinhakNormalizedAmbiguousBindings = 0
+        provider = ProviderId.JINHAK
+        credentialVault.clear(ProviderId.JINHAK.wireName)
         jinhakTransitionAuthGateActive = false
         jinhakUserSessionConfirmed = false
         jinhakAuthVerifiedForBatch = false
-        jinhakProtectedCoreStablePasses = 0
-        jinhakCoreBootstrapState = "v0171-user-session-gate"
-        jinhakLastAuthEvidence = "user-owned-session-awaiting-explicit-confirmation"
+        jinhakV0182ProtectedSessionVerified = false
+        jinhakCoreBootstrapState = "manual-storage-wait"
+        jinhakLastAuthEvidence = "manual-browser-no-auth-inference"
         jinhakLastCoreVerifiedAtMs = 0L
-        jinhakLoginRecoveryGeneration += 1
-        jinhakReauthCycles = 0
-
-        provider = ProviderId.JINHAK
+        currentBatchTarget = null
         localRunId = localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
         localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, ProviderId.JINHAK.wireName, runId) }
         localStore.updateUnifiedSession(sessionId, "jinhak", "running", "adiga:$adigaReason")
-        localStore.recordSyncState(sessionId, UnifiedSyncState.JINHAK_CAPABILITY_DISCOVERY.name, ProviderId.JINHAK.wireName,
-            JSONObject().put("authorizedConnectorActive", false).put("sessionAuthority", "user"), false)
-        localStore.recordSyncState(sessionId, UnifiedSyncState.JINHAK_USER_SESSION_MISSION.name, ProviderId.JINHAK.wireName,
+        localStore.recordSyncState(
+            sessionId,
+            UnifiedSyncState.JINHAK_USER_SESSION_MISSION.name,
+            ProviderId.JINHAK.wireName,
             JSONObject()
-                .put("observationFirst", true)
-                .put("userStartedSessionMission", true)
-                .put("boundedSameProviderTraversal", true)
-                .put("maxPages", MAX_JINHAK_AUTONAV_PAGES)
-                .put("loginAssumption", "user-confirms-before-exploration")
-                .put("collectorVerifiesLogin", false)
-                .put("collectorExtendsSession", false), false)
+                .put("authOwnership", JinhakManualStorageReportPolicy.AUTH_OWNERSHIP)
+                .put("autoLogin", false)
+                .put("sessionRestore", false)
+                .put("authProofCache", false)
+                .put("startGate", "visible-susi-storage")
+                .put("navigationModel", "application-card-report-only")
+                .put("genericSiteCrawl", false),
+            true,
+            false
+        )
         persistRuntimeCheckpoint(forceResume = true)
-        CookieManager.getInstance().flush()
-        batchButton.text = "진학사 탐색 · 사용자 로그인 확인 대기"
-        diagnosticButton.text = "진학사 전체 분석 전송"
+        batchButton.text = "수시 저장소에서 리포트 탐색"
+        diagnosticButton.text = "진학사 분석 전송"
         unifiedButton.text = "통합 수집 종료"
-        currentBatchTarget = null
-        jinhakV0172DeferredProtectedTargets.clear()
-        jinhakV0172BootstrapStarts = 0
-        jinhakV0172ProtectedRetryDeferrals = 0
-        jinhakV0172LoginRedirectLoopBreaks = 0
-        jinhakV0173ResumeArmed = false
-        jinhakV0173LoginSurfaceArmRequests = 0
-        jinhakV0173NaturalHigh3Resumes = 0
-        jinhakV0173StaleLoginCallbacksIgnored = 0
-        jinhakV0173High3StabilityRejects = 0
-        jinhakV0173High3StabilityGeneration = 0
-        jinhakV0173ActualLoginReturns = 0
-        enterJinhakUserSessionGate("unified-transition")
-        val current = webView.url.orEmpty()
-        if (!isProviderUrl(current)) {
-            loadJinhakV0174High3Only(ProviderId.JINHAK.homeUrl, "legacy-jinhak-home-failsafe")
-        }
+        sessionState.text = "○ 진학사 수시 저장소 직접 진입 대기"
+        status.text = "어디가 수집은 끝났습니다. 이제 진학사에 직접 로그인하고 수시 저장소까지 이동하세요. 저장소가 열리면 각 대학·학과의 리포트 탐색을 자동 시작합니다."
     }
 
     private fun jinhakTargetAuthRedirectKey(rawTarget: String?): String? {
@@ -4848,168 +4780,31 @@ class MainActivity : Activity() {
     private fun persistJinhakAuthDiagnostics(trigger: String) {
         val sessionId = unifiedSessionId ?: return
         if (provider != ProviderId.JINHAK && unifiedPhase != "jinhak") return
-        val secondsSinceCoreVerified = if (jinhakLastCoreVerifiedAtMs > 0L) {
-            (System.currentTimeMillis() - jinhakLastCoreVerifiedAtMs).coerceAtLeast(0L) / 1000.0
-        } else JSONObject.NULL
         runCatching {
             localStore.recordSyncState(
                 sessionId,
-                "JINHAK_AUTH_DIAGNOSTICS",
+                "JINHAK_MANUAL_STORAGE_REPORT_DIAGNOSTICS",
                 ProviderId.JINHAK.wireName,
                 JSONObject()
                     .put("trigger", trigger.take(80))
                     .put("safePath", runtimeSafePath(webView.url))
                     .put("currentTargetSafePath", runtimeSafePath(currentBatchTarget))
-                    .put("authVerifiedForBatch", jinhakAuthVerifiedForBatch)
-                    .put("coreBootstrapState", jinhakCoreBootstrapState)
-                    .put("lastAuthEvidence", jinhakLastAuthEvidence)
-                    .put("lastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
-                    .put("secondsSinceCoreVerified", secondsSinceCoreVerified)
-                    .put("transitionAuthGateActive", jinhakTransitionAuthGateActive)
+                    .put("storageVisible", JinhakManualStorageReportPolicy.isStorageEntry(webView.url))
+                    .put("reportVisible", JinhakManualStorageReportPolicy.isReportUrl(webView.url))
                     .put("batchRunning", batchRunning)
-                    .put("batchPausedForLogin", batchPausedForLogin)
-                    .put("loginRecoveryPolls", jinhakLoginRecoveryPolls)
-                    .put("loginRecoveryEpisodePolls", jinhakLoginRecoveryEpisodePolls)
-                    .put("loginRecoveryEpisodeAgeMs", if (jinhakLoginRecoveryEpisodeStartedAtMs > 0L) (System.currentTimeMillis() - jinhakLoginRecoveryEpisodeStartedAtMs).coerceAtLeast(0L) else 0L)
-                    .put("loginRecoveryTimeoutMs", JINHAK_LOGIN_RECOVERY_TIMEOUT_MS)
-                    .put("loginRecoveryMaxPolls", MAX_JINHAK_LOGIN_RECOVERY_POLLS)
-                    .put("loginRecoveryFenceTrips", jinhakLoginRecoveryFenceTrips)
-                    .put("postMissionClosureFences", jinhakPostMissionClosureFences)
-                    .put("missionOutstandingAtAuth", jinhakMissionTargetLedger.outstandingCount())
-                    .put("genericActionBudgetExhausted", jinhakGenericActionsExecuted >= MAX_JINHAK_GENERIC_ACTIONS)
-                    .put("reauthCycles", jinhakReauthCycles)
-                    .put("authVerificationFailures", jinhakAuthVerificationFailures)
-                    .put("transitionAuthChecks", jinhakTransitionAuthChecks)
-                    .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
-                    .put("targetAuthRedirectEpisodes", jinhakTargetAuthRedirectEpisodes)
-                    .put("targetAuthRedirectQuarantines", jinhakTargetAuthRedirectQuarantines)
-                    .put("freshCoreFastTargetQuarantines", jinhakFreshCoreFastQuarantines)
-                    .put("orphanOutstandingRecoveries", jinhakOrphanOutstandingRecoveries)
-                    .put("activeOwnerPreservations", jinhakActiveOwnerPreservations)
-                    .put("hubEditsBlockedDuringCollection", hubEditsBlockedDuringCollection)
-                    .put("targetAuthRedirectTrackedTargets", jinhakTargetAuthRedirectCounts.size)
-                    .put("targetAuthRedirectMaxCycles", jinhakTargetAuthRedirectCounts.values.maxOrNull() ?: 0)
-                    .put("targetAuthRedirectThreshold", MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES)
-                    .put("lastTargetAuthRedirectSafePath", jinhakLastTargetAuthRedirectSafePath.take(300))
-                                        .put("jinhakSessionAuthority", "user")
-                    .put("userSessionConfirmed", jinhakUserSessionConfirmed)
-                    .put("userSessionGateEntries", jinhakUserSessionGateEntries)
-                    .put("userSessionConfirmations", jinhakUserSessionConfirmations)
-                    .put("userSessionPauses", jinhakUserSessionPauses)
-                    .put("v0172BootstrapStarts", jinhakV0172BootstrapStarts)
-                    .put("v0172ProtectedRetryDeferrals", jinhakV0172ProtectedRetryDeferrals)
-                    .put("v0172LoginRedirectLoopBreaks", jinhakV0172LoginRedirectLoopBreaks)
-                    .put("v0172DeferredProtectedTargets", jinhakV0172DeferredProtectedTargets.size)
-                    .put("v0173ResumeArmed", jinhakV0173ResumeArmed)
-                    .put("v0173LoginSurfaceArmRequests", jinhakV0173LoginSurfaceArmRequests)
-                    .put("v0173NaturalHigh3Resumes", jinhakV0173NaturalHigh3Resumes)
-                    .put("v0173StaleLoginCallbacksIgnored", jinhakV0173StaleLoginCallbacksIgnored)
-                    .put("v0173High3StabilityRejects", jinhakV0173High3StabilityRejects)
-                    .put("v0173ActualLoginReturns", jinhakV0173ActualLoginReturns)
-                    .put("v0173AutoBootstrapNavigations", 0)
-                    .put("jinhakAuthModel", "dedicated-auth-webview-autologin-v0180")
-                    .put("v0174StrictHigh3Sandbox", true)
-                    .put("v0175BlockedRoutesPreserveUserSession", true)
-                    .put("v0175SpaHistoryBlankNeutralization", false)
-                    .put("v0175SnapshotOverlapRetryMs", JINHAK_SNAPSHOT_OVERLAP_RETRY_MS)
-                    .put("v0175RendererCrashCooldownMs", JINHAK_FIRST_RENDERER_CRASH_COOLDOWN_MS)
-                    .put("v0180DedicatedAuthWebView", true)
-                    .put("v0180CredentialVaultAutoLogin", true)
-                    .put("v0180AuthState", jinhakV0180AuthState)
-                    .put("v0180AuthGeneration", jinhakV0180AuthGeneration)
-                    .put("v0180AuthSubmitAttempts", jinhakV0180AuthSubmitAttempts)
-                    .put("v0180AuthSubmissions", jinhakV0180AuthSubmissions)
-                    .put("v0180AuthSuccesses", jinhakV0180AuthSuccesses)
-                    .put("v0180AuthFailures", jinhakV0180AuthFailures)
-                    .put("v0180AuthRendererRestarts", jinhakV0180AuthRendererRestarts)
-                    .put("v0180CollectorLoginRouteLoads", jinhakV0180CollectorLoginRouteLoads)
-                    .put("v0180LowerGradeBlocks", jinhakV0180LowerGradeBlocks)
-                    .put("v0181FocusedSixMode", jinhakV0181FocusedSixMode)
-                    .put("v0181PinnedIdentitySeeds", jinhakV0181PinnedIdentitySeeds)
-                    .put("v0181GenericRoutesSuppressed", jinhakV0181GenericRoutesSuppressed)
-                    .put("v0181GenericActionsSuppressed", jinhakV0181GenericActionsSuppressed)
-                    .put("v0181ProtectedCoreStarts", jinhakV0181ProtectedCoreStarts)
-                    .put("v0182ProtectedSessionVerified", jinhakV0182ProtectedSessionVerified)
-                    .put("v0182ProtectedSessionVerifications", jinhakV0182ProtectedSessionVerifications)
-                    .put("v0182ProtectedBootstrapAttempts", jinhakV0182ProtectedBootstrapAttempts)
-                    .put("v0182ProtectedBootstrapFailures", jinhakV0182ProtectedBootstrapFailures)
-                    .put("v0182High3ReturnsAwaitingProof", jinhakV0182High3ReturnsAwaitingProof)
-                    .put("v0182AutofillAttemptsThisGeneration", jinhakV0182AutofillAttemptsThisGeneration)
-                    .put("v0182CredentialSubmitVerifiedSuccesses", jinhakV0182CredentialSubmitVerifiedSuccesses)
-                    .put("v0182ManualHigh3Returns", jinhakV0182ManualHigh3Returns)
-                    .put("v0182RecoveryScopePreparations", jinhakV0182RecoveryScopePreparations)
-                    .put("v0183StorageOnlyMode", JinhakStorageCompetitionPolicy.ENABLED)
-                    .put("v0183StorageRefreshIntervalMs", JinhakStorageCompetitionPolicy.REFRESH_INTERVAL_MS)
-                    .put("v0183StorageSnapshots", jinhakV0183StorageSnapshots)
-                    .put("v0183CompetitionRecords", jinhakV0183CompetitionRecords)
-                    .put("v0183CurrentCompetitionVerifiedRecords", jinhakV0183CurrentCompetitionVerifiedRecords)
-                    .put("v0183StorageRefreshes", jinhakV0183StorageRefreshes)
-                    .put("v0183NextRefreshAtMs", jinhakV0183NextRefreshAtMs)
-                    .put("v0184SingleSurfaceAuth", JinhakSingleSurfaceStoragePolicy.ENABLED)
-                    .put("v0184AuthAndCollectionSurface", JinhakSingleSurfaceStoragePolicy.AUTH_AND_COLLECTION_SURFACE)
-                    .put("v0184ExternalAppSessionBridge", JinhakSingleSurfaceStoragePolicy.EXTERNAL_APP_SESSION_BRIDGE)
-                    .put("v0184SingleSurfaceLoginPages", jinhakV0184SingleSurfaceLoginPages)
-                    .put("v0184SingleSurfaceAutofillAttempts", jinhakV0184SingleSurfaceAutofillAttempts)
-                    .put("v0184SingleSurfaceSubmits", jinhakV0184SingleSurfaceSubmits)
-                    .put("v0180RecursiveAuthPolling", false)
-                    .put("v0180CollectorOwnsLogin", false)
-                    .put("v0180AuthLastReason", jinhakV0180AuthLastReason)
-                    .put("v0180AuthLastSafePath", jinhakV0180AuthLastSafePath)
-                    .put("v0174StrictMainFrameBlocks", jinhakV0174StrictMainFrameBlocks)
-                    .put("v0174LowerGradeAnyRequestBlocks", jinhakV0174LowerGradeAnyRequestBlocks)
-                    .put("v0174ServiceWorkerLowerGradeBlocks", jinhakV0174ServiceWorkerLowerGradeBlocks)
-                    .put("v0174PopupBlocks", jinhakV0174PopupBlocks)
-                    .put("v0174HistoryBlocks", jinhakV0174HistoryBlocks)
-                    .put("v0174AppNavigationBlocks", jinhakV0174AppNavigationBlocks)
-                    .put("v0174RendererResumeBlocks", jinhakV0174RendererResumeBlocks)
-                    .put("v0174PersistedTargetBlocks", jinhakV0174PersistedTargetBlocks)
-                    .put("v0174SharedRootBlocks", jinhakV0174SharedRootBlocks)
-                    .put("v0174GenericLoginBlocks", jinhakV0174GenericLoginBlocks)
-                    .put("v0174OtherJinhakBlocks", jinhakV0174OtherJinhakBlocks)
-                    .put("v0174ExternalBlocks", jinhakV0174ExternalBlocks)
-                    .put("v0174MemberLoginAllows", jinhakV0174MemberLoginAllows)
-                    .put("v0174High3Allows", jinhakV0174High3Allows)
-                    .put("v0174ExplicitHigh3Confirmations", jinhakV0174ExplicitHigh3Confirmations)
-                    .put("v0174StrictEntryRequests", jinhakV0174StrictEntryRequests)
-                    .put("v0174ForbiddenPageStartsStopped", jinhakV0174ForbiddenPageStartsStopped)
-                    .put("v0174ForbiddenPageFinishesObserved", jinhakV0174ForbiddenPageFinishesObserved)
-                    .put("v0174SharedRootAllowed", false)
-                    .put("v0174GenericLoginAllowed", false)
-                    .put("v0174AutoHigh3Resume", false)
-                    .put("collectorVerifiesLogin", false)
-                    .put("collectorRestoresJinhakAuthLease", false)
-                    .put("collectorCapturesJinhakAuthLease", false)
-                    .put("collectorExtendsJinhakSession", false)
-                    .put("forcedAuthNavigations", jinhakV0170ForcedAuthNavigations)
-                    .put("domAuthChecks", jinhakV0170DomAuthChecks)
-                    .put("serverLoginRedirects", jinhakV0170ServerLoginRedirects)
-                    .put("naturalHigh3Returns", jinhakV0170NaturalHigh3Returns)
-                    .put("protectedMissionStarts", jinhakV0170ProtectedMissionStarts)
-                    .put("realJinhakAuthProbeResult", jinhakRealAuthProbeResult.take(80))
-                    .put("realJinhakAuthProbeVerifiedAtMs", jinhakRealAuthProbeVerifiedAtMs)
-                    .put("realJinhakAuthRouteCycleDetected", jinhakRealAuthProbeRouteCycleDetected)
-                    .put("realJinhakAuthRouteTransitions", jinhakRealAuthProbeRouteEvents.length())
-                    .put("authProofRestores", jinhakAuthProofRestores)
-                    .put("authResumeGateRuns", jinhakAuthResumeGateRuns)
-                    .put("authResumeGatePending", jinhakRealAuthResumeGatePending)
-                    .put("freshProtectedCoreProof", hasFreshJinhakProtectedCoreProof())
-                    .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
-                    .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
-                    .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
-                    .put("credentialAutoLoginSuccesses", credentialAutoLoginSuccesses)
-                    .put("credentialAutoLoginFailures", credentialAutoLoginFailures)
-                    .put("credentialAutoLoginSuppressedInFlight", credentialAutoLoginSuppressedInFlight)
-                    .put("credentialAutoLoginSuppressedThrottle", credentialAutoLoginSuppressedThrottle)
-                    .put("credentialAutoLoginSuppressedNoCredential", credentialAutoLoginSuppressedNoCredential)
-                    .put("credentialAutoLoginSuppressedProbeLost", credentialAutoLoginSuppressedProbeLost)
-                    .put("credentialAutoLoginSuppressedRetryLimit", credentialAutoLoginSuppressedRetryLimit)
-                    .put("credentialAutoLoginLastResult", credentialAutoLoginLastResult.take(80))
-                    .put("sessionKeepAliveTicks", jinhakSessionKeepAliveTicks)
-                    .put("sessionKeepAliveBackgroundTicks", jinhakSessionKeepAliveBackgroundTicks)
-                    .put("sessionExtensionClicks", jinhakSessionExtensionClicks)
-                    .put("credentialExported", false)
-                    .put("sessionSecretExported", false),
-                batchPausedForLogin || jinhakTransitionAuthGateActive,
+                    .put("authOwnership", JinhakManualStorageReportPolicy.AUTH_OWNERSHIP)
+                    .put("autoLogin", false)
+                    .put("credentialStorage", false)
+                    .put("sessionRestore", false)
+                    .put("authProofCache", false)
+                    .put("genericSiteCrawl", false)
+                    .put("missionTargets", jinhakMissionTargetLedger.summary())
+                    .put("missionActionsExecuted", jinhakMissionActionsExecuted)
+                    .put("genericActionsExecuted", jinhakGenericActionsExecuted)
+                    .put("credentialsExported", false)
+                    .put("cookiesExported", false)
+                    .put("sessionSecretsExported", false),
+                false,
                 false
             )
         }
@@ -5559,29 +5354,28 @@ class MainActivity : Activity() {
 
     private fun startBatch() {
         if (provider == ProviderId.JINHAK) {
-            activateV0181PinnedSixFocus("start-batch")
-            if (!jinhakUserSessionConfirmed) {
-                enterJinhakUserSessionGate("start-batch")
+            activateV0181PinnedSixFocus("manual-storage-start")
+            val current = webView.url.orEmpty()
+            if (!JinhakManualStorageReportPolicy.isStorageEntry(current)) {
+                batchPausedForLogin = false
+                sessionState.text = "○ 수시 저장소 직접 진입 필요"
+                status.text = "진학사 로그인은 직접 진행하세요. 수시 저장소 페이지가 열린 뒤에만 대학·학과별 리포트 탐색을 시작합니다."
+                Toast.makeText(this, "수시 저장소까지 직접 이동해주세요.", Toast.LENGTH_LONG).show()
                 return
             }
-            if (!jinhakV0182ProtectedSessionVerified) {
-                jinhakAuthVerifiedForBatch = false
-                requestV0182ProtectedSessionProbe("start-batch")
-                return
-            }
-            val visibleHigh3 = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(webView.url)
-            if (!jinhakUserSessionConfirmed || visibleHigh3 == null) {
-                jinhakV0174PersistedTargetBlocks += 1
-                enterJinhakUserSessionGate("v0174-start-batch-requires-visible-high3")
-                return
-            }
-            currentBatchTarget = canonicalizeBatchUrl(visibleHigh3)
+            credentialVault.clear(ProviderId.JINHAK.wireName)
+            startupLoginPreflightActive = false
+            startupLoginPreflightVerified = false
+            jinhakTransitionAuthGateActive = false
+            jinhakUserSessionConfirmed = false
             jinhakAuthVerifiedForBatch = false
-            jinhakCoreBootstrapState = "v0182-user-approved-high3-awaiting-protected-proof"
-            jinhakLastAuthEvidence = "user-approved-public-high3-not-auth-proof"
+            jinhakV0182ProtectedSessionVerified = false
+            jinhakCoreBootstrapState = "manual-storage-ready"
+            jinhakLastAuthEvidence = "manual-storage-visible-no-auth-inference"
             jinhakLastCoreVerifiedAtMs = 0L
+            currentBatchTarget = canonicalizeBatchUrl(current)
         }
-        if (startupLoginPreflightActive) {
+        if (provider != ProviderId.JINHAK && startupLoginPreflightActive) {
             Toast.makeText(this, "로그인 준비가 끝난 뒤 수집이 자동 시작됩니다.", Toast.LENGTH_SHORT).show()
             return
         }

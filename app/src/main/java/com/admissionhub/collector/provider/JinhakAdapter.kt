@@ -8,6 +8,7 @@ import com.admissionhub.collector.jinhak.JinhakApplicationMission
 import com.admissionhub.collector.jinhak.JinhakReportYearGuard
 import com.admissionhub.collector.jinhak.JinhakStrictHigh3Sandbox
 import com.admissionhub.collector.jinhak.JinhakStorageCompetitionPolicy
+import com.admissionhub.collector.jinhak.JinhakManualStorageReportPolicy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -42,7 +43,7 @@ object JinhakAdapter : ProviderAdapter {
 
     override fun isBatchNavigable(url: String): Boolean {
         if (!accepts(url) || !JinhakStrictHigh3Sandbox.allowsCollectorNavigation(url)) return false
-        if (JinhakStorageCompetitionPolicy.ENABLED && !JinhakStorageCompetitionPolicy.isStorageUrl(url)) return false
+        if (JinhakManualStorageReportPolicy.ENABLED && !JinhakManualStorageReportPolicy.isAllowedMissionUrl(url)) return false
         return try {
             val uri = URI(url)
             val path = (uri.path ?: "/").lowercase()
