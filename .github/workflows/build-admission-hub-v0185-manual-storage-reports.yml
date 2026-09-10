@@ -7,6 +7,7 @@ on:
       - ".github/workflows/build-admission-hub-v0185-manual-storage-reports.yml"
       - ".github/scripts/patch_v0185_manual_storage_reports.py"
       - ".github/scripts/fix_v0185_report_activation.py"
+      - ".github/scripts/fix_v0185_compile_auth_metadata.py"
       - ".github/scripts/verify_v0185_manual_storage_reports.py"
       - ".github/scripts/verify_apk_v0185.sh"
       - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakManualStorageReportPolicy.kt"
@@ -43,6 +44,7 @@ jobs:
             python3 .github/scripts/patch_v0185_manual_storage_reports.py
           fi
           python3 .github/scripts/fix_v0185_report_activation.py
+          python3 .github/scripts/fix_v0185_compile_auth_metadata.py
           git diff --check
 
       - name: Verify source contracts before commit
@@ -138,7 +140,7 @@ jobs:
           PY
           )"
           cat > release-v0185/verification-v0.18.5.json <<EOF
-          {"versionName":"0.18.5","versionCode":118500,"sourceCommit":"$PRODUCT_COMMIT","tests":$TESTS,"apkSha256":"$APK_SHA","signerSha256":"$SIGNER","jinhakAuthOwnership":"user-browser-only","jinhakAutoLogin":false,"jinhakCredentialStorage":false,"jinhakSessionRestore":false,"jinhakAuthProofCache":false,"legacyAuthWebViewActive":false,"automationStartGate":"visible-susi-storage","storagePath":"/jh/high3/early/four-year-university/library","navigationModel":"application-card-report-only","genericSiteCrawl":false,"sameCardBindingRequiredAtStorage":true,"credentialsExported":false,"cookiesExported":false,"sessionSecretsExported":false,"jinhakPromotedToOfficial":false,"probabilityInferredByRelease":false,"deviceAcceptance":"PENDING_V0185_REAL_GALAXY_RUN"}
+          {"versionName":"0.18.5","versionCode":118500,"sourceCommit":"$PRODUCT_COMMIT","tests":$TESTS,"apkSha256":"$APK_SHA","signerSha256":"$SIGNER","jinhakAuthOwnership":"user-browser-only","jinhakAutoLogin":false,"jinhakCredentialStorage":false,"jinhakSessionRestore":false,"jinhakAuthProofCache":false,"legacyAuthWebViewActive":false,"automationStartGate":"visible-susi-storage","storagePath":"/jh/high3/early/four-year-university/library","navigationModel":"application-card-report-only","genericSiteCrawl":false,"sameCardBindingRequiredAtStorage":true,"authStateInference":false,"credentialsExported":false,"cookiesExported":false,"sessionSecretsExported":false,"jinhakPromotedToOfficial":false,"probabilityInferredByRelease":false,"deviceAcceptance":"PENDING_V0185_REAL_GALAXY_RUN"}
           EOF
 
       - uses: actions/upload-artifact@v4
