@@ -15,6 +15,12 @@ export default async function handler(req, res) {
   if (action === 'health') {
     path = '/health';
     needsAuth = false;
+  } else if (action === 'competition_status') {
+    path = '/v1/competition/status';
+    needsAuth = false;
+  } else if (action === 'competition_latest') {
+    path = '/v1/competition/latest';
+    needsAuth = false;
   } else if (action === 'latest' && (provider === 'adiga' || provider === 'jinhak')) {
     path = `/v1/runs/latest?provider=${encodeURIComponent(provider)}`;
   } else if (action === 'status' && allowedRunId(runId)) {
