@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/build-admission-hub-v0185-manual-storage-reports.yml"
       - ".github/scripts/patch_v0185_manual_storage_reports.py"
+      - ".github/scripts/fix_v0185_report_activation.py"
       - ".github/scripts/verify_v0185_manual_storage_reports.py"
       - ".github/scripts/verify_apk_v0185.sh"
       - "app/src/main/java/com/admissionhub/collector/jinhak/JinhakManualStorageReportPolicy.kt"
@@ -37,10 +38,11 @@ jobs:
         run: |
           set -euo pipefail
           if grep -F 'versionName = "0.18.5"' app/build.gradle.kts >/dev/null; then
-            echo 'v0.18.5 product source already patched; skipping replay'
+            echo 'v0.18.5 base product patch already applied'
           else
             python3 .github/scripts/patch_v0185_manual_storage_reports.py
           fi
+          python3 .github/scripts/fix_v0185_report_activation.py
           git diff --check
 
       - name: Verify source contracts before commit
