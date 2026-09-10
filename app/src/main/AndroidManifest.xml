@@ -4,9 +4,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
+    <queries>
+        <package android:name="com.jinhak.jinhakmobile.android" />
+    </queries>
+
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.18.3 Storage Competition Watch"
+        android:label="Admission Hub v0.18.4 Native Jinhak Bridge + Adiga Audit"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
@@ -14,6 +18,17 @@
             android:name=".CollectionKeepAliveService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".jinhak.JinhakNativeBridgeAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/jinhak_native_bridge_accessibility" />
+        </service>
         <activity
             android:name=".hub.AdmissionDashboardActivity"
             android:exported="false" />

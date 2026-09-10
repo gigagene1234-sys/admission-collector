@@ -63,6 +63,7 @@ import com.admissionhub.collector.jinhak.JinhakDedicatedAuthPolicy
 import com.admissionhub.collector.jinhak.JinhakFocusedSixPolicy
 import com.admissionhub.collector.jinhak.JinhakProtectedSessionPolicy
 import com.admissionhub.collector.jinhak.JinhakStorageCompetitionPolicy
+import com.admissionhub.collector.jinhak.JinhakNativeAppBridge
 import com.admissionhub.collector.session.SecureSessionVault
 import com.admissionhub.collector.session.CredentialVault
 import com.admissionhub.collector.provider.ProviderCapabilities
@@ -177,6 +178,12 @@ class MainActivity : Activity() {
     private var pendingBatchPageAction: BatchPageAction? = null
     private var activeBatchPageAction: BatchPageAction? = null
     private var batchPageCount = 0
+    private var adigaV0184KnownPagesAtStart = 0
+    private var adigaV0184CompletedPagesAtStart = 0
+    private var adigaV0184ErrorPagesAtStart = 0
+    private var adigaV0184KnownDocumentsAtStart = 0
+    private var adigaV0184CompletedDocumentsAtStart = 0
+    private var adigaV0184UnresolvedAtStart = 0
     private var batchPaginationRetries = 0
     private var batchCloudPlansPending = 0
     private var batchCloudResumePlans = 0
@@ -612,8 +619,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.18.3"
-        private const val BUILD_CODE = 118300
+        private const val VERSION = "0.18.4"
+        private const val BUILD_CODE = 118400
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -993,6 +1000,18 @@ class MainActivity : Activity() {
             text = "진학사 고3 전용 진입 / 현재 고3 탐색 시작"
             setOnClickListener { confirmJinhakUserSessionAndResume("dashboard-browser-button") }
         }
+        val nativeJinhakRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(Button(this@MainActivity).apply {
+                text = "진학사 앱 열기 (로그인 우회)"
+                setOnClickListener { launchV0184NativeJinhakBridge() }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(Button(this@MainActivity).apply {
+                text = "진학사 앱 저장소 관측 가져오기"
+                setOnClickListener { importV0184NativeJinhakObservation(showToast = true) }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
         hubAdvancedToggle = Button(this).apply { text = "고급 도구" }
         primaryActions.addView(hubAdvancedToggle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
@@ -1027,6 +1046,7 @@ class MainActivity : Activity() {
         val expandedBrowserHeight = maxOf(dp(720), (resources.displayMetrics.heightPixels * 0.68f).toInt())
         root.addView(browserStack, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, expandedBrowserHeight))
         root.addView(jinhakSessionConfirmButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        root.addView(nativeJinhakRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(Button(this@MainActivity).apply { text = "내 성적 입력 / 가져오기"; setOnClickListener { scoreReviewUi.showProfile() } }, LinearLayout.LayoutParams(0, -2, 1f))
@@ -1034,6 +1054,116 @@ class MainActivity : Activity() {
         })
         root.addView(hubAdvancedPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         setContentView(ScrollView(this).apply { isFillViewport = true; addView(root) })
+    }
+
+    private fun launchV0184NativeJinhakBridge() {
+        val bridge = JinhakNativeAppBridge.status(this)
+        if (!bridge.serviceEnabled) {
+            Toast.makeText(this, "진학사 앱 관측 기능은 사용자가 접근성 설정에서 직접 허용해야 합니다. 설정 후 다시 눌러주세요.", Toast.LENGTH_LONG).show()
+            startActivity(JinhakNativeAppBridge.accessibilitySettingsIntent())
+            return
+        }
+        if (!bridge.appInstalled) {
+            Toast.makeText(this, "지원하는 진학사 앱 패키지를 이 기기에서 찾지 못했습니다. WebView 수시저장소 방식은 계속 사용할 수 있습니다.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val opened = JinhakNativeAppBridge.launchOfficialApp(this)
+        status.text = if (opened) {
+            "진학사 공식 앱을 열었습니다. 앱에서 수시 저장소를 표시하면 비밀번호/입력칸을 제외한 화면 텍스트만 기기 내부에 관측합니다."
+        } else {
+            "진학사 앱 실행에 실패했습니다. WebView 수시저장소 방식으로 계속할 수 있습니다."
+        }
+    }
+
+    private fun importV0184NativeJinhakObservation(showToast: Boolean): Boolean {
+        if (!::localStore.isInitialized) return false
+        val latest = JinhakNativeAppBridge.latest(this) ?: run {
+            if (showToast) Toast.makeText(this, "진학사 앱에서 수시 저장소 화면이 아직 관측되지 않았습니다.", Toast.LENGTH_LONG).show()
+            return false
+        }
+        val observedAtMs = latest.optLong("observedAtMs", 0L)
+        val now = System.currentTimeMillis()
+        if (observedAtMs <= 0L || now - observedAtMs !in 0..JinhakNativeAppBridge.MAX_OBSERVATION_AGE_MS) {
+            if (showToast) Toast.makeText(this, "최근 진학사 앱 수시 저장소 관측이 없습니다. 앱에서 저장소를 다시 열어주세요.", Toast.LENGTH_LONG).show()
+            return false
+        }
+        val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
+        val prior = prefs.getLong("v0184NativeJinhakImportedAtMs", 0L)
+        if (observedAtMs <= prior) {
+            if (showToast) Toast.makeText(this, "이 진학사 앱 관측은 이미 가져왔습니다.", Toast.LENGTH_SHORT).show()
+            return false
+        }
+        val runId = localStore.beginOrResume(ProviderId.JINHAK.wireName, VERSION)
+        val sessionId = unifiedSessionId ?: localStore.latestUnifiedSession()
+        val evidence = JSONObject(latest.toString())
+            .put("importedAt", Instant.now().toString())
+            .put("captureVersion", VERSION)
+            .put("nativeBridgeReadOnly", true)
+            .put("credentialCaptured", false)
+            .put("cookieCaptured", false)
+            .put("sessionSecretCaptured", false)
+            .put("officialEvidence", false)
+            .put("probabilityInferred", false)
+        val observationId = localStore.storeObservationEvidence(
+            sessionId = sessionId,
+            runId = runId,
+            provider = ProviderId.JINHAK.wireName,
+            safeRouteKey = "native-app://jinhak/susi-storage",
+            pageTypeGuess = "jinhak-native-early-storage",
+            pageTypeConfidence = 0.80,
+            authStateClass = "native-app-user-session",
+            explicitContext = JSONObject().put("scope", "susi-saved-application-visible-text"),
+            evidence = evidence,
+            captureVersion = VERSION
+        )
+        sessionId?.let { sid ->
+            localStore.storeUnifiedAnalysisCapture(
+                sessionId = sid,
+                provider = ProviderId.JINHAK.wireName,
+                pageKey = RecordUtils.sha256("native-jinhak-storage|$observedAtMs"),
+                pageType = "jinhak-native-early-storage",
+                payload = evidence.put("observationId", observationId)
+            )
+            localStore.recordSyncState(
+                sid,
+                "JINHAK_NATIVE_APP_OBSERVATION",
+                ProviderId.JINHAK.wireName,
+                JSONObject()
+                    .put("observedAtMs", observedAtMs)
+                    .put("competitionReadings", latest.optJSONArray("competitionReadings")?.length() ?: 0)
+                    .put("sourceClass", "jinhak-user-viewed-native-app")
+                    .put("officialEvidence", false)
+                    .put("probabilityInferred", false),
+                false,
+                updateOrchestrator = false
+            )
+        }
+        prefs.edit().putLong("v0184NativeJinhakImportedAtMs", observedAtMs).apply()
+        val readings = latest.optJSONArray("competitionReadings") ?: JSONArray()
+        lastJson = JSONObject()
+            .put("collectorVersion", VERSION)
+            .put("type", "jinhak-native-app-storage-observation")
+            .put("sourceClass", "jinhak-user-viewed-native-app")
+            .put("observedAtMs", observedAtMs)
+            .put("competitionReadings", readings)
+            .put("observationId", observationId)
+            .put("sameCardIdentityVerified", false)
+            .put("officialEvidence", false)
+            .put("probabilityInferred", false)
+            .toString(2)
+        showPreview(lastJson)
+        status.text = "진학사 앱 수시 저장소 관측 가져오기 완료 · 경쟁률 표현 ${readings.length()}개 · 대학/전형 동일카드 결합 전에는 현재 경쟁률로 승격하지 않습니다."
+        if (showToast) Toast.makeText(this, "진학사 앱 관측을 가져왔습니다.", Toast.LENGTH_SHORT).show()
+        return true
+    }
+
+    private fun adigaV0184CompletionStatus(reason: String): String {
+        val stats = localRunId?.let { localStore.stats(it) } ?: JSONObject()
+        val completedNow = stats.optInt("completedPages", 0)
+        val knownNow = stats.optInt("pages", 0)
+        val newCompleted = (completedNow - adigaV0184CompletedPagesAtStart).coerceAtLeast(0)
+        val unresolvedNow = localRunId?.let { localStore.unresolvedCount(it) } ?: 0
+        return "어디가 ${if (reason == "completed") "완료" else "1차 순회 종료"}: 이번 실행 스냅샷 $batchPageCount회 · 시작 시 이미 완료 ${adigaV0184CompletedPagesAtStart}/${adigaV0184KnownPagesAtStart}쪽 · 이번 새 완료 ${newCompleted}쪽 · 현재 누적 ${completedNow}/${knownNow}쪽 · 미해결 $unresolvedNow · '페이지 수'와 '이번 실행 시도'는 서로 다른 누적/세션 지표입니다."
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -5705,6 +5835,12 @@ class MainActivity : Activity() {
         batchPausedForLogin = false
         batchCollecting = false
         batchPageCount = 0
+        adigaV0184KnownPagesAtStart = 0
+        adigaV0184CompletedPagesAtStart = 0
+        adigaV0184ErrorPagesAtStart = 0
+        adigaV0184KnownDocumentsAtStart = 0
+        adigaV0184CompletedDocumentsAtStart = 0
+        adigaV0184UnresolvedAtStart = 0
         batchPaginationRetries = 0
         batchCloudPlansPending = 0
         batchCloudResumePlans = 0
@@ -5873,6 +6009,23 @@ class MainActivity : Activity() {
         batchButton.text = "일괄 수집 중지"
         if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
             localRunId = localStore.beginOrResume(provider.wireName, VERSION)
+            localRunId?.let { runId ->
+                val startStats = localStore.stats(runId)
+                adigaV0184KnownPagesAtStart = startStats.optInt("pages", 0)
+                adigaV0184CompletedPagesAtStart = startStats.optInt("completedPages", 0)
+                adigaV0184ErrorPagesAtStart = startStats.optInt("errorPages", 0)
+                adigaV0184KnownDocumentsAtStart = startStats.optInt("documents", 0)
+                adigaV0184CompletedDocumentsAtStart = startStats.optInt("completedDocuments", 0)
+                adigaV0184UnresolvedAtStart = localStore.unresolvedCount(runId)
+                recordRuntimeEvent("adiga-v0184-local-resume-baseline", JSONObject()
+                    .put("attemptModel", "session-snapshot-attempts-vs-persisted-local-resume")
+                    .put("pagesKnownAtStart", adigaV0184KnownPagesAtStart)
+                    .put("pagesCompletedAtStart", adigaV0184CompletedPagesAtStart)
+                    .put("errorPagesAtStart", adigaV0184ErrorPagesAtStart)
+                    .put("documentsKnownAtStart", adigaV0184KnownDocumentsAtStart)
+                    .put("documentsCompletedAtStart", adigaV0184CompletedDocumentsAtStart)
+                    .put("unresolvedAtStart", adigaV0184UnresolvedAtStart))
+            }
             unifiedSessionId?.takeIf { unifiedRunning }?.let { sessionId ->
                 localRunId?.let { runId -> localStore.attachUnifiedProviderRun(sessionId, provider.wireName, runId) }
             }
@@ -9006,10 +9159,10 @@ class MainActivity : Activity() {
             )
         }
         status.text = when {
-            LOCAL_FIRST_BETA && effectiveReason == "completed-with-local-errors" ->
-                "Local-First 1차 순회 종료: 미해결 오류는 로컬에 저장됨 / 다음 실행에서 해당 지점만 재개합니다."
-            LOCAL_FIRST_BETA && effectiveReason == "completed" ->
-                "어디가 로컬 수집 완료: 시도 $batchPageCount / 성공 ${batchSnapshots.length()} / 재시도 $batchPaginationRetries / 로컬 레코드 ${localRunId?.let { localStore.stats(it).optInt("records") } ?: batchRecords.length()}"
+            LOCAL_FIRST_BETA && provider == ProviderId.ADIGA && effectiveReason == "completed-with-local-errors" ->
+                adigaV0184CompletionStatus(effectiveReason)
+            LOCAL_FIRST_BETA && provider == ProviderId.ADIGA && effectiveReason == "completed" ->
+                adigaV0184CompletionStatus(effectiveReason)
             effectiveReason == "cloud-verification-failed" ->
                 "로컬 수집 종료: Cloud 최종 완결성 확인 실패 / 서버 run은 닫지 않고 유지합니다."
             batchCloudPagesDeferred > 0 ->
@@ -9265,6 +9418,15 @@ class MainActivity : Activity() {
             .put("completion", reason)
             .put("summary", JSONObject()
                 .put("attemptedPages", batchPageCount)
+                .put("attemptedPagesMeaning", "current-process-snapshot-attempts-not-total-known-pages")
+                .put("adigaAttemptModel", if (provider == ProviderId.ADIGA) "session-snapshot-attempts-vs-persisted-local-resume-v0184" else JSONObject.NULL)
+                .put("adigaPagesKnownAtStart", if (provider == ProviderId.ADIGA) adigaV0184KnownPagesAtStart else JSONObject.NULL)
+                .put("adigaPagesCompletedAtStart", if (provider == ProviderId.ADIGA) adigaV0184CompletedPagesAtStart else JSONObject.NULL)
+                .put("adigaErrorPagesAtStart", if (provider == ProviderId.ADIGA) adigaV0184ErrorPagesAtStart else JSONObject.NULL)
+                .put("adigaDocumentsKnownAtStart", if (provider == ProviderId.ADIGA) adigaV0184KnownDocumentsAtStart else JSONObject.NULL)
+                .put("adigaDocumentsCompletedAtStart", if (provider == ProviderId.ADIGA) adigaV0184CompletedDocumentsAtStart else JSONObject.NULL)
+                .put("adigaUnresolvedAtStart", if (provider == ProviderId.ADIGA) adigaV0184UnresolvedAtStart else JSONObject.NULL)
+                .put("adigaNewCompletedPagesThisRun", if (provider == ProviderId.ADIGA) (localStats.optInt("completedPages", 0) - adigaV0184CompletedPagesAtStart).coerceAtLeast(0) else JSONObject.NULL)
                 .put("successfulPages", batchSnapshots.length())
                 .put("errorPages", batchErrors.length())
                 .put("records", persistedRecordCount)
