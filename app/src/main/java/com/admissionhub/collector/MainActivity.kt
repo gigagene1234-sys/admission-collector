@@ -4490,13 +4490,10 @@ class MainActivity : Activity() {
                     .put("sessionSecretExported", false)
                     .put("adigaCredentialStored", credentialVault.has(ProviderId.ADIGA.wireName))
                     .put("jinhakCredentialStored", credentialVault.has(ProviderId.JINHAK.wireName))
-                    .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
-                    .put("loginSurfaceDetectionsAtBootstrap", credentialLoginSurfaceDetections)
+                        .put("loginSurfaceDetectionsAtBootstrap", credentialLoginSurfaceDetections)
                     .put("credentialAutoLoginSubmissionsAtBootstrap", credentialAutoLoginSubmissions)
                     .put("credentialAutoLoginSuccessesAtBootstrap", credentialAutoLoginSuccesses)
-                    .put("staleSessionLeaseBypassesPrevented", staleSessionLeaseBypassesPrevented)
-                    .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
-                    .put("targetAuthRedirectEpisodes", jinhakTargetAuthRedirectEpisodes)
+                            .put("targetAuthRedirectEpisodes", jinhakTargetAuthRedirectEpisodes)
                     .put("targetAuthRedirectQuarantines", jinhakTargetAuthRedirectQuarantines)
                     .put("freshCoreFastTargetQuarantines", jinhakFreshCoreFastQuarantines)
                     .put("orphanOutstandingRecoveries", jinhakOrphanOutstandingRecoveries)
@@ -4512,9 +4509,7 @@ class MainActivity : Activity() {
                     .put("targetAuthRedirectMaxCycles", jinhakTargetAuthRedirectCounts.values.maxOrNull() ?: 0)
                     .put("targetAuthRedirectThreshold", MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES)
                     .put("lastTargetAuthRedirectSafePath", jinhakLastTargetAuthRedirectSafePath.take(300))
-                    .put("loginRouteFallbackCredentialPrompts", loginRouteFallbackCredentialPrompts)
-                    .put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)
-                    .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
+                            .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
                     .put("jinhakLastAuthEvidence", jinhakLastAuthEvidence)
                     .put("jinhakLastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
                     .put("jinhakLoginRecoveryPolls", jinhakLoginRecoveryPolls)
@@ -5597,19 +5592,23 @@ class MainActivity : Activity() {
         currentBatchTarget = if (provider == ProviderId.JINHAK && preserveJinhakMissionState && !currentBatchTarget.isNullOrBlank()) {
             currentBatchTarget
         } else if (provider == ProviderId.JINHAK) {
-            JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(webView.url)?.let(::canonicalizeBatchUrl)
+            canonicalizeBatchUrl(webView.url.orEmpty())
         } else canonicalizeBatchUrl(url)
         if (provider == ProviderId.JINHAK) {
-            val strict = JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(currentBatchTarget)
-                ?: JinhakStrictHigh3Sandbox.sanitizedHigh3OrNull(webView.url)
-            if (strict == null) {
-                jinhakV0174PersistedTargetBlocks += 1
+            val visible = canonicalizeBatchUrl(webView.url.orEmpty())
+            val selected = canonicalizeBatchUrl(currentBatchTarget.orEmpty())
+            val target = selected.takeIf { JinhakManualStorageReportPolicy.isAllowedMissionUrl(it) }
+                ?: visible.takeIf { JinhakManualStorageReportPolicy.isAllowedMissionUrl(it) }
+            if (target == null) {
                 batchRunning = false
+                batchPausedForLogin = false
                 hideBatchCover()
-                enterJinhakUserSessionGate("v0174-invalid-persisted-or-visible-target")
+                stopCollectionKeepAlive()
+                sessionState.text = "○ 수시 저장소 직접 진입 필요"
+                status.text = "진학사 인증 상태는 확인하지 않습니다. 수시 저장소로 직접 이동한 뒤 리포트 탐색을 시작하세요."
                 return
             }
-            currentBatchTarget = canonicalizeBatchUrl(strict)
+            currentBatchTarget = target
         }
         batchButton.text = "일괄 수집 중지"
         if (LOCAL_FIRST_BETA && provider == ProviderId.ADIGA) {
@@ -5880,20 +5879,14 @@ class MainActivity : Activity() {
                 .put("slowLaneRendererCircuitOpen", slowStats?.rendererCircuitOpen ?: false)
                 .put("slowLaneRendererFallbacks", jinhakSlowLaneRendererFallbacks)
                 .put("slowLaneRendererCircuitOpenFallbacks", jinhakSlowLaneRendererCircuitOpens)
-                .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
-                .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
-                .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
-                .put("credentialAutoLoginSuccesses", credentialAutoLoginSuccesses)
-                .put("credentialAutoLoginFailures", credentialAutoLoginFailures)
-                    .put("credentialAutoLoginSuppressedInFlight", credentialAutoLoginSuppressedInFlight)
-                    .put("credentialAutoLoginSuppressedThrottle", credentialAutoLoginSuppressedThrottle)
-                    .put("credentialAutoLoginSuppressedNoCredential", credentialAutoLoginSuppressedNoCredential)
-                    .put("credentialAutoLoginSuppressedProbeLost", credentialAutoLoginSuppressedProbeLost)
-                    .put("credentialAutoLoginSuppressedRetryLimit", credentialAutoLoginSuppressedRetryLimit)
-                .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
-                .put("loginRouteFallbackCredentialPrompts", loginRouteFallbackCredentialPrompts)
-                .put("staleSessionLeaseBypassesPrevented", staleSessionLeaseBypassesPrevented)
-                .put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)
+                .put("authOwnership", JinhakManualStorageReportPolicy.AUTH_OWNERSHIP)
+                .put("authStateInferred", false)
+                .put("autoLogin", false)
+                .put("credentialStorage", false)
+                .put("sessionRestore", false)
+                .put("authProofCache", false)
+                .put("storageVisible", JinhakManualStorageReportPolicy.isStorageEntry(webView.url))
+                .put("reportVisible", JinhakManualStorageReportPolicy.isReportUrl(webView.url))
                 .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
                 .put("jinhakCoreScopeBlockedUrls", jinhakCoreScopeBlockedUrls)
                 .put("jinhakCoreScopeBlockedLanes", JSONObject(jinhakCoreScopeBlockedLaneCounts as Map<*, *>))
@@ -8832,24 +8825,12 @@ class MainActivity : Activity() {
                         .put("popupWebViewsCreated", jinhakPopupWebViewsCreated)
                         .put("popupWebViewsDestroyed", jinhakPopupWebViewsDestroyed)
                         .put("rendererFirstCrashCooldowns", jinhakRendererFirstCrashCooldowns)
-                        .put("loginSurfaceDetections", credentialLoginSurfaceDetections)
-                        .put("credentialAutoLoginAttempts", credentialAutoLoginAttempts)
-                        .put("credentialAutoLoginSubmissions", credentialAutoLoginSubmissions)
-                        .put("credentialAutoLoginSuccesses", credentialAutoLoginSuccesses)
-                        .put("credentialAutoLoginFailures", credentialAutoLoginFailures)
-                    .put("credentialAutoLoginSuppressedInFlight", credentialAutoLoginSuppressedInFlight)
-                    .put("credentialAutoLoginSuppressedThrottle", credentialAutoLoginSuppressedThrottle)
-                    .put("credentialAutoLoginSuppressedNoCredential", credentialAutoLoginSuppressedNoCredential)
-                    .put("credentialAutoLoginSuppressedProbeLost", credentialAutoLoginSuppressedProbeLost)
-                    .put("credentialAutoLoginSuppressedRetryLimit", credentialAutoLoginSuppressedRetryLimit)
-                        .put("credentialAutoLoginLastResult", credentialAutoLoginLastResult.take(80))
+                                                                .put("credentialAutoLoginLastResult", credentialAutoLoginLastResult.take(80))
                         .put("credentialAutoLoginLastProvider", credentialAutoLoginLastProvider.take(20))
                         .put("credentialAutoLoginLastAtMs", credentialAutoLoginLastAtMs)
                         .put("batchRenderedLoginSurfacePauses", batchRenderedLoginSurfacePauses)
                         .put("crossVersionResumeBlocks", crossVersionResumeBlocks)
-                        .put("staleSessionLeaseBypassesPrevented", staleSessionLeaseBypassesPrevented)
-                        .put("loginRouteFallbackPauses", loginRouteFallbackPauses)
-                    .put("targetAuthRedirectEpisodes", jinhakTargetAuthRedirectEpisodes)
+                                    .put("targetAuthRedirectEpisodes", jinhakTargetAuthRedirectEpisodes)
                     .put("targetAuthRedirectQuarantines", jinhakTargetAuthRedirectQuarantines)
                     .put("freshCoreFastTargetQuarantines", jinhakFreshCoreFastQuarantines)
                     .put("orphanOutstandingRecoveries", jinhakOrphanOutstandingRecoveries)
@@ -8859,9 +8840,7 @@ class MainActivity : Activity() {
                     .put("targetAuthRedirectMaxCycles", jinhakTargetAuthRedirectCounts.values.maxOrNull() ?: 0)
                     .put("targetAuthRedirectThreshold", MAX_JINHAK_TARGET_AUTH_REDIRECT_CYCLES)
                     .put("lastTargetAuthRedirectSafePath", jinhakLastTargetAuthRedirectSafePath.take(300))
-                        .put("loginRouteFallbackCredentialPrompts", loginRouteFallbackCredentialPrompts)
-                        .put("jinhakAuthVerifiedForBatch", jinhakAuthVerifiedForBatch)
-                        .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
+                                        .put("jinhakCoreBootstrapState", jinhakCoreBootstrapState)
                         .put("jinhakLastAuthEvidence", jinhakLastAuthEvidence)
                         .put("jinhakLastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
                         .put("jinhakLoginRecoveryPolls", jinhakLoginRecoveryPolls)
