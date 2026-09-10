@@ -2,14 +2,14 @@ name: Build Admission Hub v0.13.1 Competition Browser
 
 on:
   push:
-    branches: [codex/competition-browser-v0131]
+    branches: [codex/competition-browser-v0131-clean2]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: admission-hub-v0131-competition-browser
+  group: admission-hub-v0131-competition-browser-clean
   cancel-in-progress: true
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
           python3 .github/scripts/patch_competition_browser_v0131.py
           python3 .github/scripts/patch_competition_browser_dom_v3.py
 
-      - name: Persist patched product source on feature branch
+      - name: Persist patched product source on clean feature branch
         shell: bash
         run: |
           set -euo pipefail
@@ -41,7 +41,7 @@ jobs:
               app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt \
               app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
             git commit -m "Wire validated competition browser collector into Admission Hub v0.13.1"
-            git push origin HEAD:codex/competition-browser-v0131
+            git push origin HEAD:codex/competition-browser-v0131-clean2
           fi
 
       - name: Verify privacy and source contracts
@@ -54,6 +54,8 @@ jobs:
           grep -q 'location.origin+location.pathname' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
           grep -q 'countsMatch(quota,applicants,r)' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
           grep -q 'versionName = "0.13.1"' app/build.gradle.kts
+          grep -q 'versionCode = 113100' app/build.gradle.kts
+          grep -q 'Admission Hub v0.13.1 Live Competition' app/src/main/AndroidManifest.xml
           test -z "$(git status --porcelain)"
 
       - uses: actions/setup-java@v5
