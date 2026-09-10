@@ -1163,7 +1163,7 @@ class MainActivity : Activity() {
         val knownNow = stats.optInt("pages", 0)
         val newCompleted = (completedNow - adigaV0184CompletedPagesAtStart).coerceAtLeast(0)
         val unresolvedNow = localRunId?.let { localStore.unresolvedCount(it) } ?: 0
-        return "어디가 ${if (reason == "completed") "완료" else "1차 순회 종료"}: 이번 실행 스냅샷 $batchPageCount회 · 시작 시 이미 완료 ${adigaV0184CompletedPagesAtStart}/${adigaV0184KnownPagesAtStart}쪽 · 이번 새 완료 ${newCompleted}쪽 · 현재 누적 ${completedNow}/${knownNow}쪽 · 미해결 $unresolvedNow · '페이지 수'와 '이번 실행 시도'는 서로 다른 누적/세션 지표입니다."
+        return "어디가 ${if (reason == "completed") "완료" else "1차 순회 종료"}: 이번 실행 스냅샷 ${batchPageCount}회 · 시작 시 이미 완료 ${adigaV0184CompletedPagesAtStart}/${adigaV0184KnownPagesAtStart}쪽 · 이번 새 완료 ${newCompleted}쪽 · 현재 누적 ${completedNow}/${knownNow}쪽 · 미해결 $unresolvedNow · '페이지 수'와 '이번 실행 시도'는 서로 다른 누적/세션 지표입니다."
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
