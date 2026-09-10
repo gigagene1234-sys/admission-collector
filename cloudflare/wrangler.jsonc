@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "admission-collector-offload",
-  "main": "src/index.js",
+  "main": "src/worker.js",
   "compatibility_date": "2026-08-28",
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
@@ -16,7 +16,7 @@
     }
   ],
   "triggers": {
-    "crons": ["*/5 * * * *"]
+    "crons": ["* * * * *"]
   },
   "queues": {
     "producers": [
