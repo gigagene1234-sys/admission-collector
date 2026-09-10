@@ -1,5 +1,5 @@
 import baseWorker from "./index.js";
-import { handleCompetitionRequest, runCompetitionScheduled } from "./competition.js";
+import { handleCompetitionRequest, runCompetitionScheduled } from "./competition_v2.js";
 
 export default {
   async fetch(request, env, ctx) {
