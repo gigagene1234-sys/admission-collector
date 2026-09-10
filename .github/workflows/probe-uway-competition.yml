@@ -1,0 +1,53 @@
+name: Probe Uway Competition Endpoints
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/probe-uway-competition.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discover Woosong and KOREATECH public ratio links
+        shell: bash
+        run: |
+          set -euo pipefail
+          UA='Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/140 Safari/537.36'
+          curl -L --max-time 20 -sS -A "$UA" 'https://ent.wsu.ac.kr/page/index.jsp?code=susi0701' -o /tmp/woosong.html
+          curl -L --max-time 20 -sS -A "$UA" 'https://www.koreatech.ac.kr/index.es?sid=01' -o /tmp/koreatech.html
+          node <<'NODE'
+          const fs=require('fs');
+          for (const name of ['woosong','koreatech']) {
+            const s=fs.readFileSync(`/tmp/${name}.html`,'utf8');
+            const urls=[...s.matchAll(/https?:\\?\/\\?\/[^\s"'<>]+/gi)].map(m=>m[0].replace(/\\\//g,'/'));
+            const picked=[...new Set(urls.filter(x=>/uway|ratio|apply/i.test(x)))];
+            console.log(`=== ${name} URLs ===`);
+            for (const u of picked) console.log(u);
+            console.log(`=== ${name} competition contexts ===`);
+            const plain=s.replace(/\s+/g,' ');
+            for (const m of plain.matchAll(/.{0,240}(경쟁률|지원현황|competition|ratio).{0,420}/gi)) console.log(m[0]);
+          }
+          NODE
+
+      - name: Probe KOREATECH direct Uway ratio page
+        shell: bash
+        run: |
+          set -euo pipefail
+          UA='Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/140 Safari/537.36'
+          URL='http://ratio.uwayapply.com/Sl5KfExgMDhgfWE5SmYlJjomSjdmVGY='
+          curl -L --max-time 25 -sS -A "$UA" -H 'Accept-Language: ko-KR,ko;q=0.9' -D /tmp/krt.headers "$URL" -o /tmp/krt.body || true
+          echo '=== headers ==='
+          sed -n '1,30p' /tmp/krt.headers
+          echo "bytes=$(wc -c </tmp/krt.body)"
+          node <<'NODE'
+          const fs=require('fs');
+          const s=fs.readFileSync('/tmp/krt.body','utf8').replace(/\s+/g,' ');
+          console.log('title=',(s.match(/<title[^>]*>(.*?)<\/title>/i)||[])[1]||'');
+          console.log('signals=');
+          for (const m of s.matchAll(/.{0,220}(경쟁률|모집인원|지원인원|지원자|업데이트|갱신|분마다|분 단위).{0,420}/gi)) console.log(m[0]);
+          NODE
