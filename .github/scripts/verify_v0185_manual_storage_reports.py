@@ -35,7 +35,7 @@ required = {
     "auth-proof-cleared": 'private fun clearJinhakLegacyAuthState()' in main and '.remove("jinhakAuthProofCollectorVersion")' in main,
     "no-auth-proof-on-create": 'restoreJinhakAuthProofCheckpoint("activity-create")' not in main,
     "no-jinhak-session-keepalive": 'no Jinhak session keep-alive, measurement, or auth diagnostic exists' in main,
-    "route-only-batch-guard": 'if (JinhakManualStorageReportPolicy.isAllowedMissionUrl(current))' in main and '현재 고3 화면에서 탐색 시작/재개' not in main,
+    "route-only-batch-guard": 'private fun continueBatchAfterRenderedLoginGuard(url: String, attempt: Int)' in main and 'if (JinhakManualStorageReportPolicy.isAllowedMissionUrl(current)) {\n                scheduleBatchSnapshot()' in main and 'stopBatch("jinhak-left-manual-storage-report-scope")' in main,
     "auth-probe-ui-removed": 'text = "진학사 직접 탐색 안내"' in main,
     "runtime-auth-proof-not-persisted": '.remove("jinhakRealAuthProbeVerifiedAtMs")' in main and '.remove("jinhakAuthProofSafePath")' in main,
     "no-authenticated-evidence-label": 'authStateClass = "authenticated"' not in main,
