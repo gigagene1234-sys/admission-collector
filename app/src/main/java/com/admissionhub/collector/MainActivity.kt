@@ -199,6 +199,8 @@ class MainActivity : Activity() {
 
     private var lastJson: String = ""
     private var provider: ProviderId = ProviderId.ADIGA
+    private var jinhakBrowserSurfaceWebView: WebView? = null
+    private var jinhakBrowserSurfaceBatchMode: Boolean? = null
     private var lastJinhakDigest = JSONObject()
     private var unifiedSessionId: String? = null
     private var unifiedRunning = false
@@ -620,8 +622,8 @@ class MainActivity : Activity() {
         private const val PROCESS_HEARTBEAT_MS = 15_000L
         private const val PROCESS_JOURNAL_SCHEMA = 1
         private const val IMPORT_SCORE_REQUEST = 13130
-        private const val VERSION = "0.18.7"
-        private const val BUILD_CODE = 118700
+        private const val VERSION = "0.18.8"
+        private const val BUILD_CODE = 118800
         private const val LOCAL_FIRST_BETA = true
         private const val ADIGA_RETRY_SUSPENDED = false
     }
@@ -1571,18 +1573,44 @@ class MainActivity : Activity() {
         }
     }
     private fun configureJinhakBrowserSurface(batchMode: Boolean) {
-        if (provider != ProviderId.JINHAK || !::webView.isInitialized) return
-        webView.settings.apply {
-            if (JinhakPassiveBrowserSurfacePolicy.USE_DEFAULT_WEBVIEW_USER_AGENT) {
-                userAgentString = WebSettings.getDefaultUserAgent(this@MainActivity)
-            }
-            javaScriptCanOpenWindowsAutomatically = JinhakPassiveBrowserSurfacePolicy.automaticWindowsEnabled(batchMode)
-            setSupportMultipleWindows(JinhakPassiveBrowserSurfacePolicy.multipleWindowsEnabled(batchMode))
+        if (provider != ProviderId.JINHAK || !::webView.isInitialized || isFinishing || isDestroyed) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post { configureJinhakBrowserSurface(batchMode) }
+            return
         }
-        CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-            setAcceptThirdPartyCookies(webView, true)
-            if (JinhakPassiveBrowserSurfacePolicy.FLUSH_PROVIDER_COOKIES) flush()
+
+        val sameWebView = jinhakBrowserSurfaceWebView === webView
+        if (!JinhakPassiveBrowserSurfacePolicy.needsSurfaceReconfigure(
+                sameWebView = sameWebView,
+                previousBatchMode = jinhakBrowserSurfaceBatchMode,
+                requestedBatchMode = batchMode
+            )) return
+
+        val firstConfigurationForWebView = !sameWebView
+        runCatching {
+            webView.settings.apply {
+                val automaticWindows = JinhakPassiveBrowserSurfacePolicy.automaticWindowsEnabled(batchMode)
+                if (javaScriptCanOpenWindowsAutomatically != automaticWindows) {
+                    javaScriptCanOpenWindowsAutomatically = automaticWindows
+                }
+                setSupportMultipleWindows(JinhakPassiveBrowserSurfacePolicy.multipleWindowsEnabled(batchMode))
+            }
+            if (JinhakPassiveBrowserSurfacePolicy.applyPersistentBrowserIdentity(firstConfigurationForWebView)) {
+                CookieManager.getInstance().apply {
+                    setAcceptCookie(true)
+                    setAcceptThirdPartyCookies(webView, true)
+                    if (JinhakPassiveBrowserSurfacePolicy.FLUSH_PROVIDER_COOKIES) flush()
+                }
+            }
+            jinhakBrowserSurfaceWebView = webView
+            jinhakBrowserSurfaceBatchMode = batchMode
+        }.onFailure { error ->
+            recordRuntimeEvent(
+                "jinhak-browser-surface-config-failed",
+                JSONObject()
+                    .put("batchMode", batchMode)
+                    .put("error", error.javaClass.simpleName.take(80))
+            )
         }
     }
 
@@ -1716,11 +1744,9 @@ class MainActivity : Activity() {
             javaScriptCanOpenWindowsAutomatically = provider != ProviderId.JINHAK || batchRunning
             setSupportMultipleWindows(provider != ProviderId.JINHAK || batchRunning)
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            userAgentString = if (provider == ProviderId.JINHAK) {
-                WebSettings.getDefaultUserAgent(this@MainActivity)
-            } else {
-                WebSettings.getDefaultUserAgent(this@MainActivity) + " AdmissionCollector/$VERSION"
-            }
+            // Keep the main WebView identity stable for its entire lifetime.
+            // Switching UA after a page starts can trigger a reload/reinitialization cycle.
+            userAgentString = WebSettings.getDefaultUserAgent(this@MainActivity)
         }
 
         webView.webViewClient = object : WebViewClient() {
@@ -1843,7 +1869,6 @@ class MainActivity : Activity() {
                 runtimeLastSafePath = runtimeSafePath(url)
                 if (provider == ProviderId.JINHAK && !batchRunning) {
                     clearJinhakLegacyAuthState()
-                    configureJinhakBrowserSurface(batchMode = false)
                     return
                 }
                 if (provider == ProviderId.JINHAK) {
@@ -1902,7 +1927,6 @@ class MainActivity : Activity() {
 
                     if (!batchRunning) {
                         if (JinhakManualStorageReportPolicy.isStorageEntry(current)) {
-                            configureJinhakBrowserSurface(batchMode = false)
                             batchPausedForLogin = false
                             jinhakCoreBootstrapState = "manual-storage-visible"
                             sessionState.text = "● 수시 저장소 확인 · 리포트 탐색 시작"
@@ -1911,7 +1935,6 @@ class MainActivity : Activity() {
                                 if (provider == ProviderId.JINHAK && !batchRunning && JinhakManualStorageReportPolicy.isStorageEntry(webView.url)) startBatch()
                             }, 250L)
                         } else {
-                            configureJinhakBrowserSurface(batchMode = false)
                             sessionState.text = "○ 진학사 직접 탐색"
                             status.text = "직접 로그인한 뒤 수시 저장소까지 이동하세요. Admission Hub는 로그인·세션을 건드리지 않습니다."
                         }

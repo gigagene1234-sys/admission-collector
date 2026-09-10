@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.18.7 True Passive Manual Browser"
+        android:label="Admission Hub v0.18.8 Idempotent WebView Surface"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
