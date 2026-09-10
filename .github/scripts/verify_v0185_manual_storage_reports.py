@@ -32,13 +32,17 @@ required = {
     "report-agent-actions-on": 'var jinhakAllowAgentAction = true' in main,
     "legacy-storage-watch-not-authoritative": 'Manual-storage report mode is mission-driven' in main,
     "no-auth-inference": 'callback?.invoke(false, false)' in main and 'callback?.invoke(false, true)' not in main,
-    "auth-proof-cleared": 'private fun clearJinhakLegacyAuthState()' in main and '.remove("jinhakAuthProofCollectorVersion")' in main,
+    "auth-proof-cleared": main.count('private fun clearJinhakLegacyAuthState()') == 1 and '.remove("jinhakAuthProofCollectorVersion")' in main,
     "no-auth-proof-on-create": 'restoreJinhakAuthProofCheckpoint("activity-create")' not in main,
     "no-jinhak-session-keepalive": 'no Jinhak session keep-alive, measurement, or auth diagnostic exists' in main,
     "route-only-batch-guard": 'private fun continueBatchAfterRenderedLoginGuard(url: String, attempt: Int)' in main and 'if (JinhakManualStorageReportPolicy.isAllowedMissionUrl(current)) {\n                scheduleBatchSnapshot()' in main and 'stopBatch("jinhak-left-manual-storage-report-scope")' in main,
     "auth-probe-ui-removed": 'text = "진학사 직접 탐색 안내"' in main,
     "runtime-auth-proof-not-persisted": '.remove("jinhakRealAuthProbeVerifiedAtMs")' in main and '.remove("jinhakAuthProofSafePath")' in main,
     "no-authenticated-evidence-label": 'authStateClass = "authenticated"' not in main,
+    "current-evidence-no-auth-inference": 'val authStateClass = "user-viewed-no-auth-inference"' in main and 'sessionObj.optBoolean("authenticated"' not in main,
+    "batch-evidence-no-auth-inference": 'val batchAuthState = "user-viewed-no-auth-inference"' in main and 'batchSession.optBoolean("authenticated"' not in main,
+    "jinhak-open-does-not-flush-session": 'if (which != ProviderId.JINHAK) CookieManager.getInstance().flush()' in main,
+    "jinhak-refresh-does-not-probe-session": '진학사 로그인/세션 상태는 Admission Hub가 확인하지 않습니다.' in main,
 }
 
 failed = [name for name, ok in required.items() if not ok]
