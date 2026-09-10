@@ -1,0 +1,132 @@
+name: Build Admission Hub v0.13.3 Visible Jinhak Verify
+
+on:
+  push:
+    branches: [codex/competition-browser-v0133-visible-challenge]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0133-visible-jinhak
+  cancel-in-progress: false
+
+jobs:
+  patch-test-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      ANDROID_SIGNING_SECRET: ${{ secrets.ADMISSION_INGEST_TOKEN }}
+      APK_NAME: Admission-Hub-v0.13.3-Jinhak-Visible-Verify.apk
+      EXPECTED_SIGNER_SHA256: db6cd5efceda108657662d06f857e5f0277301cb6ab97a75c8a01994c96e4995
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply deterministic v0.13.3 visible challenge patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch_competition_browser_v0133_visible_challenge.py
+
+      - name: Persist patched product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add app/build.gradle.kts \
+              app/src/main/AndroidManifest.xml \
+              app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+              app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt \
+              app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserPolicy.kt
+            git commit -m "Show Jinhak security verification to user in v0.13.3"
+            git push origin HEAD:codex/competition-browser-v0133-visible-challenge
+          fi
+          echo "PRODUCT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify visible challenge and privacy contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          C=app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
+          grep -q 'AlertDialog' "$C"
+          grep -q 'showChallengeDialog' "$C"
+          grep -q 'USER_CHALLENGE_TIMEOUT_MS' "$C"
+          grep -q '안전 접속 확인 창 표시' "$C"
+          grep -q '로그인 정보·쿠키·세션 값은 서버로 전송하지 않습니다' "$C"
+          grep -q 'credentialExported.*false' "$C"
+          grep -q 'sessionSecretExported.*false' "$C"
+          grep -q 'location.origin+location.pathname' "$C"
+          grep -q 'countsMatch(quota,applicants,r)' "$C"
+          grep -q 'WebChromeClient' "$C"
+          grep -q 'USER_CHALLENGE_TIMEOUT_MS = 180_000L' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserPolicy.kt
+          grep -q 'versionName = "0.13.3"' app/build.gradle.kts
+          grep -q 'versionCode = 113300' app/build.gradle.kts
+          grep -q 'Admission Hub v0.13.3 Jinhak Visible Verify' app/src/main/AndroidManifest.xml
+          grep -q 'private const val VERSION = "0.13.3"' app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          grep -q 'private const val BUILD_CODE = 113300' app/src/main/java/com/admissionhub/collector/MainActivity.kt
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore stable signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_SECRET"
+          STORE_FILE="$RUNNER_TEMP/admission-upload.jks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ANDROID_SIGNING_SECRET -in signing/admission-upload.keystore.enc -out "$STORE_FILE"
+          keytool -list -keystore "$STORE_FILE" -storepass "$ANDROID_SIGNING_SECRET" -alias admission >/dev/null
+          echo "ADMISSION_SIGNING_STORE_FILE=$STORE_FILE" >> "$GITHUB_ENV"
+          echo "ADMISSION_SIGNING_PASSWORD=$ANDROID_SIGNING_SECRET" >> "$GITHUB_ENV"
+
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Run full unit test suite
+        run: gradle --no-daemon :app:testDebugUnitTest
+
+      - name: Compile stable-signed verification APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify signer and package v0.13.3 artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          apksigner verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
+          SIGNER=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' /tmp/apksigner.txt | tr -d '[:space:]')
+          test -n "$SIGNER"
+          test "$SIGNER" = "$EXPECTED_SIGNER_SHA256"
+          mkdir -p dist
+          cp "$APK" "dist/$APK_NAME"
+          (cd dist && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          cat > dist/verification-v0.13.3.json <<JSON
+          {
+            "productCommit": "$PRODUCT_SHA",
+            "versionName": "0.13.3",
+            "versionCode": 113300,
+            "feature": "visible Jinhak managed-challenge user verification",
+            "signerSha256": "$SIGNER",
+            "credentialExported": false,
+            "sessionSecretExported": false,
+            "jinhakDeviceAcceptance": "pending"
+          }
+          JSON
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.13.3-jinhak-visible-verify
+          path: |
+            dist/*
+            app/build/test-results/testDebugUnitTest/*.xml
