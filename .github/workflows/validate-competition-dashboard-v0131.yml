@@ -1,4 +1,4 @@
-name: Validate Competition Dashboard v0.13.1
+name: Validate Competition Dashboard v0.13.2
 
 on:
   push:
@@ -53,3 +53,33 @@ jobs:
             echo 'university drilldown must render the full latest competition snapshot' >&2
             exit 1
           fi
+      - name: Verify live Uway snapshots are full datasets
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://admission-collector-offload.gigagene1234.workers.dev/v1/competition/latest'
+          curl --fail --silent --show-error --retry 3 "$URL" > /tmp/latest.json
+          node <<'NODE'
+          const fs=require('fs');
+          const body=JSON.parse(fs.readFileSync('/tmp/latest.json','utf8'));
+          const byId=new Map((body.targets||[]).map(x=>[x.targetId,x]));
+          for (const id of ['woosong','koreatech']) {
+            const item=byId.get(id);
+            if (!item || !item.snapshot) throw new Error(`${id}: latest snapshot missing`);
+            const rows=Array.isArray(item.rows)?item.rows:[];
+            const declared=Number(item.snapshot.row_count||0);
+            console.log(`${id}: rows=${rows.length}, snapshot.row_count=${declared}`);
+            if (rows.length <= 1) throw new Error(`${id}: only ${rows.length} row(s), expected full competition table`);
+            if (declared !== rows.length) throw new Error(`${id}: row_count mismatch ${declared} != ${rows.length}`);
+            let numeric=0;
+            for (const r of rows) {
+              const q=Number(r.quota), a=Number(r.applicants), ratio=Number(r.ratio);
+              if (Number.isFinite(q)&&Number.isFinite(a)&&Number.isFinite(ratio)) {
+                numeric++;
+                const expected=q===0?0:a/q;
+                if (Math.abs(expected-ratio)>0.015) throw new Error(`${id}: ratio mismatch in ${r.department||'unknown row'}`);
+              }
+            }
+            if (!numeric) throw new Error(`${id}: no numeric rows found`);
+          }
+          NODE
