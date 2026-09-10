@@ -35,7 +35,7 @@ required = {
     "auth-proof-cleared": main.count('private fun clearJinhakLegacyAuthState()') == 1 and '.remove("jinhakAuthProofCollectorVersion")' in main,
     "no-auth-proof-on-create": 'restoreJinhakAuthProofCheckpoint("activity-create")' not in main,
     "no-jinhak-session-keepalive": 'no Jinhak session keep-alive, measurement, or auth diagnostic exists' in main,
-    "route-only-batch-guard": 'private fun continueBatchAfterRenderedLoginGuard(url: String, attempt: Int)' in main and 'if (JinhakManualStorageReportPolicy.isAllowedMissionUrl(current)) {\n                scheduleBatchSnapshot()' in main and 'stopBatch("jinhak-left-manual-storage-report-scope")' in main,
+    "route-only-rendered-login-guard": 'private fun continueBatchAfterRenderedLoginGuard(url: String, attempt: Int)' in main and 'if (JinhakManualStorageReportPolicy.isAllowedMissionUrl(current)) {\n                scheduleBatchSnapshot()' in main and 'stopBatch("jinhak-left-manual-storage-report-scope")' in main,
     "auth-probe-ui-removed": 'text = "진학사 직접 탐색 안내"' in main,
     "runtime-auth-proof-not-persisted": '.remove("jinhakRealAuthProbeVerifiedAtMs")' in main and '.remove("jinhakAuthProofSafePath")' in main,
     "no-authenticated-evidence-label": 'authStateClass = "authenticated"' not in main,
@@ -43,6 +43,11 @@ required = {
     "batch-evidence-no-auth-inference": 'val batchAuthState = "user-viewed-no-auth-inference"' in main and 'batchSession.optBoolean("authenticated"' not in main,
     "jinhak-open-does-not-flush-session": 'if (which != ProviderId.JINHAK) CookieManager.getInstance().flush()' in main,
     "jinhak-refresh-does-not-probe-session": '진학사 로그인/세션 상태는 Admission Hub가 확인하지 않습니다.' in main,
+    "begin-navigation-route-only": 'val visible = canonicalizeBatchUrl(webView.url.orEmpty())\n            if (!JinhakManualStorageReportPolicy.isAllowedMissionUrl(visible))' in main and 'enterJinhakUserSessionGate("v0174-begin-navigation-visible-high3-required")' not in main,
+    "resume-button-route-only": 'if (JinhakManualStorageReportPolicy.isStorageEntry(current)) {\n                if (!batchRunning) startBatch() else scheduleBatchSnapshot()' in main and 'confirmJinhakUserSessionAndResume("legacy-resume-button")' not in main,
+    "recovery-route-only": 'stopBatch("jinhak-recovery-outside-storage-report-scope")' in main and '진학사 세션 복구는 수행하지 않습니다.' in main,
+    "progress-fence-no-auth-proof": 'if (elapsed >= JINHAK_NO_PROGRESS_FENCE_MS && missionTargetCount > 0)' in main and 'shouldRunMissionStallFence(jinhakV0182ProtectedSessionVerified, missionTargetCount)' not in main,
+    "batch-state-no-auth-proof": 'jinhakCoreBootstrapState = "manual-storage-report-batch"' in main and 'if (provider == ProviderId.JINHAK && jinhakAuthVerifiedForBatch)' not in main,
 }
 
 failed = [name for name, ok in required.items() if not ok]
