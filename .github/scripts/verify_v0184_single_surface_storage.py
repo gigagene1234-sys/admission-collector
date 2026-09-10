@@ -29,6 +29,8 @@ require('return jinhakV0174BlockedResponse("dedicated-auth-route")' not in main,
 require('startV0180DedicatedJinhakAuth("collector-navigation-login")' not in main, "navigation login still rerouted")
 require('startV0180DedicatedJinhakAuth("collector-page-started-login")' not in main, "page-started login still rerouted")
 require('startV0180DedicatedJinhakAuth("collector-page-finished-login")' not in main, "page-finished login still rerouted")
+require('attemptV0180JinhakAuthAutofill(' not in main, "legacy authWebView autofill residue remains")
+require('legacy authWebView is inactive; same-surface autofill runs only in webView' in main, "legacy authWebView inert marker missing")
 require('V0184_SINGLE_SURFACE_LOGIN_VISIBLE' in main and 'V0184_SINGLE_SURFACE_LOGIN_READY' in main, "single-surface login lifecycle missing")
 require('if (JinhakStorageCompetitionPolicy.isStorageUrl(webView.url.orEmpty())) webView.reload()' in main, "same-surface periodic reload missing")
 
