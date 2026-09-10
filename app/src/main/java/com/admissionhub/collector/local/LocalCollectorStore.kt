@@ -1757,7 +1757,8 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
     fun scoreDecisionSummary(sessionId: String): JSONObject {
         val db = readableDatabase
         val fullProfile = currentStudentScoreProfile()
-        val candidates = loadCanonicalApplicationCandidates(sessionId)
+        val canonicalEvidenceSessionId = canonicalSessionForExactPinnedRebind(sessionId)
+        val candidates = loadCanonicalApplicationCandidates(canonicalEvidenceSessionId)
         val candidateById = (0 until candidates.length()).map { candidates.getJSONObject(it) }.associateBy { it.optString("applicationIdentityKey") }
         val slots = loadHubApplicationSlots()
         val selected = (0 until slots.length()).mapNotNull { slots.optJSONObject(it)?.optString("applicationIdentityKey") }.toSet()
@@ -1901,7 +1902,11 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
                     .put("officialOutcomeLabel", outcomeLabel)
                     .put("predictionLabel", predictionLabel)
                     .put("decisionLabel", decisionLabel)
-                val review = ApplicationReviewEngine.evaluate(candidateById[identity] ?: JSONObject(), loadApplicationReviewInput(identity), fullProfile, prediction, Instant.now())
+                val reviewCandidate = candidateById[identity] ?: JSONObject()
+                val reviewInput = loadApplicationReviewInput(identity)
+                    .put("applicationIdentityKey", identity)
+                    .put("academicYear", reviewCandidate.optInt("academicYear", 0))
+                val review = ApplicationReviewEngine.evaluate(reviewCandidate, reviewInput, fullProfile, prediction, Instant.now())
                 row.put("applicationReview", review).put("predictionLabel", SameCardPrediction.label(prediction))
                 val reviewInput = review.getJSONObject("input")
                 if (reviewInput.has("ownScore") && !reviewInput.isNull("ownScore")) row.put("conversionLabel", "대학 환산 입력: ${reviewInput.optDouble("ownScore")} · ${if (review.optBoolean("comparisonReady")) "사용자 근거 확인" else "확인 필요"}")
@@ -2603,21 +2608,35 @@ class LocalCollectorStore(context: Context) : SQLiteOpenHelper(
             .put("sessionSecretsRead", false)
     }
 
+    private fun canonicalSessionForExactPinnedRebind(sessionId: String): String {
+        if (sessionId.isBlank()) return sessionId
+        val pinned = pinnedHubSlotCount()
+        if (pinned <= 0) return sessionId
+        val matchedCurrent = readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM canonical_applications WHERE session_id=? AND application_identity_key IN (SELECT application_identity_key FROM hub_application_slots WHERE user_pinned=1)",
+            arrayOf(sessionId)
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+        if (matchedCurrent == pinned) return sessionId
+        return latestReusableCanonicalSessionId() ?: sessionId
+    }
+
     fun canonicalHubSummary(sessionId: String): JSONObject {
-        val candidates = loadCanonicalApplicationCandidates(sessionId)
+        val canonicalEvidenceSessionId = canonicalSessionForExactPinnedRebind(sessionId)
+        val candidates = loadCanonicalApplicationCandidates(canonicalEvidenceSessionId)
         val slots = loadHubApplicationSlots()
         val audit = readableDatabase.rawQuery(
             "SELECT audit_json FROM hub_quality_audits WHERE session_id=? LIMIT 1",
-            arrayOf(sessionId)
+            arrayOf(canonicalEvidenceSessionId)
         ).use { c ->
             if (c.moveToFirst()) runCatching { JSONObject(c.getString(0)) }.getOrNull() else null
         } ?: refreshCanonicalQualityAudit(sessionId)
         return JSONObject()
             .put("schemaVersion", 1)
             .put("candidateGraph", candidates)
+            .put("canonicalEvidenceSessionId", canonicalEvidenceSessionId)
             .put("slots", slots)
             .put("qualityAudit", audit)
-            .put("selectedRecoveryPlan", selectedSixRecoveryPlan(sessionId))
+            .put("selectedRecoveryPlan", selectedSixRecoveryPlan(canonicalEvidenceSessionId))
             .put("crossSessionContinuity", localRebindDecision())
             .put("slotPolicy", JSONObject()
                 .put("slots", CanonicalSixApplicationGraph.SLOT_COUNT)
