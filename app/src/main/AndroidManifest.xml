@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Admission Hub v0.13.0 Application Review"
+        android:label="Admission Hub v0.13.1 Live Competition"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">

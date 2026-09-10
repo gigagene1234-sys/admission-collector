@@ -298,6 +298,25 @@ class CloudOffloadCoordinator(context: Context) {
         }
     }
 
+    fun observeCompetition(
+        observation: JSONObject,
+        callback: (Result<JSONObject>) -> Unit = {}
+    ) {
+        if (!isConfigured()) {
+            callback(Result.failure(IllegalStateException("competition-cloud-not-configured")))
+            return
+        }
+        val currentClient = synchronized(lock) { ensureClientLocked(); client }
+        if (currentClient == null) {
+            callback(Result.failure(IllegalStateException("competition-cloud-client-unavailable")))
+            return
+        }
+        currentClient.observeCompetition(observation) { result ->
+            result.onFailure { lastError = it.message }
+            callback(result)
+        }
+    }
+
     fun pendingPages(callback: (Result<JSONObject>) -> Unit) {
         val runId = synchronized(lock) { activeRunId }
         val currentClient = synchronized(lock) { ensureClientLocked(); client }

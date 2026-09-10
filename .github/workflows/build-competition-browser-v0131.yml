@@ -1,0 +1,89 @@
+name: Build Admission Hub v0.13.1 Competition Browser
+
+on:
+  push:
+    branches: [codex/competition-browser-v0131]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: admission-hub-v0131-competition-browser
+  cancel-in-progress: true
+
+jobs:
+  patch-test-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply deterministic competition bridge patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch_competition_browser_v0131.py
+          python3 .github/scripts/patch_competition_browser_dom_v3.py
+
+      - name: Persist patched product source on feature branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add app/build.gradle.kts \
+              app/src/main/java/com/admissionhub/collector/MainActivity.kt \
+              app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadClient.kt \
+              app/src/main/java/com/admissionhub/collector/cloud/CloudOffloadCoordinator.kt \
+              app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
+            git commit -m "Wire validated competition browser collector into Admission Hub v0.13.1"
+            git push origin HEAD:codex/competition-browser-v0131
+          fi
+
+      - name: Verify privacy and source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'CompetitionBrowserCollector' app/src/main/java/com/admissionhub/collector/MainActivity.kt
+          grep -q 'credentialExported.*false' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
+          grep -q 'sessionSecretExported.*false' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
+          grep -q 'location.origin+location.pathname' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
+          grep -q 'countsMatch(quota,applicants,r)' app/src/main/java/com/admissionhub/collector/competition/CompetitionBrowserCollector.kt
+          grep -q 'versionName = "0.13.1"' app/build.gradle.kts
+          test -z "$(git status --porcelain)"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Run full unit test suite
+        run: gradle --no-daemon :app:testDebugUnitTest
+
+      - name: Compile debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Package build artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/Admission-Hub-v0.13.1-Competition-Browser-unsigned-test.apk
+          sha256sum dist/Admission-Hub-v0.13.1-Competition-Browser-unsigned-test.apk > dist/Admission-Hub-v0.13.1-Competition-Browser-unsigned-test.apk.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admission-hub-v0.13.1-competition-browser-test
+          path: |
+            dist/*
+            app/build/test-results/testDebugUnitTest/*.xml

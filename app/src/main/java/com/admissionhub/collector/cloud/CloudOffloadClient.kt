@@ -186,6 +186,13 @@ class CloudOffloadClient(
         })
     }
 
+    fun observeCompetition(
+        observation: JSONObject,
+        callback: (Result<JSONObject>) -> Unit = {}
+    ) = io.execute {
+        callback(runCatching { post("/v1/competition/observe", observation) })
+    }
+
     fun shutdown() {
         io.shutdownNow()
     }
