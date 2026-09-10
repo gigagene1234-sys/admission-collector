@@ -83,3 +83,10 @@ jobs:
             if (!numeric) throw new Error(`${id}: no numeric rows found`);
           }
           NODE
+      - name: Upload validated live competition snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: competition-live-snapshot-v0132
+          path: /tmp/latest.json
+          if-no-files-found: error
+          retention-days: 1
