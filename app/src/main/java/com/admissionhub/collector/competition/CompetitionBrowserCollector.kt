@@ -111,7 +111,7 @@ class CompetitionBrowserCollector(
         onStatus("경쟁률 수집 · ${target.university} 공개 페이지 확인 중")
         ensureWebView().loadUrl(target.sourceUrl)
         handler.postDelayed({
-            if (!destroyed && running && generation == pageGeneration) {
+            if (!destroyed && running && generation == pageGeneration && challengeDialog == null) {
                 onStatus("경쟁률 수집 · ${target.university} 페이지 시간 초과")
                 moveNextTarget()
             }
