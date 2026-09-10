@@ -1,6 +1,6 @@
 {
   "name": "admission-collector-offload",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,9 @@
     "types": "wrangler types",
     "db:migrate:local": "wrangler d1 migrations apply admission-collector-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply admission-collector-db --remote"
+  },
+  "dependencies": {
+    "iconv-lite": "^0.7.0"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
