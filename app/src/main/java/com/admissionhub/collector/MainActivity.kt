@@ -126,12 +126,8 @@ class MainActivity : Activity() {
             if (active && provider != ProviderId.JINHAK) {
                 attemptSessionExtension()
             } else if (active && provider == ProviderId.JINHAK) {
-                // v0.17.1: Jinhak session ownership belongs entirely to the user/browser.
-                // This timer records liveness only. It never checks, extends, rewrites, clicks,
-                // restores, captures, or otherwise changes the Jinhak authentication session.
-                jinhakSessionKeepAliveTicks += 1
-                if (!hasWindowFocus()) jinhakSessionKeepAliveBackgroundTicks += 1
-                persistJinhakAuthDiagnostics("user-owned-session-liveness-only")
+                // v0.18.5: no Jinhak session keep-alive, measurement, or auth diagnostic exists.
+                // Browser/provider session behavior is entirely outside Admission Hub.
             }
             handler.postDelayed(this, 45_000L)
         }
@@ -659,7 +655,8 @@ class MainActivity : Activity() {
         })
         configureWebView()
         initializeProcessResumeJournal()
-        restoreJinhakAuthProofCheckpoint("activity-create")
+        credentialVault.clear(ProviderId.JINHAK.wireName)
+        clearJinhakLegacyAuthState()
         val localDecision = localStore.localRebindDecision()
         val suppressInterruptedResume = localDecision.optBoolean("suppressInterruptedBrowserResume", false)
         if (suppressInterruptedResume) {
@@ -831,13 +828,12 @@ class MainActivity : Activity() {
             }
         }
         realJinhakAuthProbeButton = Button(this).apply {
-            text = "진학사 실제 로그인 진단"
+            text = "진학사 직접 탐색 안내"
             setOnClickListener {
-                if (jinhakRealAuthProbeActive) {
-                    finishJinhakRealAuthProbe("user-cancel", success = false)
-                } else {
-                    startJinhakRealAuthProbe(autoContinue = false, trigger = "manual-auth-probe")
-                }
+                credentialVault.clear(ProviderId.JINHAK.wireName)
+                clearJinhakLegacyAuthState()
+                sessionState.text = "○ 직접 로그인 · 수시 저장소 대기"
+                status.text = "진학사 사이트에서 직접 로그인하고 수시 저장소까지 이동하세요. 저장소가 열리면 대학·학과별 리포트 탐색을 자동 시작합니다."
             }
         }
         actions3.addView(unifiedButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -2390,8 +2386,8 @@ class MainActivity : Activity() {
 
     private fun checkSessionState(callback: ((Boolean, Boolean) -> Unit)? = null) {
         if (provider == ProviderId.JINHAK) {
-            // v0.17.0: Jinhak authentication is server-owned. No DOM/login/logout heuristic is run.
-            callback?.invoke(false, true)
+            // v0.18.5: Admission Hub does not infer Jinhak login state at all.
+            callback?.invoke(false, false)
             return
         }
         val js = """
@@ -2503,43 +2499,34 @@ class MainActivity : Activity() {
 
     private fun hasFreshJinhakProtectedCoreProof(): Boolean = false
 
+    private fun clearJinhakLegacyAuthState() {
+        val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
+        prefs.edit()
+            .remove("jinhakAuthProofCollectorVersion")
+            .remove("jinhakRealAuthProbeResult")
+            .remove("jinhakRealAuthProbeVerifiedAtMs")
+            .remove("jinhakLastCoreVerifiedAtMs")
+            .remove("jinhakLastAuthEvidence")
+            .remove("jinhakAuthProofSafePath")
+            .apply()
+        jinhakAuthVerifiedForBatch = false
+        jinhakV0182ProtectedSessionVerified = false
+        jinhakUserSessionConfirmed = false
+        jinhakTransitionAuthGateActive = false
+        jinhakRealAuthProbeActive = false
+        jinhakRealAuthResumeGatePending = false
+        jinhakLastCoreVerifiedAtMs = 0L
+        jinhakRealAuthProbeVerifiedAtMs = 0L
+        jinhakLastAuthEvidence = "manual-browser-no-auth-inference"
+    }
+
     private fun persistJinhakAuthProofCheckpoint(synchronous: Boolean = false) {
-        runCatching {
-            val editor = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
-                .putString("jinhakAuthProofCollectorVersion", VERSION)
-                .putString("jinhakRealAuthProbeResult", jinhakRealAuthProbeResult.take(80))
-                .putLong("jinhakRealAuthProbeVerifiedAtMs", jinhakRealAuthProbeVerifiedAtMs)
-                .putLong("jinhakLastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
-                .putString("jinhakLastAuthEvidence", jinhakLastAuthEvidence.take(80))
-                .putString("jinhakAuthProofSafePath", runtimeSafePath(webView.url).take(300))
-                .putBoolean("credentialExported", false)
-                .putBoolean("sessionSecretExported", false)
-            if (synchronous) editor.commit() else editor.apply()
-        }
+        clearJinhakLegacyAuthState()
     }
 
     private fun restoreJinhakAuthProofCheckpoint(trigger: String): Boolean {
-        val prefs = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE)
-        if (prefs.getString("jinhakAuthProofCollectorVersion", "") != VERSION) return false
-        val restoredProbeResult = prefs.getString("jinhakRealAuthProbeResult", "never-run").orEmpty().take(80)
-        val restoredProbeAt = prefs.getLong("jinhakRealAuthProbeVerifiedAtMs", 0L)
-        val restoredCoreAt = prefs.getLong("jinhakLastCoreVerifiedAtMs", 0L)
-        val restoredEvidence = prefs.getString("jinhakLastAuthEvidence", "none").orEmpty().take(80)
-        if (restoredProbeAt > jinhakRealAuthProbeVerifiedAtMs) {
-            jinhakRealAuthProbeVerifiedAtMs = restoredProbeAt
-            jinhakRealAuthProbeResult = restoredProbeResult.ifBlank { "never-run" }
-        }
-        if (restoredCoreAt > jinhakLastCoreVerifiedAtMs) {
-            jinhakLastCoreVerifiedAtMs = restoredCoreAt
-            jinhakLastAuthEvidence = restoredEvidence.ifBlank { "none" }
-        }
-        val fresh = hasFreshJinhakProtectedCoreProof()
-        if (fresh) {
-            jinhakAuthVerifiedForBatch = true
-            jinhakCoreBootstrapState = "protected-core-checkpoint-restored"
-            jinhakAuthProofRestores += 1
-        }
-        return fresh
+        clearJinhakLegacyAuthState()
+        return false
     }
 
     private fun initializeProcessResumeJournal() {
@@ -2680,12 +2667,12 @@ class MainActivity : Activity() {
                 .putInt("batchPageCount", batchPageCount)
                 .putInt("queueSize", batchQueue.size)
                 .putInt("errorCount", batchErrors.length())
-                .putString("jinhakAuthProofCollectorVersion", VERSION)
-                .putString("jinhakRealAuthProbeResult", jinhakRealAuthProbeResult.take(80))
-                .putLong("jinhakRealAuthProbeVerifiedAtMs", jinhakRealAuthProbeVerifiedAtMs)
-                .putLong("jinhakLastCoreVerifiedAtMs", jinhakLastCoreVerifiedAtMs)
-                .putString("jinhakLastAuthEvidence", jinhakLastAuthEvidence.take(80))
-                .putString("jinhakAuthProofSafePath", runtimeSafePath(webView.url).take(300))
+                .remove("jinhakAuthProofCollectorVersion")
+                .remove("jinhakRealAuthProbeResult")
+                .remove("jinhakRealAuthProbeVerifiedAtMs")
+                .remove("jinhakLastCoreVerifiedAtMs")
+                .remove("jinhakLastAuthEvidence")
+                .remove("jinhakAuthProofSafePath")
                 .apply()
         }
         if (provider == ProviderId.JINHAK && unifiedRunning && unifiedPhase == "jinhak") {
@@ -6487,7 +6474,7 @@ class MainActivity : Activity() {
                     safeRouteKey = safeRoute,
                     pageTypeGuess = pageType,
                     pageTypeConfidence = if (pageType == "jinhak-other") 0.25 else 0.90,
-                    authStateClass = "authenticated",
+                    authStateClass = "user-viewed-no-auth-inference",
                     explicitContext = explicitContext,
                     evidence = digest,
                     captureVersion = VERSION
@@ -6661,23 +6648,13 @@ class MainActivity : Activity() {
         if (!batchRunning || batchPausedForLogin) return
         if (provider == ProviderId.JINHAK) {
             val current = webView.url.orEmpty()
-            when (JinhakStrictHigh3Sandbox.decision(current)) {
-                JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_HIGH3 -> {
-                    if (!jinhakUserSessionConfirmed) {
-                        batchPausedForLogin = true
-                        hideBatchCover()
-                        jinhakSessionConfirmButton.text = "현재 고3 화면에서 탐색 시작/재개"
-                        sessionState.text = "● 고3 화면 확인 · 사용자 승인 대기"
-                    } else {
-                        scheduleBatchSnapshot()
-                    }
-                }
-                JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_MEMBER_LOGIN -> enterJinhakUserSessionGate("v0174-batch-member-login")
-                JinhakStrictHigh3Sandbox.MainFrameDecision.ALLOW_BLANK -> {
-                    batchPausedForLogin = true
-                    hideBatchCover()
-                }
-                else -> blockJinhakV0174MainFrame("v0174-batch-rendered-guard", current, JinhakStrictHigh3Sandbox.decision(current))
+            if (JinhakManualStorageReportPolicy.isAllowedMissionUrl(current)) {
+                scheduleBatchSnapshot()
+            } else {
+                batchPausedForLogin = false
+                stopBatch("jinhak-left-manual-storage-report-scope")
+                sessionState.text = "○ 수시 저장소 직접 재진입 필요"
+                status.text = "진학사 로그인/세션은 Admission Hub가 처리하지 않습니다. 수시 저장소로 직접 돌아오면 리포트 탐색을 다시 시작합니다."
             }
             return
         }
