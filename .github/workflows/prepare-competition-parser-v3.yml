@@ -1,0 +1,44 @@
+name: Prepare Competition Parser v3
+
+on:
+  push:
+    branches: [codex/competition-parser-v3]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: competition-parser-v3
+  cancel-in-progress: true
+
+jobs:
+  patch-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply parser patch
+        run: python3 .github/scripts/patch_competition_parser_v3.py
+      - name: Validate patched source
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check cloudflare/src/competition_v2.js
+          grep -q 'sourceUpdatedAt: headerTimestamp || textTimestamp' cloudflare/src/competition_v2.js
+          grep -q 'ratioMatchesCounts(quota, applicants, ratio)' cloudflare/src/competition_v2.js
+          grep -q 'markTargetWaitingForUserBrowser' cloudflare/src/competition_v2.js
+          grep -q "DELETE FROM competition_snapshots WHERE provider = 'UWAY_APPLY'" cloudflare/migrations/0006_competition_parser_v3_reset.sql
+      - name: Persist patched source on branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add cloudflare/src/competition_v2.js
+            git commit -m 'Fix competition parser column alignment and source timestamps'
+            git push origin HEAD:codex/competition-parser-v3
+          fi
