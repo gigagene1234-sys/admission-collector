@@ -14,20 +14,35 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      ADMISSION_INGEST_TOKEN: ${{ secrets.ADMISSION_INGEST_TOKEN }}
     steps:
-      - name: Check collector status and latest snapshots
+      - name: Force one collection and inspect snapshots
         shell: bash
         run: |
           set -euo pipefail
           BASE="https://admission-collector-offload.gigagene1234.workers.dev"
+          if [ -z "${ADMISSION_INGEST_TOKEN:-}" ]; then
+            echo "Missing ADMISSION_INGEST_TOKEN" >&2
+            exit 1
+          fi
+
+          echo "=== COLLECT ==="
+          curl --retry 3 --retry-delay 2 --retry-all-errors --fail --silent --show-error \
+            -X POST "$BASE/v1/competition/collect?force=1" \
+            -H "Authorization: Bearer $ADMISSION_INGEST_TOKEN" | tee /tmp/collect.json
+          echo
+
           echo "=== STATUS ==="
           curl --retry 4 --retry-delay 2 --retry-all-errors --fail --silent --show-error "$BASE/v1/competition/status" | tee /tmp/status.json
           echo
           echo "=== LATEST ==="
           curl --retry 4 --retry-delay 2 --retry-all-errors --fail --silent --show-error "$BASE/v1/competition/latest" | tee /tmp/latest.json
           echo
+
           node <<'NODE'
           const fs = require('fs');
+          const collect = JSON.parse(fs.readFileSync('/tmp/collect.json', 'utf8'));
           const status = JSON.parse(fs.readFileSync('/tmp/status.json', 'utf8'));
           const latest = JSON.parse(fs.readFileSync('/tmp/latest.json', 'utf8'));
           if (!Array.isArray(status.targets) || status.targets.length !== 6) {
@@ -36,7 +51,9 @@ jobs:
           if (!Array.isArray(latest.targets) || latest.targets.length !== 6) {
             throw new Error(`expected 6 latest target entries, got ${latest.targets?.length}`);
           }
-          console.log('\n=== SUMMARY ===');
+          console.log('\n=== COLLECTION SUMMARY ===');
+          for (const x of collect.results || []) console.log(JSON.stringify(x));
+          console.log('\n=== TARGET SUMMARY ===');
           for (const t of status.targets) {
             const l = latest.targets.find(x => x.targetId === t.targetId);
             console.log(JSON.stringify({
