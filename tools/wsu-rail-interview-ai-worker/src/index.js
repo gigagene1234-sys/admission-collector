@@ -1,5 +1,5 @@
-const GROQ_MODEL = "openai/gpt-oss-120b";
-const GEMINI_MODEL = "gemini-3.7-flash";
+const WORKERS_AI_MODEL = "@cf/openai/gpt-oss-120b";
+const WORKERS_AI_FALLBACK_MODEL = "@cf/openai/gpt-oss-20b";
 
 const ALLOWED_ORIGINS = new Set([
   "https://wsu-rail-interview-33.vercel.app",
@@ -24,12 +24,11 @@ export default {
           service: "wsu-interview-ai",
           version: "1.0.0",
           providers: {
-            groq: Boolean(env.GROQ_API_KEY),
-            gemini: Boolean(env.GEMINI_API_KEY),
+            workersAI: Boolean(env.AI),
           },
           models: {
-            groq: GROQ_MODEL,
-            gemini: GEMINI_MODEL,
+            primary: WORKERS_AI_MODEL,
+            fallback: WORKERS_AI_FALLBACK_MODEL,
           },
         },
         200,
@@ -70,43 +69,33 @@ export default {
     }
 
     const prompt = buildPrompt(input);
-    const failures = [];
 
-    // 개인정보가 포함될 수 있는 생기부 데이터 특성상 Groq를 1순위로 사용합니다.
-    // Groq 공식 정책상 일반 추론 입력/출력은 기본적으로 학습에 사용되지 않습니다.
-    if (env.GROQ_API_KEY) {
-      try {
-        const result = await callGroq(prompt, env.GROQ_API_KEY);
-        return json({ source: "groq", model: GROQ_MODEL, ...result }, 200, request);
-      } catch (error) {
-        failures.push(`groq: ${String(error?.message || error)}`);
-        console.error("Groq failed", error);
-      }
+    if (!env.AI) {
+      return json({ error: "Cloudflare Workers AI binding이 설정되지 않았습니다." }, 503, request);
     }
 
-    // Gemini 무료 티어는 Google 제품 개선에 데이터가 사용될 수 있으므로 폴백으로만 사용합니다.
-    if (env.GEMINI_API_KEY) {
-      try {
-        const result = await callGemini(prompt, env.GEMINI_API_KEY);
-        return json({ source: "gemini", model: GEMINI_MODEL, ...result }, 200, request);
-      } catch (error) {
-        failures.push(`gemini: ${String(error?.message || error)}`);
-        console.error("Gemini failed", error);
-      }
+    try {
+      const { model, result } = await callWorkersAI(prompt, env.AI);
+      return json(
+        {
+          source: "cloudflare-workers-ai",
+          model,
+          ...result,
+        },
+        200,
+        request
+      );
+    } catch (error) {
+      console.error("Cloudflare Workers AI failed", error);
+      return json(
+        {
+          error: "AI 수정안 생성에 실패했습니다.",
+          diagnostics: [compact(error?.message || error)],
+        },
+        502,
+        request
+      );
     }
-
-    if (!env.GROQ_API_KEY && !env.GEMINI_API_KEY) {
-      return json({ error: "AI 공급자 API 키가 설정되지 않았습니다." }, 503, request);
-    }
-
-    return json(
-      {
-        error: "AI 수정안 생성에 실패했습니다.",
-        diagnostics: failures.slice(0, 2),
-      },
-      502,
-      request
-    );
   },
 };
 
@@ -214,73 +203,48 @@ ${recordsText}
 }`;
 }
 
-async function callGroq(prompt, apiKey) {
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
+async function callWorkersAI(prompt, ai) {
+  const messages = [
+    {
+      role: "system",
+      content: "입시 면접 답안을 근거 기반으로 첨삭합니다. 반드시 순수 JSON 객체만 반환하세요.",
     },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      messages: [
-        {
-          role: "system",
-          content: "입시 면접 답안을 근거 기반으로 첨삭합니다. 반드시 순수 JSON 객체만 반환하세요.",
-        },
-        { role: "user", content: prompt },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.25,
-    }),
-  });
+    { role: "user", content: prompt },
+  ];
 
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`Groq API ${response.status}: ${compact(raw)}`);
+  const models = [WORKERS_AI_MODEL, WORKERS_AI_FALLBACK_MODEL];
+  let lastError;
+
+  for (const model of models) {
+    try {
+      const data = await ai.run(model, {
+        messages,
+        max_tokens: 1800,
+        temperature: 0.2,
+      });
+
+      const text =
+        typeof data?.response === "string"
+          ? data.response
+          : typeof data === "string"
+            ? data
+            : "";
+
+      if (!text) {
+        throw new Error(`${model} 응답 내용 없음`);
+      }
+
+      return {
+        model,
+        result: normalizeModelResult(parseJsonObject(text)),
+      };
+    } catch (error) {
+      lastError = error;
+      console.error(`Workers AI model failed: ${model}`, error);
+    }
   }
 
-  let data;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    throw new Error("Groq 응답 JSON 파싱 실패");
-  }
-
-  const text = data?.choices?.[0]?.message?.content;
-  if (!text) throw new Error("Groq 응답 내용 없음");
-  return normalizeModelResult(parseJsonObject(text));
-}
-
-async function callGemini(prompt, apiKey) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        responseMimeType: "application/json",
-        temperature: 0.25,
-      },
-    }),
-  });
-
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`Gemini API ${response.status}: ${compact(raw)}`);
-  }
-
-  let data;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    throw new Error("Gemini 응답 JSON 파싱 실패");
-  }
-
-  const text = data?.candidates?.[0]?.content?.parts?.map((part) => part?.text || "").join("");
-  if (!text) throw new Error("Gemini 응답 내용 없음");
-  return normalizeModelResult(parseJsonObject(text));
+  throw lastError || new Error("Workers AI 모델 호출 실패");
 }
 
 function parseJsonObject(text) {
