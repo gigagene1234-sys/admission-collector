@@ -22,7 +22,7 @@ export default {
         {
           ok: true,
           service: "wsu-interview-ai",
-          version: "1.0.0",
+          version: "1.1.0",
           providers: {
             workersAI: Boolean(env.AI),
           },
