@@ -1,5 +1,5 @@
-const WORKERS_AI_MODEL = "@cf/openai/gpt-oss-120b";
-const WORKERS_AI_FALLBACK_MODEL = "@cf/openai/gpt-oss-20b";
+const WORKERS_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const WORKERS_AI_FALLBACK_MODEL = "@cf/openai/gpt-oss-120b";
 
 const ALLOWED_ORIGINS = new Set([
   "https://wsu-rail-interview-33.vercel.app",
@@ -22,7 +22,7 @@ export default {
         {
           ok: true,
           service: "wsu-interview-ai",
-          version: "1.1.0",
+          version: "1.2.0",
           providers: {
             workersAI: Boolean(env.AI),
           },
@@ -217,19 +217,38 @@ async function callWorkersAI(prompt, ai) {
 
   for (const model of models) {
     try {
-      const data = await ai.run(model, {
+      const options = {
         messages,
         max_tokens: 1800,
         temperature: 0.2,
-      });
+      };
 
-      const text =
-        typeof data?.response === "string"
-          ? data.response
-          : typeof data === "string"
-            ? data
-            : "";
+      if (model === WORKERS_AI_MODEL) {
+        options.response_format = {
+          type: "json_schema",
+          json_schema: {
+            type: "object",
+            properties: {
+              assessment: { type: "string" },
+              caution: { type: "string" },
+              revisedAnswer: { type: "string" },
+            },
+            required: ["assessment", "caution", "revisedAnswer"],
+          },
+        };
+      }
 
+      const data = await ai.run(model, options);
+      const response = data?.response ?? data;
+
+      if (response && typeof response === "object" && !Array.isArray(response)) {
+        return {
+          model,
+          result: normalizeModelResult(response),
+        };
+      }
+
+      const text = typeof response === "string" ? response : "";
       if (!text) {
         throw new Error(`${model} 응답 내용 없음`);
       }
