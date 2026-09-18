@@ -8,6 +8,7 @@ on:
     paths:
       - "tools/wsu-rail-interview-ai-worker/src/**"
       - "tools/wsu-rail-interview-ai-worker/generate-v1.3.mjs"
+      - "tools/wsu-rail-interview-ai-worker/ai-ui.js"
       - "tools/wsu-rail-interview-ai-worker/package.json"
       - "tools/wsu-rail-interview-ai-worker/wrangler.toml"
       - ".github/workflows/deploy-wsu-interview-ai-worker.yml"
@@ -133,6 +134,17 @@ jobs:
           if (j.models?.verifier !== '@cf/meta/llama-3.3-70b-instruct-fp8-fast') process.exit(1);
           if (JSON.stringify(j).toLowerCase().includes('gemini')) process.exit(1);
           NODE
+
+      - name: Smoke test deployed app UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --max-time 60 --silent --show-error "$WORKER_URL/" -o /tmp/app.html
+          grep -q '/ai-ui.js' /tmp/app.html
+          curl --max-time 60 --silent --show-error "$WORKER_URL/ai-ui.js" -o /tmp/ai-ui.js
+          grep -q 'AI 답안 수정' /tmp/ai-ui.js
+          grep -q "fetch('/api/rewrite'" /tmp/ai-ui.js
+          grep -q '이 수정안 적용' /tmp/ai-ui.js
 
       - name: Smoke test rewrite endpoint
         shell: bash
