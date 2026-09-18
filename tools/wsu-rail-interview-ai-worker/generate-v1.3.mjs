@@ -76,6 +76,8 @@ const twoModelFetch = [
   "        models: { generation: GLM_MODEL, verifier: LLAMA_MODEL },",
   "      }, 200, request);",
   "    }",
+  "    if (request.method === \"GET\" && url.pathname === \"/\") return serveInterviewApp(request);",
+  "    if (request.method === \"GET\" && url.pathname === \"/ai-ui.js\") return new Response(AI_UI_JS, { status: 200, headers: { \"Content-Type\": \"application/javascript; charset=utf-8\", \"Cache-Control\": \"no-store, max-age=0\" } });",
   "    if (url.pathname !== \"/api/rewrite\") return json({ error: \"Not found\" }, 404, request);",
   "    if (request.method !== \"POST\") return json({ error: \"POST만 지원합니다.\" }, 405, request);",
   "    const origin = request.headers.get(\"Origin\");",
@@ -201,6 +203,25 @@ const twoModelRiskSupport = [
 ].join("\n");
 
 if (!sourceText.includes("function assessRisk(")) sourceText += "\n\n" + twoModelRiskSupport;
+
+const aiUiScript = fs.readFileSync(new URL("./ai-ui.js", import.meta.url), "utf8");
+const appProxySupport = [
+  "const UPSTREAM_INTERVIEW_APP = 'https://wsu-rail-interview-33.vercel.app/';",
+  "const AI_UI_JS = " + JSON.stringify(aiUiScript) + ";",
+  "",
+  "async function serveInterviewApp(request) {",
+  "  const upstream = await fetch(UPSTREAM_INTERVIEW_APP, { headers: { 'User-Agent': 'WSU-Interview-AI-Proxy/1.4' } });",
+  "  if (!upstream.ok) return new Response('Upstream interview app unavailable', { status: 502 });",
+  "  const html = await upstream.text();",
+  "  const injected = html.includes('/ai-ui.js') ? html : html.replace('</body>', '<script src=\\"/ai-ui.js\\"></script></body>');",
+  "  return new Response(injected, {",
+  "    status: 200,",
+  "    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, max-age=0', 'X-Content-Type-Options': 'nosniff' },",
+  "  });",
+  "}",
+].join("\n");
+sourceText += "\n\n" + appProxySupport;
+
 const requiredRuntimeFunctions = ["normalizeRequest","assessRisk","mergeRisk","callGLM","callLlamaDirect","callLlamaVerifier","looksComplete","compact","handleOptions","json"];
 for (const fn of requiredRuntimeFunctions) {
   const present = sourceText.includes("function " + fn + "(") || sourceText.includes("async function " + fn + "(");
