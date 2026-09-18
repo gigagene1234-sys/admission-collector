@@ -8,18 +8,22 @@ const rawHash = crypto.createHash("sha256").update(rawSource).digest("hex");
 const expected = "b2acf745d6a381ee533f23084a6cfc8df70ffa6aaf6c0c9488ecab0d2a646432";
 if (rawHash !== expected) throw new Error(`Generated Worker source hash mismatch: ${rawHash}`);
 
-const oldExtractor = "const response = data?.response ?? data;";
-const newExtractor = "const response = data?.response ?? data?.choices?.[0]?.message?.content ?? data;";
+const parserMarker = "function parseModelPayload(";
 let sourceText = rawSource.toString("utf8");
-if (!sourceText.includes(oldExtractor)) {
-  const start = sourceText.indexOf("async function callGLM");
-  console.log("=== callGLM diagnostic ===");
-  console.log(sourceText.slice(start, start + 5000));
-  console.log("=== end diagnostic ===");
-  throw new Error("GLM response extractor patch target not found");
+if (!sourceText.includes(parserMarker)) {
+  throw new Error("parseModelPayload function not found");
 }
-sourceText = sourceText.replaceAll(oldExtractor, newExtractor).replaceAll("1.3.1", "1.3.2");
+sourceText = sourceText.replace(parserMarker, "function parseModelPayloadBase(");
+sourceText = sourceText.replaceAll("1.3.1", "1.3.3");
+sourceText += `
+
+function parseModelPayload(value) {
+  const choiceContent = value?.choices?.[0]?.message?.content;
+  if (choiceContent != null) return parseModelPayloadBase(choiceContent);
+  return parseModelPayloadBase(value);
+}
+`;
 const source = Buffer.from(sourceText, "utf8");
 const hash = crypto.createHash("sha256").update(source).digest("hex");
 fs.writeFileSync(new URL("./src/index.js", import.meta.url), source);
-console.log(`Generated src/index.js v1.3.2 (${source.length} bytes, sha256 ${hash})`);
+console.log(`Generated src/index.js v1.3.3 (${source.length} bytes, sha256 ${hash})`);
