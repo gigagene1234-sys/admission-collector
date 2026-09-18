@@ -14,8 +14,53 @@ if (!sourceText.includes(parserMarker)) {
   throw new Error("parseModelPayload function not found");
 }
 sourceText = sourceText.replace(parserMarker, "function parseModelPayloadBase(");
-sourceText = sourceText.replaceAll("1.3.1", "1.3.3");
+const glmMessagesMarker = "        messages,\n        reasoning_effort:";
+if (!sourceText.includes(glmMessagesMarker)) {
+  throw new Error("GLM options patch target not found");
+}
+sourceText = sourceText.replace(
+  glmMessagesMarker,
+  "        messages,\n        tools: [revisionToolSchema()],\n        tool_choice: \"required\",\n        reasoning_effort:"
+);
+const glmParserMarker = "      const parsed = parseModelPayload(data);";
+if (!sourceText.includes(glmParserMarker)) {
+  throw new Error("GLM parser call patch target not found");
+}
+sourceText = sourceText.replace(glmParserMarker, "      const parsed = parseGLMToolPayload(data);");
+sourceText = sourceText.replaceAll("1.3.1", "1.3.4");
 sourceText += `
+
+function revisionToolSchema() {
+  return {
+    name: "submit_revision",
+    description: "면접 답안 수정 결과를 구조화해서 제출합니다.",
+    parameters: {
+      type: "object",
+      properties: {
+        assessment: { type: "string" },
+        caution: { type: "string" },
+        revisedAnswer: { type: "string" },
+        riskFlags: { type: "array", items: { type: "string" } }
+      },
+      required: ["assessment", "caution", "revisedAnswer", "riskFlags"]
+    }
+  };
+}
+
+function parseGLMToolPayload(value) {
+  const calls = Array.isArray(value?.tool_calls)
+    ? value.tool_calls
+    : Array.isArray(value?.choices?.[0]?.message?.tool_calls)
+      ? value.choices[0].message.tool_calls
+      : [];
+  const call = calls.find((item) =>
+    item?.name === "submit_revision" || item?.function?.name === "submit_revision"
+  ) || calls[0];
+  const args = call?.arguments ?? call?.function?.arguments;
+  if (args && typeof args === "object") return args;
+  if (typeof args === "string" && args.trim()) return JSON.parse(args);
+  return parseModelPayload(value);
+}
 
 function parseModelPayload(value) {
   const choiceContent = value?.choices?.[0]?.message?.content;
@@ -26,4 +71,4 @@ function parseModelPayload(value) {
 const source = Buffer.from(sourceText, "utf8");
 const hash = crypto.createHash("sha256").update(source).digest("hex");
 fs.writeFileSync(new URL("./src/index.js", import.meta.url), source);
-console.log(`Generated src/index.js v1.3.3 (${source.length} bytes, sha256 ${hash})`);
+console.log(`Generated src/index.js v1.3.4 (${source.length} bytes, sha256 ${hash})`);
