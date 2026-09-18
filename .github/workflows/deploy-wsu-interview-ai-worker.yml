@@ -138,6 +138,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          (
+            cd tools/wsu-rail-interview-ai-worker
+            timeout 90s npx wrangler tail wsu-interview-ai --format json > /tmp/wsu-tail.log 2>&1 || true
+          ) &
+          TAIL_PID=$!
+          sleep 4
           HTTP_CODE="$(curl --max-time 180 --retry 1 --retry-delay 2 --silent --show-error \
             -o /tmp/rewrite.json -w '%{http_code}' \
             -X POST "$WORKER_URL/api/rewrite" \
@@ -146,6 +152,12 @@ jobs:
           cat /tmp/rewrite.json
           echo
           echo "rewrite HTTP $HTTP_CODE"
+          sleep 3
+          kill "$TAIL_PID" 2>/dev/null || true
+          wait "$TAIL_PID" 2>/dev/null || true
+          echo "----- Worker tail -----"
+          cat /tmp/wsu-tail.log 2>/dev/null || true
+          echo "----- End Worker tail -----"
           if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
             exit 1
           fi
