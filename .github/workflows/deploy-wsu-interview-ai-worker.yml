@@ -7,6 +7,7 @@ on:
       - wsu-interview-web
     paths:
       - "tools/wsu-rail-interview-ai-worker/src/**"
+      - "tools/wsu-rail-interview-ai-worker/generate-v1.3.mjs"
       - "tools/wsu-rail-interview-ai-worker/package.json"
       - "tools/wsu-rail-interview-ai-worker/wrangler.toml"
       - ".github/workflows/deploy-wsu-interview-ai-worker.yml"
