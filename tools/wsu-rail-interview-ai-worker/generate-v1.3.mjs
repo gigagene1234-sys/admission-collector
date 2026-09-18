@@ -8,67 +8,57 @@ const rawHash = crypto.createHash("sha256").update(rawSource).digest("hex");
 const expected = "b2acf745d6a381ee533f23084a6cfc8df70ffa6aaf6c0c9488ecab0d2a646432";
 if (rawHash !== expected) throw new Error(`Generated Worker source hash mismatch: ${rawHash}`);
 
-const parserMarker = "function parseModelPayload(";
 let sourceText = rawSource.toString("utf8");
-if (!sourceText.includes(parserMarker)) {
-  throw new Error("parseModelPayload function not found");
-}
-sourceText = sourceText.replace(parserMarker, "function parseModelPayloadBase(");
-const glmMessagesMarker = "        messages,\n        reasoning_effort:";
-if (!sourceText.includes(glmMessagesMarker)) {
-  throw new Error("GLM options patch target not found");
-}
+
+const glmPromptMarker = '{ role: "user", content: buildGLMPrompt(input) },';
+if (!sourceText.includes(glmPromptMarker)) throw new Error("GLM prompt patch target not found");
 sourceText = sourceText.replace(
-  glmMessagesMarker,
-  "        messages,\n        tools: [revisionToolSchema()],\n        tool_choice: \"required\",\n        reasoning_effort:"
+  glmPromptMarker,
+  '{ role: "user", content: buildGLMTextPrompt(input) },'
 );
-const glmParserMarker = "      const parsed = parseModelPayload(data);";
-if (!sourceText.includes(glmParserMarker)) {
-  throw new Error("GLM parser call patch target not found");
-}
-sourceText = sourceText.replace(glmParserMarker, "      const parsed = parseGLMToolPayload(data);");
-sourceText = sourceText.replaceAll("1.3.1", "1.3.4");
+
+const glmParseBlock = `      const parsed = parseModelPayload(data);
+      const normalized = normalizeDraftResult(parsed);
+      if (!normalized.revisedAnswer) throw new Error("GLM이 revisedAnswer를 반환하지 않았습니다.");
+
+      return normalized;`;
+const glmTextBlock = `      const revisedAnswer = extractModelText(data);
+      if (!revisedAnswer) throw new Error("GLM이 수정 답안 본문을 반환하지 않았습니다.");
+
+      return {
+        assessment: "요청의 핵심과 기존 답안을 바탕으로 기본 첨삭을 수행했습니다.",
+        caution: "",
+        revisedAnswer,
+        riskFlags: []
+      };`;
+if (!sourceText.includes(glmParseBlock)) throw new Error("GLM parse block target not found");
+sourceText = sourceText.replace(glmParseBlock, glmTextBlock);
+sourceText = sourceText.replaceAll("1.3.1", "1.3.5");
+
 sourceText += `
 
-function revisionToolSchema() {
-  return {
-    name: "submit_revision",
-    description: "면접 답안 수정 결과를 구조화해서 제출합니다.",
-    parameters: {
-      type: "object",
-      properties: {
-        assessment: { type: "string" },
-        caution: { type: "string" },
-        revisedAnswer: { type: "string" },
-        riskFlags: { type: "array", items: { type: "string" } }
-      },
-      required: ["assessment", "caution", "revisedAnswer", "riskFlags"]
-    }
-  };
+function buildGLMTextPrompt(input) {
+  return baseRules() + "\\n\\n" +
+    commonInputText(input) + "\\n\\n" +
+    "[작업] 사용자의 수정 요구가 질문 의도와 근거에 맞는 범위에서 기존 답안의 좋은 부분을 최대한 유지하여 전체 답안을 다듬으세요. " +
+    "기록에 없는 사실·수치·성과를 추가하지 마세요. " +
+    "출력에는 수정된 전체 답안 본문만 적고, 설명·평가·주의사항·JSON·마크다운·머리말은 넣지 마세요.";
 }
 
-function parseGLMToolPayload(value) {
-  const calls = Array.isArray(value?.tool_calls)
-    ? value.tool_calls
-    : Array.isArray(value?.choices?.[0]?.message?.tool_calls)
-      ? value.choices[0].message.tool_calls
-      : [];
-  const call = calls.find((item) =>
-    item?.name === "submit_revision" || item?.function?.name === "submit_revision"
-  ) || calls[0];
-  const args = call?.arguments ?? call?.function?.arguments;
-  if (args && typeof args === "object") return args;
-  if (typeof args === "string" && args.trim()) return JSON.parse(args);
-  return parseModelPayload(value);
-}
-
-function parseModelPayload(value) {
-  const choiceContent = value?.choices?.[0]?.message?.content;
-  if (choiceContent != null) return parseModelPayloadBase(choiceContent);
-  return parseModelPayloadBase(value);
+function extractModelText(value) {
+  if (typeof value === "string") return value.trim();
+  if (typeof value?.response === "string") return value.response.trim();
+  if (typeof value?.response?.response === "string") return value.response.response.trim();
+  const content = value?.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content.map((part) => typeof part === "string" ? part : (part?.text || "")).join("").trim();
+  }
+  return "";
 }
 `;
+
 const source = Buffer.from(sourceText, "utf8");
 const hash = crypto.createHash("sha256").update(source).digest("hex");
 fs.writeFileSync(new URL("./src/index.js", import.meta.url), source);
-console.log(`Generated src/index.js v1.3.4 (${source.length} bytes, sha256 ${hash})`);
+console.log(`Generated src/index.js v1.3.5 (${source.length} bytes, sha256 ${hash})`);
