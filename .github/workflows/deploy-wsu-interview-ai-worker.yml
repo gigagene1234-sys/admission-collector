@@ -112,12 +112,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl --retry 6 --retry-delay 3 --retry-all-errors --fail --silent --show-error "$WORKER_URL/health" | tee /tmp/health.json
+          for attempt in $(seq 1 20); do
+            curl --silent --show-error "$WORKER_URL/health" -o /tmp/health.json || true
+            cat /tmp/health.json || true
+            echo
+            if node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('/tmp/health.json','utf8')); process.exit(j.ok && j.service==='wsu-interview-ai' && j.version==='1.3.0' ? 0 : 1)" 2>/dev/null; then
+              break
+            fi
+            echo "Waiting for v1.3.0 propagation (attempt $attempt/20)..."
+            sleep 3
+          done
           node - <<'NODE'
           const fs = require('fs');
           const j = JSON.parse(fs.readFileSync('/tmp/health.json', 'utf8'));
           if (!j.ok || j.service !== 'wsu-interview-ai') process.exit(1);
+          if (j.version !== '1.3.0') process.exit(1);
           if (!j.providers?.workersAI) process.exit(1);
+          if (j.models?.generation !== '@cf/zai-org/glm-4.7-flash') process.exit(1);
+          if (j.models?.verifier !== '@cf/meta/llama-3.3-70b-instruct-fp8-fast') process.exit(1);
           NODE
 
       - name: Smoke test rewrite endpoint
@@ -139,6 +151,30 @@ jobs:
           const fs = require('fs');
           const j = JSON.parse(fs.readFileSync('/tmp/rewrite.json', 'utf8'));
           if (!j.revisedAnswer || !j.assessment) process.exit(1);
+          if (!Array.isArray(j.reviewPath) || !j.reviewPath.includes('glm')) process.exit(1);
+          NODE
+
+      - name: Smoke test Llama verification path
+        shell: bash
+        run: |
+          set -euo pipefail
+          HTTP_CODE="$(curl --silent --show-error \
+            -o /tmp/rewrite-verified.json -w '%{http_code}' \
+            -X POST "$WORKER_URL/api/rewrite" \
+            -H "Content-Type: application/json" \
+            --data '{"question":{"id":6,"text":"문제를 해결한 경험을 말해보세요.","target":"문제 인식과 해결 과정","method":"문제→재정의→배움","risk":"과장 금지"},"currentAnswer":"로봇의 안전 기준을 탐구했습니다.","userInstruction":"선택한 근거를 활용해 자연스럽게 다듬어줘.","records":[{"id":"smoke-draft","subject":"탐구","title":"자율주행 로봇 안전 탐구","sourceKind":"draft","sourceLabel":"별도 작성본","summary":"차량 중심의 자율주행 단계가 다양한 로봇에 그대로 적용되기 어렵다고 보고 인간 개입과 안전 통제를 중심으로 다시 살펴봄","fullText":"","limits":"새 공식 분류 체계를 만들었다고 표현하지 않음"}]}' )"
+          cat /tmp/rewrite-verified.json
+          echo
+          echo "verified rewrite HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            exit 1
+          fi
+          node - <<'NODE'
+          const fs = require('fs');
+          const j = JSON.parse(fs.readFileSync('/tmp/rewrite-verified.json', 'utf8'));
+          if (!j.revisedAnswer || !j.assessment) process.exit(1);
+          if (!Array.isArray(j.reviewPath) || !j.reviewPath.includes('glm') || !j.reviewPath.includes('llama-verifier')) process.exit(1);
+          if (!j.risk || !['medium','high'].includes(j.risk.level)) process.exit(1);
           NODE
 
       - name: Persist Worker endpoint
