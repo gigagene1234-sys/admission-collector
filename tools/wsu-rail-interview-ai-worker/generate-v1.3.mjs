@@ -17,11 +17,6 @@ sourceText = sourceText.replace(
   '{ role: "user", content: buildGLMTextPrompt(input) },'
 );
 
-const glmParseBlock = `      const parsed = parseModelPayload(data);
-      const normalized = normalizeDraftResult(parsed);
-      if (!normalized.revisedAnswer) throw new Error("GLM이 revisedAnswer를 반환하지 않았습니다.");
-
-      return normalized;`;
 const glmTextBlock = `      const revisedAnswer = extractModelText(data);
       if (!revisedAnswer) throw new Error("GLM이 수정 답안 본문을 반환하지 않았습니다.");
 
@@ -31,9 +26,15 @@ const glmTextBlock = `      const revisedAnswer = extractModelText(data);
         revisedAnswer,
         riskFlags: []
       };`;
-if (!sourceText.includes(glmParseBlock)) throw new Error("GLM parse block target not found");
-sourceText = sourceText.replace(glmParseBlock, glmTextBlock);
-sourceText = sourceText.replaceAll("1.3.1", "1.3.5");
+const callGlmStart = sourceText.indexOf("async function callGLM");
+const callGlmEnd = sourceText.indexOf("function buildLlamaVerifierPrompt", callGlmStart);
+if (callGlmStart < 0 || callGlmEnd < 0) throw new Error("callGLM boundaries not found");
+let callGlmSource = sourceText.slice(callGlmStart, callGlmEnd);
+const glmParsePattern = /const parsed = parseModelPayload\(data\);[\s\S]*?return normalized;/;
+if (!glmParsePattern.test(callGlmSource)) throw new Error("GLM parse block target not found");
+callGlmSource = callGlmSource.replace(glmParsePattern, glmTextBlock.trim());
+sourceText = sourceText.slice(0, callGlmStart) + callGlmSource + sourceText.slice(callGlmEnd);
+sourceText = sourceText.replaceAll("1.3.1", "1.3.6");
 
 sourceText += `
 
@@ -61,4 +62,4 @@ function extractModelText(value) {
 const source = Buffer.from(sourceText, "utf8");
 const hash = crypto.createHash("sha256").update(source).digest("hex");
 fs.writeFileSync(new URL("./src/index.js", import.meta.url), source);
-console.log(`Generated src/index.js v1.3.5 (${source.length} bytes, sha256 ${hash})`);
+console.log(`Generated src/index.js v1.3.6 (${source.length} bytes, sha256 ${hash})`);
