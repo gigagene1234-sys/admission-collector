@@ -198,9 +198,9 @@ const twoModelRiskSupport = [
   "  if (/[.!?。！？][\\\"'”’)]?$/.test(value)) return true;",
   "  return /(습니다|입니다|했습니다|됩니다|생각합니다|느꼈습니다|배웠습니다|알게 되었습니다|있습니다)$/.test(value);",
   "}",
-].join("\\n");
+].join("\n");
 
-if (!sourceText.includes("function assessRisk(")) sourceText += "\\n\\n" + twoModelRiskSupport;
+if (!sourceText.includes("function assessRisk(")) sourceText += "\n\n" + twoModelRiskSupport;
 const requiredRuntimeFunctions = ["normalizeRequest","assessRisk","mergeRisk","callGLM","callLlamaDirect","callLlamaVerifier","looksComplete","compact","handleOptions","json"];
 for (const fn of requiredRuntimeFunctions) {
   const present = sourceText.includes("function " + fn + "(") || sourceText.includes("async function " + fn + "(");
