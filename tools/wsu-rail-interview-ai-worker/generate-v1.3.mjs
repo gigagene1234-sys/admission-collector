@@ -213,7 +213,7 @@ const appProxySupport = [
   "  const upstream = await fetch(UPSTREAM_INTERVIEW_APP, { headers: { 'User-Agent': 'WSU-Interview-AI-Proxy/1.4' } });",
   "  if (!upstream.ok) return new Response('Upstream interview app unavailable', { status: 502 });",
   "  const html = await upstream.text();",
-  "  const injected = html.includes('/ai-ui.js') ? html : html.replace('</body>', '<script src=\\"/ai-ui.js\\"></script></body>');",
+  "  const injected = html.includes('/ai-ui.js') ? html : html.replace('</body>', '<script src=/ai-ui.js></script></body>');",
   "  return new Response(injected, {",
   "    status: 200,",
   "    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, max-age=0', 'X-Content-Type-Options': 'nosniff' },",
