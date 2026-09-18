@@ -154,6 +154,59 @@ if (externalCriticStart >= 0) {
 }
 sourceText = sourceText.replace(/^const GEMINI_MODEL.*\n/m, "");
 sourceText = sourceText.replaceAll("1.3.6", "1.4.0");
+
+const twoModelRiskSupport = [
+  "function assessRisk(input, candidateAnswer) {",
+  "  let score = 0;",
+  "  const reasons = [];",
+  "  const records = Array.isArray(input.records) ? input.records : [];",
+  "  if (records.some((r) => String(r.sourceKind || '').toLowerCase() === 'draft')) { score += 2; reasons.push('draft 근거 포함'); }",
+  "  if (records.some((r) => String(r.sourceKind || '').toLowerCase() === 'unlinked' || !r.fullText)) { score += 1; reasons.push('원문 미연결 근거 포함'); }",
+  "  if (records.length >= 3) { score += 1; reasons.push('복수 근거 결합'); }",
+  "  const instruction = String(input.userInstruction || '');",
+  "  if (/\\d/.test(instruction) || /(통계|수치|비율|퍼센트|연도|공식)/.test(instruction)) { score += 1; reasons.push('수치·공식 사실 수정 가능성'); }",
+  "  const completionWords = ['제작','완성','검증','측정','분석','구현','실험','입증','개발'];",
+  "  if (completionWords.some((word) => instruction.includes(word))) { score += 1; reasons.push('완료·성과 표현 요청'); }",
+  "  if (candidateAnswer) {",
+  "    const corpus = [input.question?.text, input.question?.target, input.question?.method, input.currentAnswer, input.userInstruction, ...records.flatMap((r) => [r.summary, r.fullText, r.limits])].filter(Boolean).join('\\n');",
+  "    const inputNumbers = new Set(corpus.match(/\\d+(?:[.,]\\d+)?%?/g) || []);",
+  "    const outputNumbers = new Set(String(candidateAnswer).match(/\\d+(?:[.,]\\d+)?%?/g) || []);",
+  "    const newNumbers = [...outputNumbers].filter((n) => !inputNumbers.has(n));",
+  "    if (newNumbers.length) { score += 3; reasons.push('근거에 없는 새 수치: ' + newNumbers.slice(0,3).join(', ')); }",
+  "    if (completionWords.some((word) => String(candidateAnswer).includes(word) && !corpus.includes(word))) { score += 2; reasons.push('근거보다 강한 완료·성과 표현'); }",
+  "    const driverContext = /(기관사|운전|철도차량)/.test([input.question?.text, input.currentAnswer, input.userInstruction].filter(Boolean).join('\\n'));",
+  "    const boundaryWords = ['수리','정비했다','정비를 수행','선로를 점검','시설을 점검','부품을 교체'];",
+  "    if (driverContext && boundaryWords.some((word) => String(candidateAnswer).includes(word))) { score += 3; reasons.push('기관사 역할 경계 위험'); }",
+  "    if (!looksComplete(candidateAnswer)) { score += 2; reasons.push('답안 문장 미완결 가능성'); }",
+  "  }",
+  "  return normalizeRisk(score, reasons);",
+  "}",
+  "",
+  "function mergeRisk(a, b) {",
+  "  const score = Math.max(Number(a?.score || 0), Number(b?.score || 0));",
+  "  const reasons = [...new Set([...(a?.reasons || []), ...(b?.reasons || [])])];",
+  "  return normalizeRisk(score, reasons);",
+  "}",
+  "",
+  "function normalizeRisk(score, reasons) {",
+  "  return { level: score >= 5 ? 'high' : score >= 2 ? 'medium' : 'low', score, reasons };",
+  "}",
+  "",
+  "function looksComplete(text) {",
+  "  const value = String(text || '').trim();",
+  "  if (value.length < 12) return false;",
+  "  if (/[.!?。！？][\\\"'”’)]?$/.test(value)) return true;",
+  "  return /(습니다|입니다|했습니다|됩니다|생각합니다|느꼈습니다|배웠습니다|알게 되었습니다|있습니다)$/.test(value);",
+  "}",
+].join("\\n");
+
+if (!sourceText.includes("function assessRisk(")) sourceText += "\\n\\n" + twoModelRiskSupport;
+const requiredRuntimeFunctions = ["normalizeRequest","assessRisk","mergeRisk","callGLM","callLlamaDirect","callLlamaVerifier","looksComplete","compact","handleOptions","json"];
+for (const fn of requiredRuntimeFunctions) {
+  const present = sourceText.includes("function " + fn + "(") || sourceText.includes("async function " + fn + "(");
+  if (!present) throw new Error("required runtime function missing: " + fn);
+}
+
 if (/gemini|generativelanguage|GEMINI_API_KEY|ENABLE_GEMINI/i.test(sourceText)) {
   throw new Error("external critic code remains after v1.4.0 transformation");
 }
