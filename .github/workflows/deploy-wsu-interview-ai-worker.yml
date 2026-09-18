@@ -117,20 +117,21 @@ jobs:
             curl --silent --show-error "$WORKER_URL/health" -o /tmp/health.json || true
             cat /tmp/health.json || true
             echo
-            if node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('/tmp/health.json','utf8')); process.exit(j.ok && j.service==='wsu-interview-ai' && j.version==='1.3.6' ? 0 : 1)" 2>/dev/null; then
+            if node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('/tmp/health.json','utf8')); process.exit(j.ok && j.service==='wsu-interview-ai' && j.version==='1.4.0' ? 0 : 1)" 2>/dev/null; then
               break
             fi
-            echo "Waiting for v1.3.6 propagation (attempt $attempt/20)..."
+            echo "Waiting for v1.4.0 propagation (attempt $attempt/20)..."
             sleep 3
           done
           node - <<'NODE'
           const fs = require('fs');
           const j = JSON.parse(fs.readFileSync('/tmp/health.json', 'utf8'));
           if (!j.ok || j.service !== 'wsu-interview-ai') process.exit(1);
-          if (j.version !== '1.3.6') process.exit(1);
+          if (j.version !== '1.4.0') process.exit(1);
           if (!j.providers?.workersAI) process.exit(1);
           if (j.models?.generation !== '@cf/zai-org/glm-4.7-flash') process.exit(1);
           if (j.models?.verifier !== '@cf/meta/llama-3.3-70b-instruct-fp8-fast') process.exit(1);
+          if (JSON.stringify(j).toLowerCase().includes('gemini')) process.exit(1);
           NODE
 
       - name: Smoke test rewrite endpoint
@@ -199,6 +200,7 @@ jobs:
             echo "## WSU Interview AI Worker"
             echo "- Worker: $WORKER_URL"
             echo "- Cloudflare Workers AI: bound"
+            echo "- Architecture: GLM generation -> risk engine -> conditional Llama verification"
             echo "- External AI API keys: not required"
             echo "- Health check: passed"
             echo "- Rewrite smoke test: passed"

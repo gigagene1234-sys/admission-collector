@@ -59,7 +59,106 @@ function extractModelText(value) {
 }
 `;
 
+
+// v1.4.0: remove the external critic stage and keep a two-model pipeline only.
+const twoModelFetch = [
+  "export default {",
+  "  async fetch(request, env) {",
+  "    const url = new URL(request.url);",
+  "    if (request.method === \"OPTIONS\") return handleOptions(request);",
+  "    if (url.pathname === \"/health\" && request.method === \"GET\") {",
+  "      return json({",
+  "        ok: true,",
+  "        service: \"wsu-interview-ai\",",
+  "        version: \"1.4.0\",",
+  "        providers: { workersAI: Boolean(env.AI) },",
+  "        routing: { default: \"glm\", verification: \"risk-based-llama\" },",
+  "        models: { generation: GLM_MODEL, verifier: LLAMA_MODEL },",
+  "      }, 200, request);",
+  "    }",
+  "    if (url.pathname !== \"/api/rewrite\") return json({ error: \"Not found\" }, 404, request);",
+  "    if (request.method !== \"POST\") return json({ error: \"POST만 지원합니다.\" }, 405, request);",
+  "    const origin = request.headers.get(\"Origin\");",
+  "    if (origin && !ALLOWED_ORIGINS.has(origin)) return json({ error: \"허용되지 않은 Origin입니다.\" }, 403, request);",
+  "    const declaredLength = Number(request.headers.get(\"Content-Length\") || 0);",
+  "    if (declaredLength > MAX_BODY_BYTES) return json({ error: \"요청 본문이 너무 큽니다.\" }, 413, request);",
+  "    let payload;",
+  "    try { payload = await request.json(); } catch { return json({ error: \"잘못된 JSON입니다.\" }, 400, request); }",
+  "    let input;",
+  "    try { input = normalizeRequest(payload); } catch (error) { return json({ error: String(error?.message || error) }, 400, request); }",
+  "    if (!env.AI) return json({ error: \"Cloudflare Workers AI binding이 설정되지 않았습니다.\" }, 503, request);",
+  "    const preRisk = assessRisk(input, \"\");",
+  "    let draft;",
+  "    try {",
+  "      draft = await callGLM(input, env.AI, preRisk.level);",
+  "    } catch (error) {",
+  "      console.error(\"GLM generation failed\", compact(error?.message || error));",
+  "      const risk = mergeRisk(preRisk, { score: 3, reasons: [\"GLM 호출 실패\"] });",
+  "      try {",
+  "        const result = await callLlamaDirect(input, env.AI, [\"GLM 호출 실패로 Llama가 직접 작성\"]);",
+  "        return json({ source: \"cloudflare-workers-ai\", model: LLAMA_MODEL, reviewPath: [\"llama-direct-fallback\"], risk, ...result }, 200, request);",
+  "      } catch (fallbackError) {",
+  "        return json({ error: \"AI 수정안 생성에 실패했습니다.\", diagnostics: [compact(fallbackError?.message || fallbackError)] }, 502, request);",
+  "      }",
+  "    }",
+  "    const postRisk = assessRisk(input, draft.revisedAnswer);",
+  "    const risk = mergeRisk(preRisk, postRisk);",
+  "    const needsVerification = risk.level !== \"low\" || !looksComplete(draft.revisedAnswer);",
+  "    if (!needsVerification) {",
+  "      return json({ source: \"cloudflare-workers-ai\", model: GLM_MODEL, reviewPath: [\"glm\"], risk, assessment: draft.assessment, caution: draft.caution, revisedAnswer: draft.revisedAnswer }, 200, request);",
+  "    }",
+  "    try {",
+  "      const verified = await callLlamaVerifier(input, draft, risk, env.AI);",
+  "      return json({ source: \"multi-model\", model: LLAMA_MODEL, models: { generation: GLM_MODEL, verifier: LLAMA_MODEL }, reviewPath: [\"glm\", \"llama-verifier\"], risk, ...verified }, 200, request);",
+  "    } catch (error) {",
+  "      console.error(\"Llama verification failed\", compact(error?.message || error));",
+  "      return json({ error: \"AI 수정안 검증에 실패했습니다.\", diagnostics: [compact(error?.message || error)] }, 502, request);",
+  "    }",
+  "  },",
+  "};",
+].join("\n");
+
+const fetchStart = sourceText.indexOf("export default {");
+const normalizeStart = sourceText.indexOf("function normalizeRequest", fetchStart);
+if (fetchStart < 0 || normalizeStart < 0) throw new Error("fetch router boundaries not found");
+sourceText = sourceText.slice(0, fetchStart) + twoModelFetch + "\n\n" + sourceText.slice(normalizeStart);
+
+const verifierStart = sourceText.indexOf("function buildLlamaVerifierPrompt");
+const directStart = sourceText.indexOf("async function callLlamaDirect", verifierStart);
+if (verifierStart < 0 || directStart < 0) throw new Error("verifier boundaries not found");
+const twoModelVerifier = [
+  "function buildLlamaVerifierPrompt(input, draft, risk) {",
+  "  return baseRules() + \"\\n\\n\" +",
+  "    \"[검증자 역할]\\n\" +",
+  "    \"아래 GLM 초안은 제안일 뿐 사실 근거가 아닙니다. 사실 여부는 반드시 원래 질문·현재 답안·사용자가 선택한 근거에서만 확인하세요. \" +",
+  "    \"각 근거의 limits는 절대 금지선입니다. limits와 충돌하는 표현은 반드시 삭제하거나 근거 수준으로 낮추세요. \" +",
+  "    \"근거 없는 사실·수치·완료 표현과 기관사 역할을 벗어난 표현도 제거하세요.\\n\\n\" +",
+  "    commonInputText(input) + \"\\n\\n\" +",
+  "    \"[자동 위험도]\\n\" + JSON.stringify(risk) + \"\\n\\n\" +",
+  "    \"[GLM 초안]\\n\" + JSON.stringify(draft) + \"\\n\\n\" +",
+  "    \"[최종 출력]\\nassessment, caution, revisedAnswer 세 필드만 반환하세요.\";",
+  "}",
+  "",
+  "async function callLlamaVerifier(input, draft, risk, ai) {",
+  "  return callLlamaStructured(buildLlamaVerifierPrompt(input, draft, risk), ai);",
+  "}",
+  "",
+].join("\n");
+sourceText = sourceText.slice(0, verifierStart) + twoModelVerifier + sourceText.slice(directStart);
+
+const externalCriticStart = sourceText.indexOf("async function callGeminiCritic");
+const parserStart = sourceText.indexOf("function parseModelPayload", externalCriticStart);
+if (externalCriticStart >= 0) {
+  if (parserStart < 0) throw new Error("external critic removal boundary not found");
+  sourceText = sourceText.slice(0, externalCriticStart) + sourceText.slice(parserStart);
+}
+sourceText = sourceText.replace(/^const GEMINI_MODEL.*\n/m, "");
+sourceText = sourceText.replaceAll("1.3.6", "1.4.0");
+if (/gemini|generativelanguage|GEMINI_API_KEY|ENABLE_GEMINI/i.test(sourceText)) {
+  throw new Error("external critic code remains after v1.4.0 transformation");
+}
+
 const source = Buffer.from(sourceText, "utf8");
 const hash = crypto.createHash("sha256").update(source).digest("hex");
 fs.writeFileSync(new URL("./src/index.js", import.meta.url), source);
-console.log(`Generated src/index.js v1.3.6 (${source.length} bytes, sha256 ${hash})`);
+console.log(`Generated src/index.js v1.4.0 (${source.length} bytes, sha256 ${hash})`);
